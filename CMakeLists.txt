@@ -1,24 +1,33 @@
-cmake_minimum_required(VERSION 3.14)
-project(kvspace-cpp VERSION 0.1.0 LANGUAGES CXX)
+cmake_minimum_required(VERSION 3.10)
+project(kvspace-c VERSION 0.1.0 LANGUAGES C)
 
-set(CMAKE_CXX_STANDARD 17)
-set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_C_STANDARD 11)
+set(CMAKE_C_STANDARD_REQUIRED ON)
+set(CMAKE_C_EXTENSIONS OFF)
 
-# ── dependencies ─────────────────────────────────────────────────────────────
+include(GNUInstallDirs)
 
-find_package(hiredis REQUIRED)
+find_package(blockmalloc REQUIRED)
+find_package(slotsboxmalloc REQUIRED)
 
-# ── library ──────────────────────────────────────────────────────────────────
-
-add_library(kvspace STATIC
-    src/xvalue.cpp
-    src/redis.cpp
+add_library(kvspace-c SHARED
+    src/xvalue.c
+    src/kvspace.c
 )
 
-target_include_directories(kvspace PUBLIC include)
-target_link_libraries(kvspace PUBLIC hiredis::hiredis)
+target_include_directories(kvspace-c
+    PUBLIC
+        $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+        $<INSTALL_INTERFACE:include>
+)
 
-# ── install ──────────────────────────────────────────────────────────────────
+target_link_libraries(kvspace-c
+    PUBLIC blockmalloc slotsboxmalloc
+)
 
-install(TARGETS kvspace ARCHIVE DESTINATION lib)
-install(DIRECTORY include/kvspace DESTINATION include)
+add_subdirectory(tutorial)
+
+install(TARGETS kvspace-c
+    LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
+)
+install(DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/include/ DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
