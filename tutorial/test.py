@@ -63,6 +63,16 @@ def test_python():
          "PYTHONPATH": str(ROOT / "py")})
 
 
+def test_multiprocess():
+    src = TUTORIAL / "06_multiprocess.c"
+    bin = BUILD / "tutorial" / "06_multiprocess"
+    if not run("C: multiprocess compile",
+        ["gcc", str(src), "-I", str(ROOT / "include"),
+         "-L", str(BUILD), "-lkvspace-c", "-o", str(bin)]):
+        return
+    run("C: multiprocess run", [str(bin), "/tmp/kv_mp.shm", str(8 * 64 * 64 * 64)],
+        {"LD_LIBRARY_PATH": str(BUILD)})
+
 def test_integrity():
     src = TUTORIAL / "05_integrity.c"
     bin = BUILD / "tutorial" / "05_integrity"
@@ -90,6 +100,7 @@ if __name__ == "__main__":
     test_cpp()
     test_python()
     test_integrity()
+    test_multiprocess()
     if shutil.which("rustc"):
         test_rust()
     else:
