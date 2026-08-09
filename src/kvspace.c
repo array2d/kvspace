@@ -1,0 +1,373 @@
+/*
+ * kvspace.c — KVSpace SHM 存储引擎: ART 树 + slotsboxmalloc
+ */
+
+#define _GNU_SOURCE
+#include "kvspace/kvspace.h"
+#include "slotsboxmalloc/slotsboxobj.h"
+#include <blockmalloc/blockmalloc.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <fcntl.h>
+#include <unistd.h>
+#include <pthread.h>
+#include <time.h>
+
+#define KVS_MAGIC       "kvspace-c.v1"
+#define ART_PREFIX_MAX  10
+#define ART_NODE_MAX_SZ 2112
+#define ART_SLAB_SZ     (256UL * 1024 * 1024)
+#define WATCH_TABLE_SZ  256
+
+enum { ART_N4=0, ART_N16=1, ART_N48=2, ART_N256=3 };
+
+typedef struct {
+    uint8_t  type, prefix[ART_PREFIX_MAX], prefix_len;
+    uint8_t  has_value:1;
+    uint64_t box_offset:63;
+    uint16_t count;
+} art_hdr_t;
+
+typedef struct { art_hdr_t h; uint8_t keys[4];   int32_t children[4];   } art_n4_t;
+typedef struct { art_hdr_t h; uint8_t keys[16];  int32_t children[16];  } art_n16_t;
+typedef struct { art_hdr_t h; uint8_t index[256]; int32_t children[48];  } art_n48_t;
+typedef struct { art_hdr_t h; int32_t children[256];                      } art_n256_t;
+
+static int art_node_sz(int t) {
+    return t==ART_N4?sizeof(art_n4_t):t==ART_N16?sizeof(art_n16_t):
+           t==ART_N48?sizeof(art_n48_t):sizeof(art_n256_t);
+}
+
+typedef struct {
+    char     magic[12];
+    uint64_t shm_size, sbo_head_size, sbo_data_offset, sbo_data_size, art_slab_size;
+    int32_t  art_root;
+} kvspace_hdr_t;
+
+typedef struct {
+    char key[256]; pthread_cond_t cond; pthread_mutex_t mtx;
+    uint8_t *val; int32_t val_len; bool ready;
+} watch_t;
+
+struct kvspace {
+    int fd; size_t shm_sz; uint8_t *shm; kvspace_hdr_t *hdr;
+    blocks_meta_t *art_meta; uint8_t *art_data;
+    uint8_t *sbo_meta, *sbo_data;
+    watch_t watches[WATCH_TABLE_SZ]; pthread_mutex_t wlock;
+};
+
+/* ---- helpers ---- */
+static void *art_blk(kvspace_t *kv, int32_t id) {
+    if (id<0) return NULL;
+    return kv->art_data + blockdata_offset(kv->art_meta, (uint64_t)id);
+}
+static int32_t art_balloc(kvspace_t *kv) {
+    return (int32_t)blocks_alloc(kv->art_meta, kv->art_data);
+}
+static art_hdr_t *art_hdr(kvspace_t *kv, int32_t id) {
+    return (art_hdr_t *)art_blk(kv, id);
+}
+
+/* ---- prefix ---- */
+static int pfx_shared(const uint8_t *a, int al, const uint8_t *b, int bl) {
+    int n=al<bl?al:bl; for(int i=0;i<n;i++) if(a[i]!=b[i]) return i;
+    return n;
+}
+
+/* ---- child lookup ---- */
+static int32_t art_child(kvspace_t *kv, void *n, uint8_t b) {
+    art_hdr_t *h=(art_hdr_t*)n;
+    switch(h->type) {
+    case ART_N4:{art_n4_t*x=n;for(int i=0;i<(int)h->count;i++)if(x->keys[i]==b)return x->children[i];return -1;}
+    case ART_N16:{art_n16_t*x=n;int lo=0,hi=(int)h->count-1;while(lo<=hi){int m=(lo+hi)/2;if(x->keys[m]==b)return x->children[m];if(x->keys[m]<b)lo=m+1;else hi=m-1;}return -1;}
+    case ART_N48:{art_n48_t*x=n;uint8_t idx=x->index[b];return idx==255?-1:x->children[idx];}
+    case ART_N256:{return((art_n256_t*)n)->children[b];}
+    } return -1;
+}
+
+/* ---- art_search ---- */
+static art_hdr_t *art_search(kvspace_t *kv, int32_t nid, const uint8_t *key, int klen) {
+    if(nid<0||!key)return NULL;
+    int d=0;
+    while(nid>=0){
+        art_hdr_t *h=art_hdr(kv,nid);if(!h)return NULL;
+        if(h->prefix_len){int s=pfx_shared(h->prefix,h->prefix_len,key+d,klen-d);if(s!=h->prefix_len){if(d+s<klen)return NULL;if(s<h->prefix_len)return NULL;}d+=h->prefix_len;if(d>klen)return NULL;}
+        if(d==klen)return h->has_value?h:NULL;
+        nid=art_child(kv,h,key[d]);d++;
+    }
+    return NULL;
+}
+
+/* ---- node create ---- */
+static int32_t art_new_leaf(kvspace_t *kv, uint64_t off) {
+    int32_t id=art_balloc(kv);if(id<0)return-1;
+    art_n4_t *x=art_blk(kv,id);memset(x,0,sizeof(*x));
+    x->h.type=ART_N4;x->h.has_value=1;x->h.box_offset=off;
+    return id;
+}
+static int32_t art_new_node(kvspace_t *kv, int t) {
+    int32_t id=art_balloc(kv);if(id<0)return-1;
+    void *x=art_blk(kv,id);int sz=art_node_sz(t);memset(x,0,sz);
+    ((art_hdr_t*)x)->type=(uint8_t)t;
+    if(t==ART_N48)memset(((art_n48_t*)x)->index,255,256);
+    if(t==ART_N256){art_n256_t*n=x;for(int i=0;i<256;i++)n->children[i]=-1;}
+    return id;
+}
+
+/* ---- grow ---- */
+static int32_t art_grow(kvspace_t *kv, void *on) {
+    art_hdr_t *oh=on;int nt;if(oh->type==ART_N4)nt=ART_N16;else if(oh->type==ART_N16)nt=ART_N48;else if(oh->type==ART_N48)nt=ART_N256;else return-1;
+    int32_t nid=art_new_node(kv,nt);if(nid<0)return-1;
+    art_hdr_t *nh=art_hdr(kv,nid);
+    nh->prefix_len=oh->prefix_len;memcpy(nh->prefix,oh->prefix,oh->prefix_len);
+    nh->has_value=oh->has_value;nh->box_offset=oh->box_offset;
+    // copy children
+    for(int i=0;i<(int)oh->count;i++){uint8_t b=0;int32_t c=-1;
+        switch(oh->type){case ART_N4:{art_n4_t*x=on;b=x->keys[i];c=x->children[i];break;}case ART_N16:{art_n16_t*x=on;b=x->keys[i];c=x->children[i];break;}case ART_N48:{art_n48_t*x=on;c=x->children[i];for(int j=0;j<256;j++)if(x->index[j]==i){b=(uint8_t)j;break;}break;}}
+        switch(nt){case ART_N16:{art_n16_t*x=(art_n16_t*)nh;x->keys[i]=b;x->children[i]=c;break;}case ART_N48:{art_n48_t*x=(art_n48_t*)nh;x->index[b]=(uint8_t)i;x->children[i]=c;break;}case ART_N256:{((art_n256_t*)nh)->children[b]=c;break;}}}
+    nh->count=oh->count;
+    if(nt==ART_N16){art_n16_t*x=(art_n16_t*)nh;for(int i=0;i<(int)nh->count-1;i++)for(int j=i+1;j<(int)nh->count;j++)if(x->keys[i]>x->keys[j]){uint8_t tk=x->keys[i];x->keys[i]=x->keys[j];x->keys[j]=tk;int32_t tc=x->children[i];x->children[i]=x->children[j];x->children[j]=tc;}}
+    return nid;
+}
+
+/* ---- add child ---- */
+static int art_add(kvspace_t *kv, void *n, uint8_t b, int32_t cid) {
+    art_hdr_t *h=n;
+    switch(h->type){
+    case ART_N4:{if(h->count>=4)return-1;art_n4_t*x=n;x->keys[h->count]=b;x->children[h->count]=cid;h->count++;return 0;}
+    case ART_N16:{if(h->count>=16)return-1;art_n16_t*x=n;int p=(int)h->count;while(p>0&&x->keys[p-1]>b){x->keys[p]=x->keys[p-1];x->children[p]=x->children[p-1];p--;}x->keys[p]=b;x->children[p]=cid;h->count++;return 0;}
+    case ART_N48:{if(h->count>=48)return-1;art_n48_t*x=n;int s=(int)h->count;x->index[b]=(uint8_t)s;x->children[s]=cid;h->count++;return 0;}
+    case ART_N256:{art_n256_t*x=n;if(x->children[b]>=0)return-1;x->children[b]=cid;h->count++;return 0;}
+    } return-1;
+}
+
+/* ---- remove child ---- */
+static void art_rm(kvspace_t *kv, void *n, uint8_t b) {
+    art_hdr_t *h=n;
+    switch(h->type){
+    case ART_N4:{art_n4_t*x=n;for(int i=0;i<(int)h->count;i++)if(x->keys[i]==b){for(int j=i;j<(int)h->count-1;j++){x->keys[j]=x->keys[j+1];x->children[j]=x->children[j+1];}h->count--;return;}break;}
+    case ART_N16:{art_n16_t*x=n;int lo=0,hi=(int)h->count-1,pos=-1;while(lo<=hi){int m=(lo+hi)/2;if(x->keys[m]==b){pos=m;break;}if(x->keys[m]<b)lo=m+1;else hi=m-1;}if(pos<0)return;for(int j=pos;j<(int)h->count-1;j++){x->keys[j]=x->keys[j+1];x->children[j]=x->children[j+1];}h->count--;break;}
+    case ART_N48:{art_n48_t*x=n;uint8_t idx=x->index[b];if(idx==255)return;x->index[b]=255;int last=(int)h->count-1;if(idx!=last){x->children[idx]=x->children[last];for(int j=0;j<256;j++)if(x->index[j]==last){x->index[j]=idx;break;}}h->count--;break;}
+    case ART_N256:{art_n256_t*x=n;x->children[b]=-1;h->count--;break;}
+    }
+}
+
+/* ---- insert ---- */
+static int32_t art_ins(kvspace_t *kv, int32_t nid, const uint8_t *key, int klen, int d, uint64_t off) {
+    if(nid<0){int32_t id=art_new_leaf(kv,off);if(id<0)return-1;art_n4_t*x=art_blk(kv,id);int pl=klen-d;if(pl>ART_PREFIX_MAX)pl=ART_PREFIX_MAX;memcpy(x->h.prefix,key+d,pl);x->h.prefix_len=(uint8_t)pl;return id;}
+
+    art_hdr_t *h=art_hdr(kv,nid);if(!h)return-1;
+    int shared=pfx_shared(h->prefix,h->prefix_len,key+d,klen-d);
+    int mpl=h->prefix_len<(klen-d)?h->prefix_len:(klen-d);
+
+    if(shared<mpl){ // prefix split
+        int32_t nn=art_new_node(kv,ART_N4);if(nn<0)return-1;
+        art_hdr_t *nh=art_hdr(kv,nn);
+        nh->prefix_len=(uint8_t)shared;memcpy(nh->prefix,key+d,shared);
+        uint8_t ob=h->prefix[shared];h->prefix_len-=(uint8_t)(shared+1);
+        if(h->prefix_len>0)memmove(h->prefix,h->prefix+shared+1,h->prefix_len);
+        art_add(kv,nh,ob,nid);
+        int32_t leaf=art_new_leaf(kv,off);if(leaf<0)return-1;
+        art_n4_t *lf=art_blk(kv,leaf);
+        int rem=klen-d-shared-1;
+        if(rem>0){if(rem>ART_PREFIX_MAX)rem=ART_PREFIX_MAX;memcpy(lf->h.prefix,key+d+shared+1,rem);lf->h.prefix_len=(uint8_t)rem;}
+        if(d+shared<klen)art_add(kv,nh,key[d+shared],leaf);
+        return nn;
+    }
+    d+=h->prefix_len;
+    if(d==klen){if(h->has_value)h->box_offset=off;else{h->has_value=1;h->box_offset=off;}return nid;}
+    int32_t cid=art_child(kv,h,key[d]);
+    if(cid>=0){int32_t nc=art_ins(kv,cid,key,klen,d+1,off);if(nc<0)return-1;if(nc!=cid){art_rm(kv,h,key[d]);art_add(kv,h,key[d],nc);}return nid;}
+    int32_t leaf=art_new_leaf(kv,off);if(leaf<0)return-1;
+    art_n4_t *lf=art_blk(kv,leaf);
+    int rem=klen-d-1;if(rem>0){if(rem>ART_PREFIX_MAX)rem=ART_PREFIX_MAX;memcpy(lf->h.prefix,key+d+1,rem);lf->h.prefix_len=(uint8_t)rem;}
+    if((h->type==ART_N4&&h->count>=4)||(h->type==ART_N16&&h->count>=16)||(h->type==ART_N48&&h->count>=48)){int32_t g=art_grow(kv,h);if(g<0)return-1;art_add(kv,art_hdr(kv,g),key[d],leaf);return g;}
+    art_add(kv,h,key[d],leaf);
+    return nid;
+}
+
+/* ---- delete ---- */
+static int32_t art_del(kvspace_t *kv, int32_t nid, const uint8_t *key, int klen, int d, bool *del) {
+    if(nid<0)return-1;
+    art_hdr_t *h=art_hdr(kv,nid);if(!h)return-1;
+    if(h->prefix_len){int s=pfx_shared(h->prefix,h->prefix_len,key+d,klen-d);if(s!=h->prefix_len||d+h->prefix_len>klen)return nid;d+=h->prefix_len;}
+    if(d==klen){if(!h->has_value)return nid;h->has_value=0;sbo_free(kv->sbo_meta,h->box_offset);h->box_offset=0;*del=true;}
+    else{int32_t cid=art_child(kv,h,key[d]);if(cid>=0)art_del(kv,cid,key,klen,d+1,del);}
+    return nid;
+}
+
+/* ---- path ---- */
+static char *pjoin(const char *a, const char *b) {
+    size_t al=strlen(a),bl=strlen(b);int sep=(al>0&&a[al-1]!='/')?1:0;
+    char *r=malloc(al+sep+bl+1);memcpy(r,a,al);if(sep)r[al]='/';memcpy(r+al+sep,b,bl+1);return r;
+}
+static void psplit(const char *k, char **p, char **n) {
+    const char *s=strrchr(k,'/');if(!s||s==k){*p=strdup("/");*n=strdup(s?s+1:k);return;}
+    size_t pl=(size_t)(s-k)+2;*p=malloc(pl+1);memcpy(*p,k,pl-1);(*p)[pl-1]='/';(*p)[pl]='\0';*n=strdup(s+1);
+}
+static char *edir(const char *p) {
+    size_t l=strlen(p);if(l>0&&p[l-1]=='/')return strdup(p);char *r=malloc(l+2);memcpy(r,p,l);r[l]='/';r[l+1]='\0';return r;
+}
+/* ---- prefix scan: collect all keys under prefix into out[0..*n-1] ---- */
+static void art_scan(kvspace_t *kv, int32_t nid, char *buf, int bpos, int bcap,
+                     const char *pfx, int plen, char ***out, int32_t *n) {
+    if(nid<0||*n>=4096)return;
+    art_hdr_t *h=art_hdr(kv,nid);if(!h)return;
+    // write node's prefix into buf
+    for(int i=0;i<h->prefix_len&&bpos<bcap;i++)buf[bpos++]=h->prefix[i];
+    if(bpos>=bcap)return;
+    // if this node has value, emit key
+    if(h->has_value){
+        buf[bpos]='\0';
+        if(bpos>=plen&&memcmp(buf,pfx,plen)==0){(*out)[*n]=strdup(buf);(*n)++;}
+    }
+    // recurse into children
+    switch(h->type){
+    case ART_N4:{art_n4_t*x=(art_n4_t*)h;for(int i=0;i<(int)h->count;i++){if(bpos<bcap)buf[bpos]=x->keys[i];art_scan(kv,x->children[i],buf,bpos+(bpos<bcap?1:0),bcap,pfx,plen,out,n);}break;}
+    case ART_N16:{art_n16_t*x=(art_n16_t*)h;for(int i=0;i<(int)h->count;i++){if(bpos<bcap)buf[bpos]=x->keys[i];art_scan(kv,x->children[i],buf,bpos+(bpos<bcap?1:0),bcap,pfx,plen,out,n);}break;}
+    case ART_N48:{art_n48_t*x=(art_n48_t*)h;for(int i=0;i<256;i++)if(x->index[i]!=255){if(bpos<bcap)buf[bpos]=(uint8_t)i;art_scan(kv,x->children[x->index[i]],buf,bpos+(bpos<bcap?1:0),bcap,pfx,plen,out,n);}break;}
+    case ART_N256:{art_n256_t*x=(art_n256_t*)h;for(int i=0;i<256;i++)if(x->children[i]>=0){if(bpos<bcap)buf[bpos]=(uint8_t)i;art_scan(kv,x->children[i],buf,bpos+(bpos<bcap?1:0),bcap,pfx,plen,out,n);}break;}
+    }
+}
+
+/* ============ lifecycle ============ */
+kvspace_t *kvspace_open(const char *path, size_t data_size) {
+    if(!path||data_size==0)return NULL;
+    uint64_t slots=data_size/8;if(slots==0||(slots&(slots-1))!=0)return NULL;
+    size_t sbo_head=sbo_meta_size(data_size,data_size);
+    size_t shm_total=sizeof(kvspace_hdr_t)+sizeof(blocks_meta_t)+ART_SLAB_SZ+sbo_head+data_size;
+
+    bool created=false;int fd=open(path,O_RDWR);
+    if(fd<0){fd=open(path,O_RDWR|O_CREAT|O_EXCL,0644);if(fd<0)return NULL;if(ftruncate(fd,(off_t)shm_total)!=0){close(fd);return NULL;}created=true;}
+    uint8_t *shm=mmap(NULL,shm_total,PROT_READ|PROT_WRITE,MAP_SHARED,fd,0);
+    if(shm==MAP_FAILED){close(fd);return NULL;}
+
+    kvspace_t *kv=calloc(1,sizeof(*kv));if(!kv){munmap(shm,shm_total);close(fd);return NULL;}
+    kv->fd=fd;kv->shm_sz=shm_total;kv->shm=shm;
+    kv->hdr=(kvspace_hdr_t*)shm;
+    kv->art_meta=(blocks_meta_t*)(shm+sizeof(kvspace_hdr_t));
+    kv->art_data=shm+sizeof(kvspace_hdr_t)+sizeof(blocks_meta_t);
+    kv->sbo_meta=kv->art_data+ART_SLAB_SZ;
+    kv->sbo_data=kv->sbo_meta+sbo_head;
+
+    if(created){
+        memset(kv->hdr,0,sizeof(*kv->hdr));
+        memcpy(kv->hdr->magic,KVS_MAGIC,sizeof(KVS_MAGIC)-1);
+        kv->hdr->shm_size=shm_total;kv->hdr->sbo_head_size=sbo_head;
+        kv->hdr->sbo_data_offset=(uint64_t)(kv->sbo_data-shm);kv->hdr->sbo_data_size=data_size;
+        kv->hdr->art_slab_size=ART_SLAB_SZ;kv->hdr->art_root=-1;
+        blocks_init(kv->art_meta,ART_SLAB_SZ,ART_NODE_MAX_SZ);
+        sbo_init(kv->sbo_meta,sbo_head,(size_t)kv->hdr->sbo_data_size);
+    }else{if(memcmp(kv->hdr->magic,KVS_MAGIC,sizeof(KVS_MAGIC)-1)!=0){kvspace_close(kv);return NULL;}}
+
+    pthread_mutex_init(&kv->wlock,NULL);
+    for(int i=0;i<WATCH_TABLE_SZ;i++){pthread_cond_init(&kv->watches[i].cond,NULL);pthread_mutex_init(&kv->watches[i].mtx,NULL);}
+    return kv;
+}
+void kvspace_close(kvspace_t *kv) {
+    if(!kv)return;
+    for(int i=0;i<WATCH_TABLE_SZ;i++){pthread_cond_destroy(&kv->watches[i].cond);pthread_mutex_destroy(&kv->watches[i].mtx);free(kv->watches[i].val);}
+    pthread_mutex_destroy(&kv->wlock);
+    if(kv->shm)munmap(kv->shm,kv->shm_sz);
+    if(kv->fd>=0)close(kv->fd);free(kv);
+}
+
+/* ============ CRUD ============ */
+uint8_t *kvspace_get(kvspace_t *kv, const char *key, int32_t *ol) {
+    if(!kv||!key||!ol)return NULL;*ol=0;
+    art_hdr_t *h=art_search(kv,kv->hdr->art_root,(const uint8_t*)key,(int)strlen(key));
+    if(!h||!h->has_value)return NULL;
+    uint8_t *s=kv->sbo_data+h->box_offset;int kl=s[0],rl=(int32_t)(s[1+kl+4]|(s[1+kl+5]<<8)|(s[1+kl+6]<<16)|(s[1+kl+7]<<24));
+    int total=1+kl+8+rl;uint8_t *o=malloc(total);if(!o)return NULL;memcpy(o,s,total);*ol=total;return o;
+}
+
+int kvspace_set(kvspace_t *kv, const char *key, const uint8_t *val, int32_t val_len) {
+    if(!kv||!key||!val||val_len<=0)return-1;
+    art_hdr_t *old=art_search(kv,kv->hdr->art_root,(const uint8_t*)key,(int)strlen(key));
+    if(old&&old->has_value)sbo_free(kv->sbo_meta,old->box_offset);
+    uint64_t off=sbo_alloc(kv->sbo_meta,(size_t)val_len);
+    if(off==(uint64_t)-1)return-1;
+    memcpy(kv->sbo_data+off,val,val_len);
+    kv->hdr->art_root=art_ins(kv,kv->hdr->art_root,(const uint8_t*)key,(int)strlen(key),0,off);
+    return 0;
+}
+
+int kvspace_del(kvspace_t *kv, const char *key) {
+    if(!kv||!key)return-1;bool d=false;
+    kv->hdr->art_root=art_del(kv,kv->hdr->art_root,(const uint8_t*)key,(int)strlen(key),0,&d);
+    return d?0:-1;
+}
+
+int kvspace_deltree(kvspace_t *kv, const char *prefix) {
+    if(!kv||!prefix)return-1;
+    char *e=edir(prefix); // ensure trailing / for listing children
+    char **ns;int32_t nc;kvspace_list(kv,e,false,&ns,&nc);
+    for(int i=0;i<nc;i++){char *c=pjoin(e,ns[i]);kvspace_deltree(kv,c);free(c);}
+    for(int i=0;i<nc;i++)free(ns[i]);free(ns);
+    kvspace_del(kv,prefix);
+    if(strcmp(e,prefix)!=0)kvspace_del(kv,e);
+    free(e);return 0;
+}
+
+int kvspace_mkindex(kvspace_t *kv, const char *path) {
+    if(!kv||!path)return-1;
+    char *d=edir(path);
+    uint8_t *v;int32_t vl=xvalue_new_index(NULL,0,&v);
+    int r=kvspace_set(kv,d,v,vl);free(v);
+    free(d);return r;
+}
+
+int kvspace_list(kvspace_t *kv, const char *prefix, bool ex, char ***on, int32_t *oc) {
+    if(!kv||!prefix||!on||!oc)return-1;*on=NULL;*oc=0;
+    int plen=(int)strlen(prefix);
+    char **out=malloc(sizeof(char*)*4096);int32_t n=0;
+    char buf[2048];memset(buf,0,sizeof(buf));
+    // if root is empty, nothing to scan
+    if(kv->hdr->art_root<0)return 0;
+    art_scan(kv,kv->hdr->art_root,buf,0,(int)sizeof(buf),prefix,plen,&out,&n);
+    // filter: only direct children (one level below prefix)
+    char **filt=malloc(sizeof(char*)*n);int32_t fn=0;
+    for(int i=0;i<n;i++){
+        const char *k=out[i];int kl=(int)strlen(k);
+        if(kl<=plen)continue;
+        // extract the name segment immediately after prefix
+        const char *rest=k+plen;
+        const char *slash=strchr(rest,'/');
+        int nlen=slash?(int)(slash-rest):(int)(kl-plen);
+        if(nlen==0)continue;
+        // dedup
+        bool dup=false;
+        for(int j=0;j<fn;j++)if(strncmp(filt[j],rest,nlen)==0&&filt[j][nlen]=='\0'){dup=true;break;}
+        if(!dup){filt[fn]=strndup(rest,nlen);fn++;}
+    }
+    for(int i=0;i<n;i++)free(out[i]);free(out);
+    *on=filt;*oc=fn;return 0;
+}
+
+int kvspace_link(kvspace_t *kv, const char *t, const char *l) {
+    uint8_t *v;int32_t vl=xvalue_new_linkindex(t,&v);int r=kvspace_set(kv,l,v,vl);free(v);return r;
+}
+int kvspace_extindex(kvspace_t *kv, const char *p, const char *ep) {
+    uint8_t *v;int32_t vl=xvalue_new_extindex(ep,NULL,0,&v);int r=kvspace_set(kv,p,v,vl);free(v);return r;
+}
+int kvspace_unlink(kvspace_t *kv, const char *p) {return kvspace_del(kv,p);}
+
+/* ============ Watch/Notify ============ */
+static int wslot(const char *k) {
+    uint32_t h=5381;for(const char *p=k;*p;p++)h=((h<<5)+h)+(uint8_t)*p;return(int)(h%WATCH_TABLE_SZ);
+}
+int kvspace_notify(kvspace_t *kv, const char *k, const uint8_t *v, int32_t vl) {
+    if(!kv||!k)return-1;int s=wslot(k);pthread_mutex_lock(&kv->wlock);watch_t *w=&kv->watches[s];
+    if(w->key[0]&&strcmp(w->key,k)==0){pthread_mutex_lock(&w->mtx);free(w->val);w->val=v?memcpy(malloc(vl),v,vl):NULL;w->val_len=vl;w->ready=true;pthread_cond_signal(&w->cond);pthread_mutex_unlock(&w->mtx);}
+    pthread_mutex_unlock(&kv->wlock);return 0;
+}
+uint8_t *kvspace_watch(kvspace_t *kv, const char *k, int32_t to, int32_t *ol) {
+    if(!kv||!k||!ol)return NULL;*ol=0;int s=wslot(k);
+    pthread_mutex_lock(&kv->wlock);watch_t *w=&kv->watches[s];strncpy(w->key,k,255);w->key[255]='\0';w->ready=false;free(w->val);w->val=NULL;pthread_mutex_unlock(&kv->wlock);
+    pthread_mutex_lock(&w->mtx);
+    if(!w->ready){struct timespec ts;clock_gettime(CLOCK_REALTIME,&ts);ts.tv_sec+=to/1000;ts.tv_nsec+=(to%1000)*1000000L;if(ts.tv_nsec>=1000000000L){ts.tv_sec++;ts.tv_nsec-=1000000000L;}pthread_cond_timedwait(&w->cond,&w->mtx,&ts);}
+    uint8_t *r=NULL;if(w->ready&&w->val){r=w->val;*ol=w->val_len;w->val=NULL;}w->ready=false;pthread_mutex_unlock(&w->mtx);return r;
+}
