@@ -19,12 +19,12 @@ mod ffi {
     extern "C" {
         pub fn kvspace_open(path: *const c_char, data_size: usize) -> *mut std::ffi::c_void;
         pub fn kvspace_close(kv: *mut std::ffi::c_void);
-        pub fn kvspace_get(kv: *mut std::ffi::c_void, key: *const c_char, out_len: *mut i32) -> *const u8;
+        pub fn kvspace_get(kv: *mut std::ffi::c_void, key: *const c_char, resolve: i32, out_len: *mut i32) -> *const u8;
         pub fn kvspace_set(kv: *mut std::ffi::c_void, key: *const c_char, val: *const u8, val_len: i32) -> i32;
         pub fn kvspace_del(kv: *mut std::ffi::c_void, key: *const c_char) -> i32;
         pub fn kvspace_deltree(kv: *mut std::ffi::c_void, prefix: *const c_char) -> i32;
         pub fn kvspace_mkindex(kv: *mut std::ffi::c_void, path: *const c_char) -> i32;
-        pub fn kvspace_list(kv: *mut std::ffi::c_void, prefix: *const c_char, expand_ext: bool, out_names: *mut *mut *const c_char, out_count: *mut i32) -> i32;
+        pub fn kvspace_list(kv: *mut std::ffi::c_void, prefix: *const c_char, expand_ext: bool, resolve: i32, out_names: *mut *mut *const c_char, out_count: *mut i32) -> i32;
         pub fn kvspace_link(kv: *mut std::ffi::c_void, target: *const c_char, linkpath: *const c_char) -> i32;
         pub fn kvspace_extindex(kv: *mut std::ffi::c_void, path: *const c_char, extpath: *const c_char) -> i32;
         pub fn kvspace_unlink(kv: *mut std::ffi::c_void, path: *const c_char) -> i32;
@@ -89,7 +89,7 @@ impl KVSpace {
     pub fn get(&self, key: &str) -> Option<Vec<u8>> {
         let ckey = CString::new(key).ok()?;
         let mut len: i32 = 0;
-        let p = unsafe { ffi::kvspace_get(self.ptr, ckey.as_ptr(), &mut len) };
+        let p = unsafe { ffi::kvspace_get(self.ptr, ckey.as_ptr(), 1, &mut len) };
         if p.is_null() || len <= 0 { return None; }
         let slice = unsafe { std::slice::from_raw_parts(p, len as usize) };
         Some(slice.to_vec())
@@ -120,7 +120,7 @@ impl KVSpace {
         let mut out: *mut *const c_char = ptr::null_mut();
         let mut count: i32 = 0;
         unsafe {
-            ffi::kvspace_list(self.ptr, cprefix.as_ptr(), false, &mut out, &mut count);
+            ffi::kvspace_list(self.ptr, cprefix.as_ptr(), false, 1, &mut out, &mut count);
         }
         if count <= 0 || out.is_null() { return vec![]; }
         let ptrs = unsafe { std::slice::from_raw_parts(out, count as usize) };

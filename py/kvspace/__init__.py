@@ -19,12 +19,12 @@ def _bind(fn, argtypes, restype):
 
 _bind(_lib.kvspace_open, [ctypes.c_char_p, ctypes.c_size_t], ctypes.c_void_p)
 _bind(_lib.kvspace_close, [ctypes.c_void_p], None)
-_bind(_lib.kvspace_get, [ctypes.c_void_p, ctypes.c_char_p, ctypes.POINTER(ctypes.c_int32)], ctypes.POINTER(ctypes.c_uint8))
+_bind(_lib.kvspace_get, [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_int, ctypes.POINTER(ctypes.c_int32)], ctypes.POINTER(ctypes.c_uint8))
 _bind(_lib.kvspace_set, [ctypes.c_void_p, ctypes.c_char_p, ctypes.POINTER(ctypes.c_uint8), ctypes.c_int32], ctypes.c_int)
 _bind(_lib.kvspace_del, [ctypes.c_void_p, ctypes.c_char_p], ctypes.c_int)
 _bind(_lib.kvspace_deltree, [ctypes.c_void_p, ctypes.c_char_p], ctypes.c_int)
 _bind(_lib.kvspace_mkindex, [ctypes.c_void_p, ctypes.c_char_p], ctypes.c_int)
-_bind(_lib.kvspace_list, [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_bool,
+_bind(_lib.kvspace_list, [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_bool, ctypes.c_int,
                            ctypes.POINTER(ctypes.c_void_p), ctypes.POINTER(ctypes.c_int32)], ctypes.c_int)
 _bind(_lib.kvspace_link, [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_char_p], ctypes.c_int)
 _bind(_lib.kvspace_extindex, [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_char_p], ctypes.c_int)
@@ -105,9 +105,9 @@ class KVSpace:
 
     # ── CRUD ─────────────────────────────────────────────────
 
-    def get(self, key: str) -> Optional[bytes]:
+    def get(self, key: str, resolve: bool = True) -> Optional[bytes]:
         ol = ctypes.c_int32(0)
-        p = _lib.kvspace_get(self._kv, key.encode(), ctypes.byref(ol))
+        p = _lib.kvspace_get(self._kv, key.encode(), 1 if resolve else 0, ctypes.byref(ol))
         return ctypes.string_at(p, ol.value) if p and ol.value else None
 
     def set(self, key: str, val: bytes):
@@ -126,10 +126,10 @@ class KVSpace:
     def mkindex(self, path: str):
         _lib.kvspace_mkindex(self._kv, path.encode())
 
-    def list(self, prefix: str) -> list[str]:
+    def list(self, prefix: str, resolve: bool = True) -> list[str]:
         out = ctypes.c_void_p()
         oc = ctypes.c_int32(0)
-        _lib.kvspace_list(self._kv, prefix.encode(), False, ctypes.byref(out), ctypes.byref(oc))
+        _lib.kvspace_list(self._kv, prefix.encode(), False, 1 if resolve else 0, ctypes.byref(out), ctypes.byref(oc))
         if oc.value == 0:
             return []
         ptrs = ctypes.cast(out, ctypes.POINTER(ctypes.c_char_p))
