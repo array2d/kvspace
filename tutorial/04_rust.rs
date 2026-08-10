@@ -7,12 +7,12 @@ use std::ptr;
 extern "C" {
     fn kvspace_open(path: *const c_char, data_size: usize) -> *mut c_void;
     fn kvspace_close(kv: *mut c_void);
-    fn kvspace_get(kv: *mut c_void, key: *const c_char, out_len: *mut c_int) -> *const u8;
+    fn kvspace_get(kv: *mut c_void, key: *const c_char, resolve: c_int, out_len: *mut c_int) -> *const u8;
     fn kvspace_set(kv: *mut c_void, key: *const c_char, val: *const u8, val_len: c_int) -> c_int;
     fn kvspace_del(kv: *mut c_void, key: *const c_char) -> c_int;
     fn kvspace_deltree(kv: *mut c_void, prefix: *const c_char) -> c_int;
     fn kvspace_mkindex(kv: *mut c_void, path: *const c_char) -> c_int;
-    fn kvspace_list(kv: *mut c_void, prefix: *const c_char, expand_ext: bool,
+    fn kvspace_list(kv: *mut c_void, prefix: *const c_char, expand_ext: bool, resolve: c_int,
                     out_names: *mut *mut *const c_char, out_count: *mut c_int) -> c_int;
     fn kvspace_link(kv: *mut c_void, target: *const c_char, linkpath: *const c_char) -> c_int;
 }
@@ -50,7 +50,7 @@ impl KV {
     fn get(&self, key: &str) -> Option<Vec<u8>> {
         let ck = CString::new(key).unwrap();
         let mut len: c_int = 0;
-        let p = unsafe { kvspace_get(self.ptr, ck.as_ptr(), &mut len) };
+        let p = unsafe { kvspace_get(self.ptr, ck.as_ptr(), 1, &mut len) };
         if p.is_null() || len <= 0 { return None; }
         Some(unsafe { std::slice::from_raw_parts(p, len as usize) }.to_vec())
     }
@@ -66,7 +66,7 @@ impl KV {
         let cp = CString::new(prefix).unwrap();
         let mut out: *mut *const c_char = ptr::null_mut();
         let mut count: c_int = 0;
-        unsafe { kvspace_list(self.ptr, cp.as_ptr(), false, &mut out, &mut count); }
+        unsafe { kvspace_list(self.ptr, cp.as_ptr(), false, 1, &mut out, &mut count); }
         if count <= 0 { return vec![]; }
         let ptrs = unsafe { std::slice::from_raw_parts(out, count as usize) };
         ptrs.iter().map(|p| unsafe { CStr::from_ptr(*p) }.to_string_lossy().into_owned()).collect()

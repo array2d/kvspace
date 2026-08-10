@@ -89,7 +89,7 @@ static int reader(kvspace_t *kv, int64_t seed) {
 
     printf("[reader] listing /mp/\n");
     char **ns; int32_t nc;
-    kvspace_list(kv, "/mp/", false, &ns, &nc);
+    kvspace_list(kv, "/mp/", false, 1, &ns, &nc);
     printf("[reader]   total children: %d\n", nc);
 
     // verify some ints
@@ -99,7 +99,7 @@ static int reader(kvspace_t *kv, int64_t seed) {
     for (int i = 0; i < N_KEYS; i++) {
         char k[64]; snprintf(k, sizeof(k), "/mp/k%d", i);
         int64_t expected = ((int64_t)rand() << 32) | rand();
-        int32_t l; uint8_t *v = kvspace_get(kv, k, &l);
+        int32_t l; uint8_t *v = kvspace_get(kv, k, 1, &l);
         if (v) {
             xvalue_head_t h = xvalue_decode_head(v, l);
             if (h.raw_len >= 8 && strncmp(h.kind, XK_INT64, h.kind_len) == 0) {
@@ -119,7 +119,7 @@ static int reader(kvspace_t *kv, int64_t seed) {
     printf("[reader] verifying strings...\n");
     for (int i = 0; i < 100; i++) {
         char k[64]; snprintf(k, sizeof(k), "/mp/s%d", i);
-        int32_t l; uint8_t *v = kvspace_get(kv, k, &l);
+        int32_t l; uint8_t *v = kvspace_get(kv, k, 1, &l);
         if (!v) continue; // may have been overwritten
         xvalue_head_t h = xvalue_decode_head(v, l);
         if (strncmp(h.kind, XK_STRING, h.kind_len) != 0) {
@@ -134,7 +134,7 @@ static int reader(kvspace_t *kv, int64_t seed) {
     int big_ok = 0;
     for (int i = 0; i < 20; i++) {
         char k[64]; snprintf(k, sizeof(k), "/mp/big%d", i);
-        int32_t l; uint8_t *v = kvspace_get(kv, k, &l);
+        int32_t l; uint8_t *v = kvspace_get(kv, k, 1, &l);
         if (v) {
             xvalue_head_t h = xvalue_decode_head(v, l);
             if (h.raw_len == 1024) big_ok++;

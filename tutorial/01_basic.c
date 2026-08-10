@@ -27,7 +27,7 @@
 #include <unistd.h>
 
 static void get(kvspace_t *kv, const char *key) {
-    int32_t len; uint8_t *v = kvspace_get(kv, key, &len);
+    int32_t len; uint8_t *v = kvspace_get(kv, key, 1, &len);
     if (!v || len == 0) { printf("%s\t(nil)\n", key); return; }
     xvalue_head_t h = xvalue_decode_head(v, len);
     printf("%s\t%.*s:", key, h.kind_len, h.kind);
@@ -50,12 +50,12 @@ static void set_str(kvspace_t *kv, const char *key, const char *v) {
 }
 static void list(kvspace_t *kv, const char *dir, bool show_kind) {
     char **ns; int32_t nc;
-    kvspace_list(kv, dir, false, &ns, &nc);
+    kvspace_list(kv, dir, false, 1, &ns, &nc);
     for (int i = 0; i < nc; i++) {
         char *k = malloc(strlen(dir) + strlen(ns[i]) + 2);
         sprintf(k, "%s%s", dir, ns[i]);
         if (show_kind) {
-            int32_t len; uint8_t *v = kvspace_get(kv, k, &len);
+            int32_t len; uint8_t *v = kvspace_get(kv, k, 1, &len);
             if (v) { xvalue_head_t h = xvalue_decode_head(v, len);
                 printf("%s\t%.*s", ns[i], h.kind_len, h.kind);
                 if (h.raw_len > 0 && strncmp(h.kind, XK_INT64, h.kind_len) == 0)

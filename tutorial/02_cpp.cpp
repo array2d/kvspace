@@ -30,7 +30,7 @@ struct KV {
 
     void set(const char *key, const uint8_t *val, int32_t len) { kvspace_set(kv, key, val, len); }
     bool get(const char *key, std::string &kind, std::string &raw) {
-        int32_t len; uint8_t *v = kvspace_get(kv, key, &len);
+        int32_t len; uint8_t *v = kvspace_get(kv, key, 1, &len);
         if (!v) return false;
         xvalue_head_t h = xvalue_decode_head(v, len);
         kind.assign(h.kind, h.kind_len);
@@ -43,7 +43,7 @@ struct KV {
     void mkindex(const char *p) { kvspace_mkindex(kv, p); }
     std::vector<std::string> list(const char *prefix) {
         char **ns; int32_t nc;
-        kvspace_list(kv, prefix, false, &ns, &nc);
+        kvspace_list(kv, prefix, false, 1, &ns, &nc);
         std::vector<std::string> r;
         for (int i = 0; i < nc; i++) r.push_back(ns[i]);
         for (int i = 0; i < nc; i++) free(ns[i]); free(ns);

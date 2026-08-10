@@ -44,7 +44,7 @@ static uint8_t *encode_bytes(const uint8_t *raw, int32_t rl, int32_t *len) {
 }
 
 static bool check(kvspace_t *kv, const char *key, int64_t expected, int round) {
-    int32_t len; uint8_t *v = kvspace_get(kv, key, &len);
+    int32_t len; uint8_t *v = kvspace_get(kv, key, 1, &len);
     if (!v) { printf("ROUND%d MISS  %s\n", round, key); return false; }
     xvalue_head_t h = xvalue_decode_head(v, len);
     if (h.raw_len < 8 || strncmp(h.kind, XK_INT64, h.kind_len) != 0) {
@@ -61,7 +61,7 @@ static bool check(kvspace_t *kv, const char *key, int64_t expected, int round) {
 }
 
 static bool check_str(kvspace_t *kv, const char *key, const char *expected, int round) {
-    int32_t len; uint8_t *v = kvspace_get(kv, key, &len);
+    int32_t len; uint8_t *v = kvspace_get(kv, key, 1, &len);
     if (!v) { printf("ROUND%d MISS  %s\n", round, key); return false; }
     xvalue_head_t h = xvalue_decode_head(v, len);
     if (strncmp(h.kind, XK_STRING, h.kind_len) != 0) {
@@ -181,7 +181,7 @@ int main() {
     /* ── Round 5: 校验大 value 和复用后的小 value ── */
     for (int i = 10; i < 20; i++) {
         char k[64]; snprintf(k, sizeof(k), "/it/big%d", i);
-        int32_t len; uint8_t *v = kvspace_get(kv, k, &len);
+        int32_t len; uint8_t *v = kvspace_get(kv, k, 1, &len);
         if (!v) { printf("ROUND5 MISS  big%d\n", i); errors++; continue; }
         xvalue_head_t h = xvalue_decode_head(v, len);
         if (h.raw_len != MAX_VAL_SZ || memcmp(h.raw, big_vals[i], MAX_VAL_SZ) != 0) {
@@ -197,7 +197,7 @@ int main() {
     /* ── 最终全量扫描 ── */
     printf("=== final: list and verify all ===\n");
     char **ns; int32_t nc;
-    kvspace_list(kv, "/it/", false, &ns, &nc);
+    kvspace_list(kv, "/it/", false, 1, &ns, &nc);
     printf("  total children: %d\n", nc);
     for (int i = 0; i < nc; i++) free(ns[i]); free(ns);
 
