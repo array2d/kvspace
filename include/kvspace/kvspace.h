@@ -27,20 +27,19 @@ void       kvspace_close(kvspace_t *kv);
  * 单点读写
  * ================================================================ */
 
-// Get: 返回 malloc 的 TLV buffer，调用者 free。缺失返回 NULL, *out_len=0.
-uint8_t *kvspace_get(kvspace_t *kv, const char *key, int32_t *out_len);
+// Get: resolve=1 穿透 link，resolve=0 返回 link 本身。
+uint8_t *kvspace_get(kvspace_t *kv, const char *key, int resolve, int32_t *out_len);
 
-// Set: 写入 value（TLV 编码的字节）。自动维护目录索引。
-// 父目录不存在则失败。
+// Set: 写入 value（TLV 编码的字节）。总是穿透 link 写入 target。
 int kvspace_set(kvspace_t *kv, const char *key, const uint8_t *val, int32_t val_len);
 
 /* ================================================================
  * 目录操作
  * ================================================================ */
 
-// List: 返回直接子项名数组 + 个数。调用者 free(*out_names) 和每个元素。
+// List: resolve=1 穿透 link 列出 target 子节点。
 int kvspace_list(kvspace_t *kv, const char *prefix, bool expand_ext,
-                 char ***out_names, int32_t *out_count);
+                 int resolve, char ***out_names, int32_t *out_count);
 
 int kvspace_del(kvspace_t *kv, const char *key);
 int kvspace_deltree(kvspace_t *kv, const char *prefix);

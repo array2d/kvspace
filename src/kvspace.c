@@ -275,36 +275,83 @@ void kvspace_close(kvspace_t *kv) {
     if(kv->fd>=0)close(kv->fd);free(kv);
 }
 
+/* ---- link resolve helpers ---- */
+static int read_tlv(kvspace_t *kv, uint64_t off, uint8_t **out, int32_t *ol) {
+    uint8_t *s=kv->sbo_data+off;int kl=s[0],rl=(int32_t)(s[1+kl+4]|(s[1+kl+5]<<8)|(s[1+kl+6]<<16)|(s[1+kl+7]<<24));
+    int total=1+kl+8+rl;*out=malloc(total);if(!*out)return-1;memcpy(*out,s,total);*ol=total;return 0;
+}
+static void resolve_path(kvspace_t *kv, const char *path, char *out, int osz) {
+    strncpy(out,path,osz-1);out[osz-1]='\0';
+    for(int depth=0;depth<16;depth++){
+        char cur[1024];strncpy(cur,out,sizeof(cur)-1);cur[sizeof(cur)-1]='\0';
+        bool changed=false;
+        // scan / /a /a/b ... for link at each prefix
+        char *s=cur;
+        while(s&&*s){
+            s=strchr(s+1,'/');
+            int pl=s?(int)(s-cur):(int)strlen(cur);
+            if(pl==0)continue;
+            char pre[1024];memcpy(pre,cur,pl);pre[pl]='\0';
+            art_hdr_t *h=art_search(kv,kv->hdr->art_root,(const uint8_t*)pre,pl);
+            if(!h||!h->has_value){pre[pl]='/';pre[pl+1]='\0';h=art_search(kv,kv->hdr->art_root,(const uint8_t*)pre,pl+1);}
+            if(!h||!h->has_value){if(s)continue; // full key: also try dir form
+                char d[1028];snprintf(d,sizeof(d),"%s/",cur);h=art_search(kv,kv->hdr->art_root,(const uint8_t*)d,(int)strlen(d));}
+            if(!h||!h->has_value)continue;
+            uint8_t *raw;int32_t rl;if(read_tlv(kv,h->box_offset,&raw,&rl)<0)continue;
+            xvalue_head_t hh=xvalue_decode_head(raw,rl);
+            if(strncmp(hh.kind,XK_LINKINDEX,hh.kind_len)!=0){free(raw);continue;}
+            int tl=hh.raw_len;if(tl>=osz){free(raw);break;}
+            memcpy(out,hh.raw,tl);out[tl]='\0';
+            const char *rest=path+pl;if(*rest=='/')rest++;
+            if(*rest){size_t ol=strlen(out);if(ol>0&&out[ol-1]!='/'){out[ol]='/';out[ol+1]='\0';}strncat(out,rest,osz-(int)strlen(out)-1);}
+            free(raw);changed=true;break;
+        }
+        if(!changed)break;
+    }
+}
+
 /* ============ CRUD ============ */
-uint8_t *kvspace_get(kvspace_t *kv, const char *key, int32_t *ol) {
+uint8_t *kvspace_get(kvspace_t *kv, const char *key, int resolve, int32_t *ol) {
     if(!kv||!key||!ol)return NULL;*ol=0;
-    art_hdr_t *h=art_search(kv,kv->hdr->art_root,(const uint8_t*)key,(int)strlen(key));
+    char kbuf[1024];
+    if(resolve)resolve_path(kv,key,kbuf,sizeof(kbuf));
+    else{strncpy(kbuf,key,sizeof(kbuf)-1);kbuf[sizeof(kbuf)-1]='\0';}
+    art_hdr_t *h=art_search(kv,kv->hdr->art_root,(const uint8_t*)kbuf,(int)strlen(kbuf));
     if(!h||!h->has_value)return NULL;
-    uint8_t *s=kv->sbo_data+h->box_offset;int kl=s[0],rl=(int32_t)(s[1+kl+4]|(s[1+kl+5]<<8)|(s[1+kl+6]<<16)|(s[1+kl+7]<<24));
-    int total=1+kl+8+rl;uint8_t *o=malloc(total);if(!o)return NULL;memcpy(o,s,total);*ol=total;return o;
+    uint8_t *raw;int32_t rl;if(read_tlv(kv,h->box_offset,&raw,&rl)<0)return NULL;
+    *ol=rl;return raw;
 }
 
 int kvspace_set(kvspace_t *kv, const char *key, const uint8_t *val, int32_t val_len) {
     if(!kv||!key||!val||val_len<=0)return-1;
-    art_hdr_t *old=art_search(kv,kv->hdr->art_root,(const uint8_t*)key,(int)strlen(key));
+    char kbuf[1024];resolve_path(kv,key,kbuf,sizeof(kbuf)); // always resolve through link
+    art_hdr_t *old=art_search(kv,kv->hdr->art_root,(const uint8_t*)kbuf,(int)strlen(kbuf));
     if(old&&old->has_value)sbo_free(kv->sbo_meta,old->box_offset);
     uint64_t off=sbo_alloc(kv->sbo_meta,(size_t)val_len);
     if(off==(uint64_t)-1)return-1;
     memcpy(kv->sbo_data+off,val,val_len);
-    kv->hdr->art_root=art_ins(kv,kv->hdr->art_root,(const uint8_t*)key,(int)strlen(key),0,off);
+    kv->hdr->art_root=art_ins(kv,kv->hdr->art_root,(const uint8_t*)kbuf,(int)strlen(kbuf),0,off);
     return 0;
 }
 
 int kvspace_del(kvspace_t *kv, const char *key) {
-    if(!kv||!key)return-1;bool d=false;
-    kv->hdr->art_root=art_del(kv,kv->hdr->art_root,(const uint8_t*)key,(int)strlen(key),0,&d);
+    if(!kv||!key)return-1;
+    char kbuf[1024];resolve_path(kv,key,kbuf,sizeof(kbuf)); // POSIX rm: resolve all
+    bool d=false;
+    kv->hdr->art_root=art_del(kv,kv->hdr->art_root,(const uint8_t*)kbuf,(int)strlen(kbuf),0,&d);
     return d?0:-1;
 }
 
 int kvspace_deltree(kvspace_t *kv, const char *prefix) {
     if(!kv||!prefix)return-1;
+    // if prefix itself is a link, only delete the link
+    art_hdr_t *h=art_search(kv,kv->hdr->art_root,(const uint8_t*)prefix,(int)strlen(prefix));
+    if(h&&h->has_value){uint8_t *raw;int32_t rl;read_tlv(kv,h->box_offset,&raw,&rl);
+    xvalue_head_t hh=xvalue_decode_head(raw,rl);
+    if(strncmp(hh.kind,XK_LINKINDEX,hh.kind_len)==0){free(raw);return kvspace_del(kv,prefix);}
+    free(raw);}
     char *e=edir(prefix); // ensure trailing / for listing children
-    char **ns;int32_t nc;kvspace_list(kv,e,false,&ns,&nc);
+    char **ns;int32_t nc;kvspace_list(kv,e,false,1,&ns,&nc);
     for(int i=0;i<nc;i++){char *c=pjoin(e,ns[i]);kvspace_deltree(kv,c);free(c);}
     for(int i=0;i<nc;i++)free(ns[i]);free(ns);
     kvspace_del(kv,prefix);
@@ -320,14 +367,15 @@ int kvspace_mkindex(kvspace_t *kv, const char *path) {
     free(d);return r;
 }
 
-int kvspace_list(kvspace_t *kv, const char *prefix, bool ex, char ***on, int32_t *oc) {
+int kvspace_list(kvspace_t *kv, const char *prefix, bool ex, int resolve, char ***on, int32_t *oc) {
     if(!kv||!prefix||!on||!oc)return-1;*on=NULL;*oc=0;
-    int plen=(int)strlen(prefix);
+    const char *pfx=prefix;char tbuf[1024];
+    if(resolve){resolve_path(kv,prefix,tbuf,sizeof(tbuf));pfx=tbuf;}
+    int plen=(int)strlen(pfx);
     char **out=malloc(sizeof(char*)*4096);int32_t n=0;
     char buf[2048];memset(buf,0,sizeof(buf));
-    // if root is empty, nothing to scan
     if(kv->hdr->art_root<0)return 0;
-    art_scan(kv,kv->hdr->art_root,buf,0,(int)sizeof(buf),prefix,plen,&out,&n);
+    art_scan(kv,kv->hdr->art_root,buf,0,(int)sizeof(buf),pfx,plen,&out,&n);
     // filter: only direct children (one level below prefix)
     char **filt=malloc(sizeof(char*)*n);int32_t fn=0;
     for(int i=0;i<n;i++){
