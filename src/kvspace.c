@@ -236,12 +236,21 @@ static void art_scan(kvspace_t *kv, int32_t nid, char *buf, int bpos, int bcap,
 /* ============ lifecycle ============ */
 kvspace_t *kvspace_open(const char *path, size_t data_size) {
     if(!path||data_size==0)return NULL;
-    uint64_t slots=data_size/8;if(slots==0||(slots&(slots-1))!=0)return NULL;
-    size_t sbo_head=sbo_meta_size(data_size,data_size);
-    size_t shm_total=sizeof(kvspace_hdr_t)+sizeof(blocks_meta_t)+ART_SLAB_SZ+sbo_head+data_size;
 
     bool created=false;int fd=open(path,O_RDWR);
-    if(fd<0){fd=open(path,O_RDWR|O_CREAT|O_EXCL,0644);if(fd<0)return NULL;if(ftruncate(fd,(off_t)shm_total)!=0){close(fd);return NULL;}created=true;}
+    if(fd<0){fd=open(path,O_RDWR|O_CREAT|O_EXCL,0644);if(fd<0)return NULL;created=true;}
+
+    if(!created){
+        struct stat st;fstat(fd,&st);
+        if(st.st_size<(off_t)sizeof(kvspace_hdr_t)){close(fd);return NULL;}
+        kvspace_hdr_t tmp;pread(fd,&tmp,sizeof(tmp),0);
+        if(memcmp(tmp.magic,KVS_MAGIC,sizeof(KVS_MAGIC)-1)!=0){close(fd);return NULL;}
+        data_size=(size_t)tmp.sbo_data_size;
+    }else{uint64_t slots=data_size/8;if(slots==0||(slots&(slots-1))!=0){close(fd);return NULL;}}
+
+    size_t sbo_head=sbo_meta_size(data_size,256*1024);
+    size_t shm_total=sizeof(kvspace_hdr_t)+sizeof(blocks_meta_t)+ART_SLAB_SZ+sbo_head+data_size;
+    if(created&&ftruncate(fd,(off_t)shm_total)!=0){close(fd);return NULL;}
     uint8_t *shm=mmap(NULL,shm_total,PROT_READ|PROT_WRITE,MAP_SHARED,fd,0);
     if(shm==MAP_FAILED){close(fd);return NULL;}
 
@@ -278,7 +287,7 @@ void kvspace_close(kvspace_t *kv) {
 /* ---- link resolve helpers ---- */
 static int read_tlv(kvspace_t *kv, uint64_t off, uint8_t **out, int32_t *ol) {
     uint8_t *s=kv->sbo_data+off;int kl=s[0],rl=(int32_t)(s[1+kl+4]|(s[1+kl+5]<<8)|(s[1+kl+6]<<16)|(s[1+kl+7]<<24));
-    int total=1+kl+8+rl;*out=malloc(total);if(!*out)return-1;memcpy(*out,s,total);*ol=total;return 0;
+    int total=1+kl+8+rl;*out=s; /* SHM pointer */*ol=total;return 0;
 }
 static void resolve_path(kvspace_t *kv, const char *path, char *out, int osz) {
     strncpy(out,path,osz-1);out[osz-1]='\0';
@@ -299,12 +308,12 @@ static void resolve_path(kvspace_t *kv, const char *path, char *out, int osz) {
             if(!h||!h->has_value)continue;
             uint8_t *raw;int32_t rl;if(read_tlv(kv,h->box_offset,&raw,&rl)<0)continue;
             xvalue_head_t hh=xvalue_decode_head(raw,rl);
-            if(strncmp(hh.kind,XK_LINKINDEX,hh.kind_len)!=0){free(raw);continue;}
-            int tl=hh.raw_len;if(tl>=osz){free(raw);break;}
+            if(strncmp(hh.kind,XK_LINKINDEX,hh.kind_len)!=0){continue;}
+            int tl=hh.raw_len;if(tl>=osz){break;}
             memcpy(out,hh.raw,tl);out[tl]='\0';
             const char *rest=path+pl;if(*rest=='/')rest++;
             if(*rest){size_t ol=strlen(out);if(ol>0&&out[ol-1]!='/'){out[ol]='/';out[ol+1]='\0';}strncat(out,rest,osz-(int)strlen(out)-1);}
-            free(raw);changed=true;break;
+            changed=true;break;
         }
         if(!changed)break;
     }
@@ -348,8 +357,8 @@ int kvspace_deltree(kvspace_t *kv, const char *prefix) {
     art_hdr_t *h=art_search(kv,kv->hdr->art_root,(const uint8_t*)prefix,(int)strlen(prefix));
     if(h&&h->has_value){uint8_t *raw;int32_t rl;read_tlv(kv,h->box_offset,&raw,&rl);
     xvalue_head_t hh=xvalue_decode_head(raw,rl);
-    if(strncmp(hh.kind,XK_LINKINDEX,hh.kind_len)==0){free(raw);return kvspace_del(kv,prefix);}
-    free(raw);}
+    if(strncmp(hh.kind,XK_LINKINDEX,hh.kind_len)==0){return kvspace_del(kv,prefix);}
+    }
     char *e=edir(prefix); // ensure trailing / for listing children
     char **ns;int32_t nc;kvspace_list(kv,e,false,1,&ns,&nc);
     for(int i=0;i<nc;i++){char *c=pjoin(e,ns[i]);kvspace_deltree(kv,c);free(c);}
