@@ -46,12 +46,11 @@ int kvspace_deltree(kvspace_t *kv, const char *prefix);
 int kvspace_mkindex(kvspace_t *kv, const char *path); // 递归创建目录
 
 /* ================================================================
- * Link / ExtIndex
+ * ExtIndex
  * ================================================================ */
 
-int kvspace_link(kvspace_t *kv, const char *target, const char *linkpath);
 int kvspace_extindex(kvspace_t *kv, const char *path, const char *extpath);
-int kvspace_unlink(kvspace_t *kv, const char *path);
+int kvspace_delextindex(kvspace_t *kv, const char *path);    // 移除 extindex
 
 /* ================================================================
  * Watch / Notify

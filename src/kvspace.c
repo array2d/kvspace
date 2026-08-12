@@ -971,13 +971,6 @@ int kvspace_list(kvspace_t *kv, const char *prefix, bool ex, int resolve,
   return 0;
 }
 
-int kvspace_link(kvspace_t *kv, const char *t, const char *l) {
-  uint8_t *v;
-  int32_t vl = xvalue_new_linkindex(t, &v);
-  int r = kvspace_set(kv, l, v, vl);
-  free(v);
-  return r;
-}
 int kvspace_extindex(kvspace_t *kv, const char *p, const char *ep) {
   uint8_t *v;
   int32_t vl = xvalue_new_extindex(ep, NULL, 0, &v);
@@ -985,7 +978,7 @@ int kvspace_extindex(kvspace_t *kv, const char *p, const char *ep) {
   free(v);
   return r;
 }
-int kvspace_unlink(kvspace_t *kv, const char *p) { return kvspace_del(kv, p); }
+int kvspace_delextindex(kvspace_t *kv, const char *p) { return kvspace_del(kv, p); }
 
 /* ============ Watch/Notify ============ */
 static int wslot(const char *k) {
