@@ -26,9 +26,8 @@ _bind(_lib.kvspace_deltree, [ctypes.c_void_p, ctypes.c_char_p], ctypes.c_int)
 _bind(_lib.kvspace_mkindex, [ctypes.c_void_p, ctypes.c_char_p], ctypes.c_int)
 _bind(_lib.kvspace_list, [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_bool, ctypes.c_int,
                            ctypes.POINTER(ctypes.c_void_p), ctypes.POINTER(ctypes.c_int32)], ctypes.c_int)
-_bind(_lib.kvspace_link, [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_char_p], ctypes.c_int)
 _bind(_lib.kvspace_extindex, [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_char_p], ctypes.c_int)
-_bind(_lib.kvspace_unlink, [ctypes.c_void_p, ctypes.c_char_p], ctypes.c_int)
+_bind(_lib.kvspace_delextindex, [ctypes.c_void_p, ctypes.c_char_p], ctypes.c_int)
 _bind(_lib.kvspace_notify, [ctypes.c_void_p, ctypes.c_char_p, ctypes.POINTER(ctypes.c_uint8), ctypes.c_int32], ctypes.c_int)
 _bind(_lib.kvspace_watch, [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_int32, ctypes.POINTER(ctypes.c_int32)], ctypes.POINTER(ctypes.c_uint8))
 
@@ -137,11 +136,8 @@ class KVSpace:
 
     # ── Link / ExtIndex ──────────────────────────────────────
 
-    def link(self, target: str, linkpath: str):
-        _lib.kvspace_link(self._kv, target.encode(), linkpath.encode())
-
     def extindex(self, path: str, extpath: str):
         _lib.kvspace_extindex(self._kv, path.encode(), extpath.encode())
 
-    def unlink(self, path: str):
-        _lib.kvspace_unlink(self._kv, path.encode())
+    def delextindex(self, path: str):
+        _lib.kvspace_delextindex(self._kv, path.encode())

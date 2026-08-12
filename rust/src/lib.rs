@@ -25,9 +25,8 @@ mod ffi {
         pub fn kvspace_deltree(kv: *mut std::ffi::c_void, prefix: *const c_char) -> i32;
         pub fn kvspace_mkindex(kv: *mut std::ffi::c_void, path: *const c_char) -> i32;
         pub fn kvspace_list(kv: *mut std::ffi::c_void, prefix: *const c_char, expand_ext: bool, resolve: i32, out_names: *mut *mut *const c_char, out_count: *mut i32) -> i32;
-        pub fn kvspace_link(kv: *mut std::ffi::c_void, target: *const c_char, linkpath: *const c_char) -> i32;
         pub fn kvspace_extindex(kv: *mut std::ffi::c_void, path: *const c_char, extpath: *const c_char) -> i32;
-        pub fn kvspace_unlink(kv: *mut std::ffi::c_void, path: *const c_char) -> i32;
+        pub fn kvspace_delextindex(kv: *mut std::ffi::c_void, path: *const c_char) -> i32;
     }
 }
 
@@ -128,12 +127,6 @@ impl KVSpace {
             .map(|p| unsafe { CStr::from_ptr(*p) }.to_string_lossy().into_owned())
             .collect();
         names
-    }
-
-    pub fn link(&self, target: &str, linkpath: &str) {
-        let ct = CString::new(target).unwrap();
-        let cl = CString::new(linkpath).unwrap();
-        unsafe { ffi::kvspace_link(self.ptr, ct.as_ptr(), cl.as_ptr()); }
     }
 
     pub fn extindex(&self, path: &str, extpath: &str) {

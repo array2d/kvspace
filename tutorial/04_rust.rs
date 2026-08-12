@@ -14,7 +14,6 @@ extern "C" {
     fn kvspace_mkindex(kv: *mut c_void, path: *const c_char) -> c_int;
     fn kvspace_list(kv: *mut c_void, prefix: *const c_char, expand_ext: bool, resolve: c_int,
                     out_names: *mut *mut *const c_char, out_count: *mut c_int) -> c_int;
-    fn kvspace_link(kv: *mut c_void, target: *const c_char, linkpath: *const c_char) -> c_int;
 }
 
 fn xv_int(v: i64) -> Vec<u8> {
