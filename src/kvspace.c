@@ -406,21 +406,38 @@ static void art_rm(kvspace_t *kv, void *n, uint8_t b) {
   }
 }
 
-/* ---- insert ---- */
-static int32_t art_ins(kvspace_t *kv, int32_t nid, const uint8_t *key, int klen,
-                       int d, uint64_t off) {
-  if (nid < 0) {
+/* ---- 叶子链：key[d..klen) 建链，末端叶子存 off（尾段超 ART_PREFIX_MAX 分级） ---- */
+static int32_t art_leaf_chain(kvspace_t *kv, const uint8_t *key, int klen,
+                              int d, uint64_t off) {
+  int rem = klen - d;
+  if (rem <= ART_PREFIX_MAX) {
     int32_t id = art_new_leaf(kv, off);
     if (id < 0)
       return -1;
     art_n4_t *x = art_blk(kv, id);
-    int pl = klen - d;
-    if (pl > ART_PREFIX_MAX)
-      pl = ART_PREFIX_MAX;
-    memcpy(x->h.prefix, key + d, pl);
-    x->h.prefix_len = (uint8_t)pl;
+    if (rem > 0)
+      memcpy(x->h.prefix, key + d, (size_t)rem);
+    x->h.prefix_len = (uint8_t)rem;
     return id;
   }
+  int32_t id = art_new_node(kv, ART_N4);
+  if (id < 0)
+    return -1;
+  art_hdr_t *x = art_hdr(kv, id);
+  memcpy(x->prefix, key + d, ART_PREFIX_MAX);
+  x->prefix_len = ART_PREFIX_MAX;
+  int32_t sub = art_leaf_chain(kv, key, klen, d + ART_PREFIX_MAX + 1, off);
+  if (sub < 0)
+    return -1;
+  art_add(kv, x, key[d + ART_PREFIX_MAX], sub);
+  return id;
+}
+
+/* ---- insert ---- */
+static int32_t art_ins(kvspace_t *kv, int32_t nid, const uint8_t *key, int klen,
+                       int d, uint64_t off) {
+  if (nid < 0)
+    return art_leaf_chain(kv, key, klen, d, off);
 
   art_hdr_t *h = art_hdr(kv, nid);
   if (!h)
@@ -428,6 +445,24 @@ static int32_t art_ins(kvspace_t *kv, int32_t nid, const uint8_t *key, int klen,
   int shared = pfx_shared(h->prefix, h->prefix_len, key + d, klen - d);
   int mpl = h->prefix_len < (klen - d) ? h->prefix_len : (klen - d);
 
+  if (shared == mpl && (klen - d) < h->prefix_len) {
+    /* key 在节点 prefix 内部耗尽（含 d==klen）：拆出 shared 字节作新值，旧节点作 child */
+    int32_t nn = art_new_node(kv, ART_N4);
+    if (nn < 0)
+      return -1;
+    art_hdr_t *nh = art_hdr(kv, nn);
+    nh->prefix_len = (uint8_t)shared;
+    if (shared > 0)
+      memcpy(nh->prefix, key + d, (size_t)shared);
+    uint8_t ob = h->prefix[shared];
+    h->prefix_len -= (uint8_t)(shared + 1);
+    if (h->prefix_len > 0)
+      memmove(h->prefix, h->prefix + shared + 1, h->prefix_len);
+    art_add(kv, nh, ob, nid);
+    nh->has_value = 1;
+    nh->box_offset = off;
+    return nn;
+  }
   if (shared < mpl) { // prefix split
     int32_t nn = art_new_node(kv, ART_N4);
     if (nn < 0)
@@ -440,19 +475,10 @@ static int32_t art_ins(kvspace_t *kv, int32_t nid, const uint8_t *key, int klen,
     if (h->prefix_len > 0)
       memmove(h->prefix, h->prefix + shared + 1, h->prefix_len);
     art_add(kv, nh, ob, nid);
-    int32_t leaf = art_new_leaf(kv, off);
+    int32_t leaf = art_leaf_chain(kv, key, klen, d + shared + 1, off);
     if (leaf < 0)
       return -1;
-    art_n4_t *lf = art_blk(kv, leaf);
-    int rem = klen - d - shared - 1;
-    if (rem > 0) {
-      if (rem > ART_PREFIX_MAX)
-        rem = ART_PREFIX_MAX;
-      memcpy(lf->h.prefix, key + d + shared + 1, rem);
-      lf->h.prefix_len = (uint8_t)rem;
-    }
-    if (d + shared < klen)
-      art_add(kv, nh, key[d + shared], leaf);
+    art_add(kv, nh, key[d + shared], leaf);
     return nn;
   }
   d += h->prefix_len;
@@ -476,17 +502,9 @@ static int32_t art_ins(kvspace_t *kv, int32_t nid, const uint8_t *key, int klen,
     }
     return nid;
   }
-  int32_t leaf = art_new_leaf(kv, off);
+  int32_t leaf = art_leaf_chain(kv, key, klen, d + 1, off);
   if (leaf < 0)
     return -1;
-  art_n4_t *lf = art_blk(kv, leaf);
-  int rem = klen - d - 1;
-  if (rem > 0) {
-    if (rem > ART_PREFIX_MAX)
-      rem = ART_PREFIX_MAX;
-    memcpy(lf->h.prefix, key + d + 1, rem);
-    lf->h.prefix_len = (uint8_t)rem;
-  }
   if ((h->type == ART_N4 && h->count >= 4) ||
       (h->type == ART_N16 && h->count >= 16) ||
       (h->type == ART_N48 && h->count >= 48)) {
@@ -547,10 +565,9 @@ static void psplit(const char *k, char **p, char **n) {
     *n = strdup(s ? s + 1 : k);
     return;
   }
-  size_t pl = (size_t)(s - k) + 2;
+  size_t pl = (size_t)(s - k) + 1; /* 含尾 '/' */
   *p = malloc(pl + 1);
-  memcpy(*p, k, pl - 1);
-  (*p)[pl - 1] = '/';
+  memcpy(*p, k, pl);
   (*p)[pl] = '\0';
   *n = strdup(s + 1);
 }
@@ -633,7 +650,7 @@ static void art_scan(kvspace_t *kv, int32_t nid, char *buf, int bpos, int bcap,
 }
 
 /* ============ lifecycle ============ */
-kvspace_t *kvspace_open(const char *path, size_t data_size) {
+kvspace_t *kvsc_open(const char *path, size_t data_size) {
   if (!path || data_size == 0)
     return NULL;
 
@@ -710,7 +727,7 @@ kvspace_t *kvspace_open(const char *path, size_t data_size) {
     sbo_init(kv->sbo_meta, sbo_head, (size_t)kv->hdr->sbo_data_size);
   } else {
     if (memcmp(kv->hdr->magic, KVS_MAGIC, sizeof(KVS_MAGIC) - 1) != 0) {
-      kvspace_close(kv);
+      kvsc_close(kv);
       return NULL;
     }
   }
@@ -722,7 +739,7 @@ kvspace_t *kvspace_open(const char *path, size_t data_size) {
   }
   return kv;
 }
-void kvspace_close(kvspace_t *kv) {
+void kvsc_close(kvspace_t *kv) {
   if (!kv)
     return;
   for (int i = 0; i < WATCH_TABLE_SZ; i++) {
@@ -739,11 +756,17 @@ void kvspace_close(kvspace_t *kv) {
 }
 
 /* ---- link resolve helpers ---- */
+static uint32_t rd32(const uint8_t *r) {
+    return (uint32_t)r[0] | ((uint32_t)r[1] << 8) | ((uint32_t)r[2] << 16) | ((uint32_t)r[3] << 24);
+}
 static int read_tlv(kvspace_t *kv, uint64_t off, uint8_t **out, int32_t *ol) {
   uint8_t *s = kv->sbo_data + off;
-  int kl = s[0], rl = (int32_t)(s[1 + kl + 4] | (s[1 + kl + 5] << 8) |
-                                (s[1 + kl + 6] << 16) | (s[1 + kl + 7] << 24));
-  int total = 1 + kl + 8 + rl;
+  int kl = s[0];
+  int o = 1 + kl;
+  int ndim = s[o + 2];
+  int raw_off = o + 3 + 4 * ndim;
+  int rl = (int32_t)rd32(s + raw_off);
+  int total = raw_off + 4 + rl;
   *out = s; /* SHM pointer */
   *ol = total;
   return 0;
@@ -788,7 +811,7 @@ static void resolve_path(kvspace_t *kv, const char *path, char *out, int osz) {
       if (read_tlv(kv, h->box_offset, &raw, &rl) < 0)
         continue;
       xvalue_head_t hh = xvalue_decode_head(raw, rl);
-      if (strncmp(hh.kind, XK_LINKINDEX, hh.kind_len) != 0) {
+      if (hh.ref != 1) {
         continue;
       }
       int tl = hh.raw_len;
@@ -816,8 +839,44 @@ static void resolve_path(kvspace_t *kv, const char *path, char *out, int osz) {
   }
 }
 
+/* 解析 extindex body 的 extpath（body = "…extpath\nchild..."）。 */
+static void decode_ext_path(const uint8_t *raw, int32_t rl, char *out, int osz) {
+  out[0] = 0;
+  if (!raw || rl <= 0)
+    return;
+  const char *s = (const char *)raw;
+  int start = 0;
+  if (rl >= 3 && (uint8_t)s[0] == 0xE2 && (uint8_t)s[1] == 0x80 && (uint8_t)s[2] == 0xA6)
+    start = 3;
+  int i;
+  for (i = start; i < rl && s[i] != '\n'; i++)
+    ;
+  int el = i - start;
+  if (el >= osz)
+    el = osz - 1;
+  memcpy(out, s + start, (size_t)el);
+  out[el] = 0;
+}
+
+/* 读 dir（尾斜杠目录键）的 extindex，返回 extpath；非 extindex 返回 0。 */
+static int dir_ext_path(kvspace_t *kv, const char *dir, char *out, int osz) {
+  out[0] = 0;
+  art_hdr_t *h = art_search(kv, kv->hdr->art_root, (const uint8_t *)dir, (int)strlen(dir));
+  if (!h || !h->has_value)
+    return 0;
+  uint8_t *raw;
+  int32_t rl;
+  if (read_tlv(kv, h->box_offset, &raw, &rl) < 0)
+    return 0;
+  xvalue_head_t hh = xvalue_decode_head(raw, rl);
+  if (hh.kind_len != (int32_t)strlen(XK_EXT_INDEX) || memcmp(hh.kind, XK_EXT_INDEX, hh.kind_len) != 0)
+    return 0;
+  decode_ext_path(hh.raw, hh.raw_len, out, osz);
+  return out[0] ? 1 : 0;
+}
+
 /* ============ CRUD ============ */
-uint8_t *kvspace_get(kvspace_t *kv, const char *key, int resolve, int32_t *ol) {
+uint8_t *kvsc_get(kvspace_t *kv, const char *key, int resolve, int32_t *ol) {
   if (!kv || !key || !ol)
     return NULL;
   *ol = 0;
@@ -830,8 +889,29 @@ uint8_t *kvspace_get(kvspace_t *kv, const char *key, int resolve, int32_t *ol) {
   }
   art_hdr_t *h = art_search(kv, kv->hdr->art_root, (const uint8_t *)kbuf,
                             (int)strlen(kbuf));
-  if (!h || !h->has_value)
+  if (!h || !h->has_value) {
+    /* extindex fallback：父目录是 extindex → 读 extpath + name */
+    char *parent = NULL, *name = NULL;
+    psplit(kbuf, &parent, &name);
+    char extpath[1024];
+    if (dir_ext_path(kv, parent, extpath, sizeof extpath)) {
+      char *target = pjoin(extpath, name);
+      art_hdr_t *eh = art_search(kv, kv->hdr->art_root, (const uint8_t *)target,
+                                 (int)strlen(target));
+      free(target);
+      if (eh && eh->has_value) {
+        uint8_t *raw;
+        int32_t rl;
+        if (read_tlv(kv, eh->box_offset, &raw, &rl) == 0) {
+          *ol = rl;
+          free(parent); free(name);
+          return raw;
+        }
+      }
+    }
+    free(parent); free(name);
     return NULL;
+  }
   uint8_t *raw;
   int32_t rl;
   if (read_tlv(kv, h->box_offset, &raw, &rl) < 0)
@@ -840,7 +920,7 @@ uint8_t *kvspace_get(kvspace_t *kv, const char *key, int resolve, int32_t *ol) {
   return raw;
 }
 
-int kvspace_set(kvspace_t *kv, const char *key, const uint8_t *val,
+int kvsc_set(kvspace_t *kv, const char *key, const uint8_t *val,
                 int32_t val_len) {
   if (!kv || !key || !val || val_len <= 0)
     return -1;
@@ -859,7 +939,7 @@ int kvspace_set(kvspace_t *kv, const char *key, const uint8_t *val,
   return 0;
 }
 
-int kvspace_del(kvspace_t *kv, const char *key) {
+int kvsc_del(kvspace_t *kv, const char *key) {
   if (!kv || !key)
     return -1;
   char kbuf[1024];
@@ -870,7 +950,7 @@ int kvspace_del(kvspace_t *kv, const char *key) {
   return d ? 0 : -1;
 }
 
-int kvspace_deltree(kvspace_t *kv, const char *prefix) {
+int kvsc_deltree(kvspace_t *kv, const char *prefix) {
   if (!kv || !prefix)
     return -1;
   // if prefix itself is a link, only delete the link
@@ -881,42 +961,42 @@ int kvspace_deltree(kvspace_t *kv, const char *prefix) {
     int32_t rl;
     read_tlv(kv, h->box_offset, &raw, &rl);
     xvalue_head_t hh = xvalue_decode_head(raw, rl);
-    if (strncmp(hh.kind, XK_LINKINDEX, hh.kind_len) == 0) {
-      return kvspace_del(kv, prefix);
+    if (hh.ref == 1) {
+      return kvsc_del(kv, prefix);
     }
   }
   char *e = edir(prefix); // ensure trailing / for listing children
   char **ns;
   int32_t nc;
-  kvspace_list(kv, e, false, 1, &ns, &nc);
+  kvsc_list(kv, e, false, 1, &ns, &nc);
   for (int i = 0; i < nc; i++) {
     char *c = pjoin(e, ns[i]);
-    kvspace_deltree(kv, c);
+    kvsc_deltree(kv, c);
     free(c);
   }
   for (int i = 0; i < nc; i++)
     free(ns[i]);
   free(ns);
-  kvspace_del(kv, prefix);
+  kvsc_del(kv, prefix);
   if (strcmp(e, prefix) != 0)
-    kvspace_del(kv, e);
+    kvsc_del(kv, e);
   free(e);
   return 0;
 }
 
-int kvspace_mkindex(kvspace_t *kv, const char *path) {
+int kvsc_mkindex(kvspace_t *kv, const char *path) {
   if (!kv || !path)
     return -1;
   char *d = edir(path);
   uint8_t *v;
   int32_t vl = xvalue_new_index(NULL, 0, &v);
-  int r = kvspace_set(kv, d, v, vl);
+  int r = kvsc_set(kv, d, v, vl);
   free(v);
   free(d);
   return r;
 }
 
-int kvspace_list(kvspace_t *kv, const char *prefix, bool ex, int resolve,
+int kvsc_list(kvspace_t *kv, const char *prefix, bool ex, int resolve,
                  char ***on, int32_t *oc) {
   if (!kv || !prefix || !on || !oc)
     return -1;
@@ -966,19 +1046,60 @@ int kvspace_list(kvspace_t *kv, const char *prefix, bool ex, int resolve,
   for (int i = 0; i < n; i++)
     free(out[i]);
   free(out);
+
+  /* extindex 展开：ex 且 prefix 是 extindex → 追加 extpath 的直接子项。 */
+  if (ex) {
+    char extpath[1024];
+    char *d = edir(pfx);
+    if (dir_ext_path(kv, d, extpath, sizeof extpath)) {
+      char **eo = malloc(sizeof(char *) * 4096);
+      int32_t en = 0;
+      char ebuf[2048];
+      memset(ebuf, 0, sizeof ebuf);
+      int el = (int)strlen(extpath);
+      art_scan(kv, kv->hdr->art_root, ebuf, 0, (int)sizeof ebuf, extpath, el, &eo, &en);
+      filt = realloc(filt, sizeof(char *) * (size_t)(fn + en));
+      for (int i = 0; i < en; i++) {
+        const char *k = eo[i];
+        int kl = (int)strlen(k);
+        if (kl <= el)
+          continue;
+        const char *rest = k + el;
+        const char *slash = strchr(rest, '/');
+        int nlen = slash ? (int)(slash - rest) : (int)(kl - el);
+        if (nlen == 0)
+          continue;
+        bool dup = false;
+        for (int j = 0; j < fn; j++)
+          if (strncmp(filt[j], rest, (size_t)nlen) == 0 && filt[j][nlen] == '\0') {
+            dup = true;
+            break;
+          }
+        if (!dup) {
+          filt[fn] = strndup(rest, (size_t)nlen);
+          fn++;
+        }
+      }
+      for (int i = 0; i < en; i++)
+        free(eo[i]);
+      free(eo);
+    }
+    free(d);
+  }
+
   *on = filt;
   *oc = fn;
   return 0;
 }
 
-int kvspace_extindex(kvspace_t *kv, const char *p, const char *ep) {
+int kvsc_extindex(kvspace_t *kv, const char *p, const char *ep) {
   uint8_t *v;
   int32_t vl = xvalue_new_extindex(ep, NULL, 0, &v);
-  int r = kvspace_set(kv, p, v, vl);
+  int r = kvsc_set(kv, p, v, vl);
   free(v);
   return r;
 }
-int kvspace_delextindex(kvspace_t *kv, const char *p) { return kvspace_del(kv, p); }
+int kvsc_delextindex(kvspace_t *kv, const char *p) { return kvsc_del(kv, p); }
 
 /* ============ Watch/Notify ============ */
 static int wslot(const char *k) {
@@ -987,7 +1108,7 @@ static int wslot(const char *k) {
     h = ((h << 5) + h) + (uint8_t)*p;
   return (int)(h % WATCH_TABLE_SZ);
 }
-int kvspace_notify(kvspace_t *kv, const char *k, const uint8_t *v, int32_t vl) {
+int kvsc_notify(kvspace_t *kv, const char *k, const uint8_t *v, int32_t vl) {
   if (!kv || !k)
     return -1;
   int s = wslot(k);
@@ -1005,7 +1126,7 @@ int kvspace_notify(kvspace_t *kv, const char *k, const uint8_t *v, int32_t vl) {
   pthread_mutex_unlock(&kv->wlock);
   return 0;
 }
-uint8_t *kvspace_watch(kvspace_t *kv, const char *k, int32_t to, int32_t *ol) {
+uint8_t *kvsc_watch(kvspace_t *kv, const char *k, int32_t to, int32_t *ol) {
   if (!kv || !k || !ol)
     return NULL;
   *ol = 0;
