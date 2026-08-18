@@ -127,16 +127,16 @@ int kvspace_disconn(void *h, char *err, uint32_t err_cap) {
 }
 
 int kvspace_tlv_encode(const char *kind, const uint8_t *raw, uint32_t raw_len,
-                       int32_t array_len, uint8_t **out, uint32_t *out_len) {
-    int32_t n = xvalue_encode(kind, raw, (int32_t)raw_len, array_len, out);
+                       const int32_t *dims, int32_t ndim, uint8_t **out, uint32_t *out_len) {
+    int32_t n = xvalue_encode(kind, raw, (int32_t)raw_len, dims, ndim, out);
     if (n < 0) return 1;
     *out_len = (uint32_t)n;
     return 0;
 }
 
 int kvspace_tlv_encode_ptr(const char *kind, const uint8_t *raw, uint32_t raw_len,
-                           int32_t array_len, uint8_t **out, uint32_t *out_len) {
-    int32_t n = xvalue_encode_ptr(kind, raw, (int32_t)raw_len, array_len, out);
+                           const int32_t *dims, int32_t ndim, uint8_t **out, uint32_t *out_len) {
+    int32_t n = xvalue_encode_ptr(kind, raw, (int32_t)raw_len, dims, ndim, out);
     if (n < 0) return 1;
     *out_len = (uint32_t)n;
     return 0;
@@ -178,7 +178,8 @@ int kvspace_new_char(const char *kind, const char *s, uint8_t **out, uint32_t *o
 }
 
 int kvspace_new_char_byte(const uint8_t *bytes, uint32_t len, uint8_t **out, uint32_t *out_len) {
-    int32_t n = xvalue_encode(XK_CHAR_UTF8, bytes, (int32_t)len, (int32_t)len, out);
+    int32_t d = (int32_t)len;
+    int32_t n = xvalue_encode(XK_CHAR_UTF8, bytes, (int32_t)len, &d, 1, out);
     if (n < 0) return 1;
     *out_len = (uint32_t)n;
     return 0;

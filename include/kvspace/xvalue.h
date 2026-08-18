@@ -56,12 +56,12 @@ typedef struct {
 /* head 字节数（不含 body） */
 int32_t xvalue_head_len(const xvalue_head_t *h);
 
-/* 内联编码（ref=0）。array_len<=0 视为 1；>1 编码为一维连续数组。 */
+/* 内联编码（ref=0）。dims/ndim 直接落盘：ndim=0 标量，dims 可为 NULL。 */
 int32_t xvalue_encode(const char *kind, const uint8_t *raw, int32_t raw_len,
-                      int32_t array_len, uint8_t **out);
+                      const int32_t *dims, int32_t ndim, uint8_t **out);
 /* 软链接编码（ref=1），raw 为目标路径。 */
 int32_t xvalue_encode_ptr(const char *kind, const uint8_t *raw, int32_t raw_len,
-                          int32_t array_len, uint8_t **out);
+                          const int32_t *dims, int32_t ndim, uint8_t **out);
 xvalue_head_t xvalue_decode_head(const uint8_t *data, int32_t data_len);
 
 /* raw 读取 helpers（小端） */
