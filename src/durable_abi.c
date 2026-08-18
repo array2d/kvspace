@@ -1,6 +1,9 @@
 /* durable_abi.c — 对齐 kvspace-durable 的 C ABI（kvspace_conn 等 22 符号），
  * 让 kvlang 的 Rust layout 零改动对接 kvspace-c 的 SHM。内部复用 kvsc_* 与 xvalue_*。 */
 
+#define _POSIX_C_SOURCE 199309L
+#define _DEFAULT_SOURCE
+
 #include "kvspace/kvspace.h"
 #include "kvspace/xvalue.h"
 #include <stdio.h>
@@ -11,13 +14,15 @@
 
 #define SHM_DEFAULT_SIZE (8ULL * 64 * 64 * 64 * 64)
 
-/* 对齐 kvspace-durable 的 KVHead（repr(C)，48B）。 */
+/* 对齐 kvspace-durable 的 KVHead（repr(C)）。kind+ndim+dims 即完整 kindexp。 */
 typedef struct {
     uint8_t kind[32];
     uint8_t is_ptr;
     int32_t array_len;
     int32_t body_len;
     int32_t body_offset;
+    int32_t ndim;
+    int32_t dims[8];
 } kvhead_t;
 
 static int parse_shm_path(const char *dsn, char *out, size_t osz) {
@@ -149,6 +154,8 @@ int kvspace_decode_head(const uint8_t *data, uint32_t data_len, kvhead_t *out) {
     out->array_len = h.array_len;
     out->body_len = h.raw_len;
     out->body_offset = xvalue_head_len(&h);
+    out->ndim = h.ndim;
+    for (int i = 0; i < 8 && i < h.ndim; i++) out->dims[i] = h.dims[i];
     return 0;
 }
 

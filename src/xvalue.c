@@ -18,49 +18,28 @@ static uint32_t rd_u32(const uint8_t *r) {
     return (uint32_t)r[0] | ((uint32_t)r[1]<<8) | ((uint32_t)r[2]<<16) | ((uint32_t)r[3]<<24);
 }
 
-static bool kind_eq(const xvalue_head_t *h, const char *k) {
-    size_t l = strlen(k);
-    return h->kind_len == (int32_t)l && memcmp(h->kind, k, l) == 0;
-}
-
-static int32_t elem_size(const xvalue_head_t *h) {
-    if (kind_eq(h, XK_INT8) || kind_eq(h, XK_UINT8) || kind_eq(h, XK_CHAR_UTF8) ||
-        kind_eq(h, XK_CHAR_ASCII) || kind_eq(h, XK_BOOL)) return 1;
-    if (kind_eq(h, XK_INT16) || kind_eq(h, XK_UINT16)) return 2;
-    if (kind_eq(h, XK_INT32) || kind_eq(h, XK_UINT32) || kind_eq(h, XK_FLOAT32) || kind_eq(h, XK_CHAR)) return 4;
-    if (kind_eq(h, XK_INT64) || kind_eq(h, XK_UINT64) || kind_eq(h, XK_FLOAT64) ||
-        kind_eq(h, XK_TIME) || kind_eq(h, XK_DURATION)) return 8;
-    return 0;
-}
-
-static int32_t header_array_len(int32_t arr_flag, int32_t ndim, const int32_t *dims,
-                                int32_t raw_len, const xvalue_head_t *h) {
-    if (arr_flag == 0) return 1;
-    if (ndim > 0) {
-        int32_t n = 1;
-        for (int i = 0; i < ndim; i++) n *= dims[i];
-        return n;
-    }
-    int32_t es = elem_size(h);
-    return es > 0 ? raw_len / es : 0;
+static int32_t header_array_len(int32_t ndim, const int32_t *dims) {
+    if (ndim <= 0) return 1;
+    int32_t n = 1;
+    for (int i = 0; i < ndim; i++) n *= dims[i];
+    return n;
 }
 
 int32_t xvalue_head_len(const xvalue_head_t *h) {
-    return 1 + h->kind_len + 1 + 1 + 1 + 4 * h->ndim + 4;
+    return 1 + h->kind_len + 1 + 1 + 4 * h->ndim + 4;
 }
 
-static int32_t encode_head(const char *kind, int32_t ref, int32_t arr_flag,
+static int32_t encode_head(const char *kind, int32_t ref,
                            const int32_t *dims, int32_t ndim,
                            const uint8_t *raw, int32_t raw_len, uint8_t **out) {
     int32_t kl = (int32_t)strlen(kind);
-    int32_t total = 1 + kl + 1 + 1 + 1 + 4 * ndim + 4 + raw_len;
+    int32_t total = 1 + kl + 1 + 1 + 4 * ndim + 4 + raw_len;
     uint8_t *buf = (uint8_t *)malloc((size_t)total);
     if (!buf) return -1;
     buf[0] = (uint8_t)kl;
     memcpy(buf + 1, kind, (size_t)kl);
     int32_t o = 1 + kl;
     buf[o++] = (uint8_t)ref;
-    buf[o++] = (uint8_t)arr_flag;
     buf[o++] = (uint8_t)ndim;
     for (int i = 0; i < ndim; i++) {
         wr_u32(buf + o, (uint32_t)dims[i]);
@@ -73,22 +52,21 @@ static int32_t encode_head(const char *kind, int32_t ref, int32_t arr_flag,
     return total;
 }
 
-static void array_to_header(int32_t array_len, int32_t *arr_flag, int32_t *ndim, int32_t *dims) {
-    if (array_len <= 1) {
-        *arr_flag = 0; *ndim = 0;
-    } else {
-        *arr_flag = 1; *ndim = 1; dims[0] = array_len;
-    }
+/* array_len → (ndim, dims)：char/* 恒一维（含空串/单字符）；其余标量(≤1)=0 维、多元素=1 维。 */
+static void array_to_header(const char *kind, int32_t array_len, int32_t *ndim, int32_t *dims) {
+    bool is_char = strncmp(kind, "char/", 5) == 0;
+    if (is_char) { *ndim = 1; dims[0] = array_len < 0 ? 0 : array_len; }
+    else if (array_len > 1) { *ndim = 1; dims[0] = array_len; }
+    else { *ndim = 0; }
 }
 
 int32_t xvalue_encode(const char *kind, const uint8_t *raw, int32_t raw_len,
                       int32_t array_len, uint8_t **out) {
     if (!out || !kind) return -1;
-    if (array_len <= 0) array_len = 1;
     if (raw_len < 0) raw_len = 0;
-    int32_t af, nd, dims[X_MAX_NDIM];
-    array_to_header(array_len, &af, &nd, dims);
-    return encode_head(kind, 0, af, dims, nd, raw, raw_len, out);
+    int32_t nd, dims[X_MAX_NDIM];
+    array_to_header(kind, array_len, &nd, dims);
+    return encode_head(kind, 0, dims, nd, raw, raw_len, out);
 }
 
 int32_t xvalue_encode_ptr(const char *kind, const uint8_t *raw, int32_t raw_len,
@@ -96,9 +74,9 @@ int32_t xvalue_encode_ptr(const char *kind, const uint8_t *raw, int32_t raw_len,
     if (!out || !kind) return -1;
     if (array_len <= 0) array_len = 1;
     if (raw_len < 0) raw_len = 0;
-    int32_t af, nd, dims[X_MAX_NDIM];
-    array_to_header(array_len, &af, &nd, dims);
-    return encode_head(kind, 1, af, dims, nd, raw, raw_len, out);
+    int32_t nd, dims[X_MAX_NDIM];
+    array_to_header(kind, array_len, &nd, dims);
+    return encode_head(kind, 1, dims, nd, raw, raw_len, out);
 }
 
 xvalue_head_t xvalue_decode_head(const uint8_t *data, int32_t data_len) {
@@ -106,19 +84,18 @@ xvalue_head_t xvalue_decode_head(const uint8_t *data, int32_t data_len) {
     if (!data || data_len < 4) return h;
     h.kind_len = (int32_t)data[0];
     int32_t o = 1 + h.kind_len;
-    if (data_len < o + 3 + 4) return h;
+    if (data_len < o + 2 + 4) return h;
     h.kind = (const char *)(data + 1);
     h.ref = data[o];
-    h.arr_flag = data[o + 1];
-    h.ndim = data[o + 2];
+    h.ndim = data[o + 1];
     if (h.ndim > X_MAX_NDIM) return h;
-    if (data_len < o + 3 + 4 * h.ndim + 4) return h;
-    for (int i = 0; i < h.ndim; i++) h.dims[i] = (int32_t)rd_u32(data + o + 3 + 4 * i);
-    int32_t raw_off = o + 3 + 4 * h.ndim;
+    if (data_len < o + 2 + 4 * h.ndim + 4) return h;
+    for (int i = 0; i < h.ndim; i++) h.dims[i] = (int32_t)rd_u32(data + o + 2 + 4 * i);
+    int32_t raw_off = o + 2 + 4 * h.ndim;
     h.raw_len = (int32_t)rd_u32(data + raw_off);
     if (data_len < raw_off + 4 + h.raw_len) return h;
     h.raw = data + raw_off + 4;
-    h.array_len = header_array_len(h.arr_flag, h.ndim, h.dims, h.raw_len, &h);
+    h.array_len = header_array_len(h.ndim, h.dims);
     return h;
 }
 

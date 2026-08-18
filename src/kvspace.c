@@ -11,6 +11,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <limits.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <time.h>
@@ -756,19 +757,11 @@ void kvsc_close(kvspace_t *kv) {
 }
 
 /* ---- link resolve helpers ---- */
-static uint32_t rd32(const uint8_t *r) {
-    return (uint32_t)r[0] | ((uint32_t)r[1] << 8) | ((uint32_t)r[2] << 16) | ((uint32_t)r[3] << 24);
-}
 static int read_tlv(kvspace_t *kv, uint64_t off, uint8_t **out, int32_t *ol) {
-  uint8_t *s = kv->sbo_data + off;
-  int kl = s[0];
-  int o = 1 + kl;
-  int ndim = s[o + 2];
-  int raw_off = o + 3 + 4 * ndim;
-  int rl = (int32_t)rd32(s + raw_off);
-  int total = raw_off + 4 + rl;
+  uint8_t *s = kv->sbo_data + off;   /* box 内必含完整 TLV，用 xvalue 解码器算长度 */
+  xvalue_head_t h = xvalue_decode_head(s, INT32_MAX);
   *out = s; /* SHM pointer */
-  *ol = total;
+  *ol = xvalue_head_len(&h) + h.raw_len;
   return 0;
 }
 static void resolve_path(kvspace_t *kv, const char *path, char *out, int osz) {

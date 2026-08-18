@@ -13,6 +13,7 @@ find_package(slotsboxmalloc REQUIRED)
 add_library(kvspace-c SHARED
     src/xvalue.c
     src/kvspace.c
+    src/durable_abi.c
 )
 
 target_include_directories(kvspace-c

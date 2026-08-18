@@ -1,11 +1,11 @@
 /*
  * xvalue.h — XValue 类型系统与 TLV 编解码（对齐 kvspace-durable 的 kindexp TLV）。
  *
- * TLV: [1B kind_len][kind][1B ref][1B arr_flag][1B ndim][ndim×4B dims LE][4B raw_len LE][raw]
+ * TLV: [1B kind_len][kind][1B ref][1B ndim][ndim×4B dims LE][4B raw_len LE][raw]
  *   ref: 0=内联 1=软链接(Ptr, raw=目标路径) 2=扩展句柄(@)
- *   arr_flag: 0=标量 1=连续([]) 2=分离(<>)
- *   ndim: 0=变长, N=定长 N 维
+ *   ndim: 0=标量(单值)，N=N 维数组；ndim 是唯一「是否数组」标志（无独立 arr_flag）
  *   dims: 各维长度（LE u32）
+ *   char/* kind 恒为一维序列（ndim=1，含空串/单字符）
  * None 编码为 NULL/len=0。
  */
 
@@ -46,8 +46,7 @@ typedef struct {
     const char    *kind;      /* 非 NUL-terminated，用 kind_len */
     int32_t        kind_len;
     int32_t        ref;       /* 0=内联 1=软链接 2=扩展句柄 */
-    int32_t        arr_flag;
-    int32_t        ndim;
+    int32_t        ndim;      /* 0=标量，N=N 维数组（唯一「是否数组」标志） */
     int32_t        dims[X_MAX_NDIM];
     int32_t        array_len; /* 派生：标量=1，定长=∏dims，变长=raw_len/elem_size */
     int32_t        raw_len;
