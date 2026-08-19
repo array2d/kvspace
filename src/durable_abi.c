@@ -6,6 +6,7 @@
 
 #include "kvspace/kvspace.h"
 #include "kvspace/xvalue.h"
+#include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -266,6 +267,103 @@ int kvspaceWatch(void *h, const char *key, const uint8_t *target, uint32_t targe
         uint64_t elapsed = (uint64_t)(tn.tv_sec - t0.tv_sec) * 1000000000ULL +
                            (uint64_t)(tn.tv_nsec - t0.tv_nsec);
         if (elapsed >= tick_ns) return 0;
+        usleep(1000);
+    }
+}
+
+/* Durable Notify/Take queue. Outside the user-visible tree (old Watch is WatchValue). */
+#define NQ_PFX "/\xE2\x80\xA5notify"
+
+static pthread_mutex_t nq_mu = PTHREAD_MUTEX_INITIALIZER;
+
+static void nq_key(const char *key, char *out, size_t cap) {
+    snprintf(out, cap, "%s%s", NQ_PFX, key ? key : "");
+}
+
+static uint32_t nq_rd32(const uint8_t *p) {
+    return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
+}
+
+static void nq_wr32(uint8_t *p, uint32_t v) {
+    p[0] = (uint8_t)v; p[1] = (uint8_t)(v >> 8); p[2] = (uint8_t)(v >> 16); p[3] = (uint8_t)(v >> 24);
+}
+
+static int nq_load(kvspace_t *kv, const char *qk, uint8_t **body, uint32_t *blen) {
+    int32_t len = 0;
+    uint8_t *d = kvspaceShmGet(kv, qk, 1, &len);
+    *body = NULL; *blen = 0;
+    if (!d || len <= 0) return 0;
+    xvalue_head_t h = kvspaceXvalueDecodeHead(d, len);
+    if (h.raw_len <= 0 || !h.raw) return 0;
+    uint8_t *c = malloc((size_t)h.raw_len);
+    if (!c) abort();
+    memcpy(c, h.raw, (size_t)h.raw_len);
+    *body = c; *blen = (uint32_t)h.raw_len;
+    return 0;
+}
+
+static int nq_save(kvspace_t *kv, const char *qk, const uint8_t *body, uint32_t blen) {
+    if (blen == 0) return kvspaceShmDel(kv, qk);
+    int32_t dims[1] = { (int32_t)blen };
+    uint8_t *tlv = NULL;
+    int32_t n = kvspaceXvalueEncode(KVSPACE_KIND_UINT8, body, (int32_t)blen, dims, 1, &tlv);
+    if (n < 0 || !tlv) abort();
+    int rc = kvspaceShmSet(kv, qk, tlv, n);
+    free(tlv);
+    return rc;
+}
+
+int kvspaceNotify(void *h, const char *key, const uint8_t *val, uint32_t len, char *err, uint32_t err_cap) {
+    (void)err; (void)err_cap;
+    if (!h || !key || !val || len == 0) return 1;
+    char qk[2048];
+    nq_key(key, qk, sizeof qk);
+    pthread_mutex_lock(&nq_mu);
+    uint8_t *body = NULL; uint32_t blen = 0;
+    nq_load((kvspace_t *)h, qk, &body, &blen);
+    uint8_t *nb = malloc((size_t)blen + 4 + len);
+    if (!nb) abort();
+    if (blen) memcpy(nb, body, blen);
+    nq_wr32(nb + blen, len);
+    memcpy(nb + blen + 4, val, len);
+    int rc = nq_save((kvspace_t *)h, qk, nb, blen + 4 + len);
+    free(nb); free(body);
+    pthread_mutex_unlock(&nq_mu);
+    return rc == 0 ? 0 : 1;
+}
+
+int kvspaceTake(void *h, const char *key, uint64_t timeout_ns, uint8_t **out, uint32_t *out_len) {
+    if (!out || !out_len) return 1;
+    *out = NULL; *out_len = 0;
+    if (!h || !key) return 1;
+    char qk[2048];
+    nq_key(key, qk, sizeof qk);
+    struct timespec t0, tn;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    for (;;) {
+        pthread_mutex_lock(&nq_mu);
+        uint8_t *body = NULL; uint32_t blen = 0;
+        nq_load((kvspace_t *)h, qk, &body, &blen);
+        if (blen >= 4) {
+            uint32_t fl = nq_rd32(body);
+            if (4 + fl <= blen) {
+                uint8_t *item = malloc(fl ? fl : 1);
+                if (!item) abort();
+                if (fl) memcpy(item, body + 4, fl);
+                uint32_t rest = blen - 4 - fl;
+                nq_save((kvspace_t *)h, qk, body + 4 + fl, rest);
+                free(body);
+                pthread_mutex_unlock(&nq_mu);
+                *out = item; *out_len = fl;
+                return 0;
+            }
+        }
+        free(body);
+        pthread_mutex_unlock(&nq_mu);
+        clock_gettime(CLOCK_MONOTONIC, &tn);
+        uint64_t elapsed = (uint64_t)(tn.tv_sec - t0.tv_sec) * 1000000000ULL +
+                           (uint64_t)(tn.tv_nsec - t0.tv_nsec);
+        if (elapsed >= timeout_ns) return 0;
         usleep(1000);
     }
 }
