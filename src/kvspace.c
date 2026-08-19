@@ -651,7 +651,7 @@ static void art_scan(kvspace_t *kv, int32_t nid, char *buf, int bpos, int bcap,
 }
 
 /* ============ lifecycle ============ */
-kvspace_t *kvsc_open(const char *path, size_t data_size) {
+kvspace_t *kvspaceShmOpen(const char *path, size_t data_size) {
   if (!path || data_size == 0)
     return NULL;
 
@@ -728,7 +728,7 @@ kvspace_t *kvsc_open(const char *path, size_t data_size) {
     sbo_init(kv->sbo_meta, sbo_head, (size_t)kv->hdr->sbo_data_size);
   } else {
     if (memcmp(kv->hdr->magic, KVS_MAGIC, sizeof(KVS_MAGIC) - 1) != 0) {
-      kvsc_close(kv);
+      kvspaceShmClose(kv);
       return NULL;
     }
   }
@@ -740,7 +740,7 @@ kvspace_t *kvsc_open(const char *path, size_t data_size) {
   }
   return kv;
 }
-void kvsc_close(kvspace_t *kv) {
+void kvspaceShmClose(kvspace_t *kv) {
   if (!kv)
     return;
   for (int i = 0; i < WATCH_TABLE_SZ; i++) {
@@ -759,9 +759,9 @@ void kvsc_close(kvspace_t *kv) {
 /* ---- link resolve helpers ---- */
 static int read_tlv(kvspace_t *kv, uint64_t off, uint8_t **out, int32_t *ol) {
   uint8_t *s = kv->sbo_data + off;   /* box 内必含完整 TLV，用 xvalue 解码器算长度 */
-  xvalue_head_t h = xvalue_decode_head(s, INT32_MAX);
+  xvalue_head_t h = kvspaceXvalueDecodeHead(s, INT32_MAX);
   *out = s; /* SHM pointer */
-  *ol = xvalue_head_len(&h) + h.raw_len;
+  *ol = kvspaceXvalueHeadLen(&h) + h.raw_len;
   return 0;
 }
 static void resolve_path(kvspace_t *kv, const char *path, char *out, int osz) {
@@ -803,7 +803,7 @@ static void resolve_path(kvspace_t *kv, const char *path, char *out, int osz) {
       int32_t rl;
       if (read_tlv(kv, h->box_offset, &raw, &rl) < 0)
         continue;
-      xvalue_head_t hh = xvalue_decode_head(raw, rl);
+      xvalue_head_t hh = kvspaceXvalueDecodeHead(raw, rl);
       if (hh.ref != 1) {
         continue;
       }
@@ -861,15 +861,15 @@ static int dir_ext_path(kvspace_t *kv, const char *dir, char *out, int osz) {
   int32_t rl;
   if (read_tlv(kv, h->box_offset, &raw, &rl) < 0)
     return 0;
-  xvalue_head_t hh = xvalue_decode_head(raw, rl);
-  if (hh.kind_len != (int32_t)strlen(XK_EXT_INDEX) || memcmp(hh.kind, XK_EXT_INDEX, hh.kind_len) != 0)
+  xvalue_head_t hh = kvspaceXvalueDecodeHead(raw, rl);
+  if (hh.kind_len != (int32_t)strlen(KVSPACE_KIND_EXT_INDEX) || memcmp(hh.kind, KVSPACE_KIND_EXT_INDEX, hh.kind_len) != 0)
     return 0;
   decode_ext_path(hh.raw, hh.raw_len, out, osz);
   return out[0] ? 1 : 0;
 }
 
 /* ============ CRUD ============ */
-uint8_t *kvsc_get(kvspace_t *kv, const char *key, int resolve, int32_t *ol) {
+uint8_t *kvspaceShmGet(kvspace_t *kv, const char *key, int resolve, int32_t *ol) {
   if (!kv || !key || !ol)
     return NULL;
   *ol = 0;
@@ -913,7 +913,7 @@ uint8_t *kvsc_get(kvspace_t *kv, const char *key, int resolve, int32_t *ol) {
   return raw;
 }
 
-int kvsc_set(kvspace_t *kv, const char *key, const uint8_t *val,
+int kvspaceShmSet(kvspace_t *kv, const char *key, const uint8_t *val,
                 int32_t val_len) {
   if (!kv || !key || !val || val_len <= 0)
     return -1;
@@ -932,7 +932,7 @@ int kvsc_set(kvspace_t *kv, const char *key, const uint8_t *val,
   return 0;
 }
 
-int kvsc_del(kvspace_t *kv, const char *key) {
+int kvspaceShmDel(kvspace_t *kv, const char *key) {
   if (!kv || !key)
     return -1;
   char kbuf[1024];
@@ -943,7 +943,7 @@ int kvsc_del(kvspace_t *kv, const char *key) {
   return d ? 0 : -1;
 }
 
-int kvsc_deltree(kvspace_t *kv, const char *prefix) {
+int kvspaceShmDeltree(kvspace_t *kv, const char *prefix) {
   if (!kv || !prefix)
     return -1;
   // if prefix itself is a link, only delete the link
@@ -953,43 +953,43 @@ int kvsc_deltree(kvspace_t *kv, const char *prefix) {
     uint8_t *raw;
     int32_t rl;
     read_tlv(kv, h->box_offset, &raw, &rl);
-    xvalue_head_t hh = xvalue_decode_head(raw, rl);
+    xvalue_head_t hh = kvspaceXvalueDecodeHead(raw, rl);
     if (hh.ref == 1) {
-      return kvsc_del(kv, prefix);
+      return kvspaceShmDel(kv, prefix);
     }
   }
   char *e = edir(prefix); // ensure trailing / for listing children
   char **ns;
   int32_t nc;
-  kvsc_list(kv, e, false, 1, &ns, &nc);
+  kvspaceShmList(kv, e, false, 1, &ns, &nc);
   for (int i = 0; i < nc; i++) {
     char *c = pjoin(e, ns[i]);
-    kvsc_deltree(kv, c);
+    kvspaceShmDeltree(kv, c);
     free(c);
   }
   for (int i = 0; i < nc; i++)
     free(ns[i]);
   free(ns);
-  kvsc_del(kv, prefix);
+  kvspaceShmDel(kv, prefix);
   if (strcmp(e, prefix) != 0)
-    kvsc_del(kv, e);
+    kvspaceShmDel(kv, e);
   free(e);
   return 0;
 }
 
-int kvsc_mkindex(kvspace_t *kv, const char *path) {
+int kvspaceShmMkindex(kvspace_t *kv, const char *path) {
   if (!kv || !path)
     return -1;
   char *d = edir(path);
   uint8_t *v;
-  int32_t vl = xvalue_new_index(NULL, 0, &v);
-  int r = kvsc_set(kv, d, v, vl);
+  int32_t vl = kvspaceXvalueNewIndex(NULL, 0, &v);
+  int r = kvspaceShmSet(kv, d, v, vl);
   free(v);
   free(d);
   return r;
 }
 
-int kvsc_list(kvspace_t *kv, const char *prefix, bool ex, int resolve,
+int kvspaceShmList(kvspace_t *kv, const char *prefix, bool ex, int resolve,
                  char ***on, int32_t *oc) {
   if (!kv || !prefix || !on || !oc)
     return -1;
@@ -1085,14 +1085,14 @@ int kvsc_list(kvspace_t *kv, const char *prefix, bool ex, int resolve,
   return 0;
 }
 
-int kvsc_extindex(kvspace_t *kv, const char *p, const char *ep) {
+int kvspaceShmExtindex(kvspace_t *kv, const char *p, const char *ep) {
   uint8_t *v;
-  int32_t vl = xvalue_new_extindex(ep, NULL, 0, &v);
-  int r = kvsc_set(kv, p, v, vl);
+  int32_t vl = kvspaceXvalueNewExtindex(ep, NULL, 0, &v);
+  int r = kvspaceShmSet(kv, p, v, vl);
   free(v);
   return r;
 }
-int kvsc_delextindex(kvspace_t *kv, const char *p) { return kvsc_del(kv, p); }
+int kvspaceShmDelextindex(kvspace_t *kv, const char *p) { return kvspaceShmDel(kv, p); }
 
 /* ============ Watch/Notify ============ */
 static int wslot(const char *k) {
@@ -1101,7 +1101,7 @@ static int wslot(const char *k) {
     h = ((h << 5) + h) + (uint8_t)*p;
   return (int)(h % WATCH_TABLE_SZ);
 }
-int kvsc_notify(kvspace_t *kv, const char *k, const uint8_t *v, int32_t vl) {
+int kvspaceShmNotify(kvspace_t *kv, const char *k, const uint8_t *v, int32_t vl) {
   if (!kv || !k)
     return -1;
   int s = wslot(k);
@@ -1119,7 +1119,7 @@ int kvsc_notify(kvspace_t *kv, const char *k, const uint8_t *v, int32_t vl) {
   pthread_mutex_unlock(&kv->wlock);
   return 0;
 }
-uint8_t *kvsc_watch(kvspace_t *kv, const char *k, int32_t to, int32_t *ol) {
+uint8_t *kvspaceShmWatch(kvspace_t *kv, const char *k, int32_t to, int32_t *ol) {
   if (!kv || !k || !ol)
     return NULL;
   *ol = 0;

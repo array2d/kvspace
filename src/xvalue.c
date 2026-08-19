@@ -25,7 +25,7 @@ static int32_t header_array_len(int32_t ndim, const int32_t *dims) {
     return n;
 }
 
-int32_t xvalue_head_len(const xvalue_head_t *h) {
+int32_t kvspaceXvalueHeadLen(const xvalue_head_t *h) {
     return 1 + h->kind_len + 1 + 1 + 4 * h->ndim + 4;
 }
 
@@ -52,7 +52,7 @@ static int32_t encode_head(const char *kind, int32_t ref,
     return total;
 }
 
-int32_t xvalue_encode(const char *kind, const uint8_t *raw, int32_t raw_len,
+int32_t kvspaceXvalueEncode(const char *kind, const uint8_t *raw, int32_t raw_len,
                       const int32_t *dims, int32_t ndim, uint8_t **out) {
     if (!out || !kind) return -1;
     if (ndim < 0) ndim = 0;
@@ -61,7 +61,7 @@ int32_t xvalue_encode(const char *kind, const uint8_t *raw, int32_t raw_len,
     return encode_head(kind, 0, dims, ndim, raw, raw_len, out);
 }
 
-int32_t xvalue_encode_ptr(const char *kind, const uint8_t *raw, int32_t raw_len,
+int32_t kvspaceXvalueEncodePtr(const char *kind, const uint8_t *raw, int32_t raw_len,
                           const int32_t *dims, int32_t ndim, uint8_t **out) {
     if (!out || !kind) return -1;
     if (ndim < 0) ndim = 0;
@@ -71,7 +71,7 @@ int32_t xvalue_encode_ptr(const char *kind, const uint8_t *raw, int32_t raw_len,
 }
 
 /* 标量/一维便捷编码（内部）：array_len → dims。char/* 恒一维（含空串/单字符）；
- * 其余标量(≤1)=0 维、多元素=1 维。公开的 xvalue_encode 只认 dims/ndim。 */
+ * 其余标量(≤1)=0 维、多元素=1 维。公开的 kvspaceXvalueEncode 只认 dims/ndim。 */
 static int32_t al_to_dims(const char *kind, int32_t array_len, int32_t *dims) {
     if (strncmp(kind, "char/", 5) == 0) { dims[0] = array_len < 0 ? 0 : array_len; return 1; }
     if (array_len > 1) { dims[0] = array_len; return 1; }
@@ -81,17 +81,17 @@ static int32_t al_to_dims(const char *kind, int32_t array_len, int32_t *dims) {
 static int32_t encode_al(const char *kind, const uint8_t *raw, int32_t raw_len,
                          int32_t array_len, uint8_t **out) {
     int32_t dims[1]; int32_t nd = al_to_dims(kind, array_len, dims);
-    return xvalue_encode(kind, raw, raw_len, dims, nd, out);
+    return kvspaceXvalueEncode(kind, raw, raw_len, dims, nd, out);
 }
 
 static int32_t encode_al_ptr(const char *kind, const uint8_t *raw, int32_t raw_len,
                              int32_t array_len, uint8_t **out) {
     if (array_len <= 0) array_len = 1;
     int32_t dims[1]; int32_t nd = al_to_dims(kind, array_len, dims);
-    return xvalue_encode_ptr(kind, raw, raw_len, dims, nd, out);
+    return kvspaceXvalueEncodePtr(kind, raw, raw_len, dims, nd, out);
 }
 
-xvalue_head_t xvalue_decode_head(const uint8_t *data, int32_t data_len) {
+xvalue_head_t kvspaceXvalueDecodeHead(const uint8_t *data, int32_t data_len) {
     xvalue_head_t h = {0};
     if (!data || data_len < 4) return h;
     h.kind_len = (int32_t)data[0];
@@ -112,7 +112,7 @@ xvalue_head_t xvalue_decode_head(const uint8_t *data, int32_t data_len) {
 }
 
 #define DEF_NEW_ARRAY(name, kind, T, elem_sz, wr_fn)                      \
-    int32_t xvalue_new_##name(const T *vals, int32_t count, uint8_t **out) { \
+    int32_t kvspaceXvalueNew##name(const T *vals, int32_t count, uint8_t **out) { \
         if (!vals || count <= 0) return -1;                                  \
         int32_t raw_len = count * elem_sz;                                   \
         uint8_t *raw = (uint8_t *)malloc((size_t)raw_len);                   \
@@ -123,17 +123,17 @@ xvalue_head_t xvalue_decode_head(const uint8_t *data, int32_t data_len) {
         return r;                                                            \
     }
 
-DEF_NEW_ARRAY(bool,    XK_BOOL,    bool,    1,  wr_u8)
-DEF_NEW_ARRAY(int8,    XK_INT8,    int8_t,  1,  wr_i8)
-DEF_NEW_ARRAY(int16,   XK_INT16,   int16_t, 2,  wr_i16)
-DEF_NEW_ARRAY(int32,   XK_INT32,   int32_t, 4,  wr_i32)
-DEF_NEW_ARRAY(int64,   XK_INT64,   int64_t, 8,  wr_i64)
-DEF_NEW_ARRAY(uint8,   XK_UINT8,   uint8_t, 1,  wr_u8)
-DEF_NEW_ARRAY(uint16,  XK_UINT16,  uint16_t,2,  wr_u16)
-DEF_NEW_ARRAY(uint32,  XK_UINT32,  uint32_t,4,  wr_u32)
-DEF_NEW_ARRAY(uint64,  XK_UINT64,  uint64_t,8,  wr_u64)
+DEF_NEW_ARRAY(Bool,    KVSPACE_KIND_BOOL,    bool,    1,  wr_u8)
+DEF_NEW_ARRAY(Int8,    KVSPACE_KIND_INT8,    int8_t,  1,  wr_i8)
+DEF_NEW_ARRAY(Int16,   KVSPACE_KIND_INT16,   int16_t, 2,  wr_i16)
+DEF_NEW_ARRAY(Int32,   KVSPACE_KIND_INT32,   int32_t, 4,  wr_i32)
+DEF_NEW_ARRAY(Int64,   KVSPACE_KIND_INT64,   int64_t, 8,  wr_i64)
+DEF_NEW_ARRAY(Uint8,   KVSPACE_KIND_UINT8,   uint8_t, 1,  wr_u8)
+DEF_NEW_ARRAY(Uint16,  KVSPACE_KIND_UINT16,  uint16_t,2,  wr_u16)
+DEF_NEW_ARRAY(Uint32,  KVSPACE_KIND_UINT32,  uint32_t,4,  wr_u32)
+DEF_NEW_ARRAY(Uint64,  KVSPACE_KIND_UINT64,  uint64_t,8,  wr_u64)
 
-int32_t xvalue_new_float32(const float *vals, int32_t count, uint8_t **out) {
+int32_t kvspaceXvalueNewFloat32(const float *vals, int32_t count, uint8_t **out) {
     if (!vals || count <= 0) return -1;
     int32_t raw_len = count * 4;
     uint8_t *raw = (uint8_t *)malloc((size_t)raw_len);
@@ -142,12 +142,12 @@ int32_t xvalue_new_float32(const float *vals, int32_t count, uint8_t **out) {
         union { float f; uint32_t u; } c = {vals[i]};
         wr_u32(raw + i * 4, c.u);
     }
-    int32_t r = encode_al(XK_FLOAT32, raw, raw_len, count, out);
+    int32_t r = encode_al(KVSPACE_KIND_FLOAT32, raw, raw_len, count, out);
     free(raw);
     return r;
 }
 
-int32_t xvalue_new_float64(const double *vals, int32_t count, uint8_t **out) {
+int32_t kvspaceXvalueNewFloat64(const double *vals, int32_t count, uint8_t **out) {
     if (!vals || count <= 0) return -1;
     int32_t raw_len = count * 8;
     uint8_t *raw = (uint8_t *)malloc((size_t)raw_len);
@@ -156,7 +156,7 @@ int32_t xvalue_new_float64(const double *vals, int32_t count, uint8_t **out) {
         union { double f; uint64_t u; } c = {vals[i]};
         wr_u64(raw + i * 8, c.u);
     }
-    int32_t r = encode_al(XK_FLOAT64, raw, raw_len, count, out);
+    int32_t r = encode_al(KVSPACE_KIND_FLOAT64, raw, raw_len, count, out);
     free(raw);
     return r;
 }
@@ -176,8 +176,8 @@ static uint32_t utf8_next(const uint8_t *s, int32_t len, int32_t *i) {
     return cp;
 }
 
-int32_t xvalue_new_char(const char *s, uint8_t **out) {
-    if (!s || !*s) return encode_al(XK_CHAR, NULL, 0, 0, out);
+int32_t kvspaceXvalueNewChar(const char *s, uint8_t **out) {
+    if (!s || !*s) return encode_al(KVSPACE_KIND_CHAR, NULL, 0, 0, out);
     int32_t slen = (int32_t)strlen(s);
     uint8_t *raw = (uint8_t *)malloc((size_t)slen * 4);
     if (!raw) return -1;
@@ -187,32 +187,32 @@ int32_t xvalue_new_char(const char *s, uint8_t **out) {
         wr_u32(raw + n * 4, cp);
         n++;
     }
-    int32_t r = encode_al(XK_CHAR, raw, n * 4, n, out);
+    int32_t r = encode_al(KVSPACE_KIND_CHAR, raw, n * 4, n, out);
     free(raw);
     return r;
 }
 
-int32_t xvalue_new_char_utf8(const char *s, uint8_t **out) {
+int32_t kvspaceXvalueNewCharUtf8(const char *s, uint8_t **out) {
     if (!s) s = "";
     int32_t slen = (int32_t)strlen(s);
-    return encode_al(XK_CHAR_UTF8, (const uint8_t *)s, slen, slen, out);
+    return encode_al(KVSPACE_KIND_CHAR_UTF8, (const uint8_t *)s, slen, slen, out);
 }
 
-int32_t xvalue_new_char_ascii(const char *s, uint8_t **out) {
+int32_t kvspaceXvalueNewCharAscii(const char *s, uint8_t **out) {
     if (!s) s = "";
     int32_t slen = (int32_t)strlen(s);
-    return encode_al(XK_CHAR_ASCII, (const uint8_t *)s, slen, slen, out);
+    return encode_al(KVSPACE_KIND_CHAR_ASCII, (const uint8_t *)s, slen, slen, out);
 }
 
-int32_t xvalue_at_char(const xvalue_head_t *h, int32_t idx) {
+int32_t kvspaceXvalueAtChar(const xvalue_head_t *h, int32_t idx) {
     if (!h || !h->raw || idx < 0 || idx >= h->array_len) return 0;
     return (int32_t)rd_u32(h->raw + idx * 4);
 }
 
 /* ── index / ptr / extindex ──────────────────────────────────────── */
 
-int32_t xvalue_new_index(const char **children, int32_t count, uint8_t **out) {
-    if (count == 0) return encode_al(XK_INDEX, NULL, 0, 1, out);
+int32_t kvspaceXvalueNewIndex(const char **children, int32_t count, uint8_t **out) {
+    if (count == 0) return encode_al(KVSPACE_KIND_INDEX, NULL, 0, 1, out);
     size_t total = 0;
     for (int i = 0; i < count; i++) total += (children[i] ? strlen(children[i]) : 0);
     total += (size_t)(count - 1);
@@ -227,19 +227,19 @@ int32_t xvalue_new_index(const char **children, int32_t count, uint8_t **out) {
         pos += len;
         if (i < count - 1) raw[pos++] = '\n';
     }
-    int32_t r = encode_al(XK_INDEX, raw, (int32_t)pos, 1, out);
+    int32_t r = encode_al(KVSPACE_KIND_INDEX, raw, (int32_t)pos, 1, out);
     free(raw);
     return r;
 }
 
-int32_t xvalue_new_ptr(const char *kind, const char *target, int32_t array_len, uint8_t **out) {
+int32_t kvspaceXvalueNewPtr(const char *kind, const char *target, int32_t array_len, uint8_t **out) {
     if (!target) return -1;
     return encode_al_ptr(kind, (const uint8_t *)target, (int32_t)strlen(target), array_len, out);
 }
 
 #define EXT_PREFIX "…"
 
-int32_t xvalue_new_extindex(const char *extpath, const char **children, int32_t count, uint8_t **out) {
+int32_t kvspaceXvalueNewExtindex(const char *extpath, const char **children, int32_t count, uint8_t **out) {
     if (!extpath) return -1;
     size_t plen = strlen(EXT_PREFIX) + strlen(extpath);
     size_t total = plen;
@@ -258,7 +258,7 @@ int32_t xvalue_new_extindex(const char *extpath, const char **children, int32_t 
         memcpy(raw + pos, children[i], len);
         pos += len;
     }
-    int32_t r = encode_al(XK_EXT_INDEX, raw, (int32_t)pos, 1, out);
+    int32_t r = encode_al(KVSPACE_KIND_EXT_INDEX, raw, (int32_t)pos, 1, out);
     free(raw);
     return r;
 }

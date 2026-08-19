@@ -20,45 +20,45 @@ typedef struct kvspace kvspace_t;
  * ================================================================ */
 
 // 打开或创建 SHM。data_size 必须为 64 的幂 × 8 的倍数.
-kvspace_t *kvsc_open(const char *path, size_t data_size);
-void       kvsc_close(kvspace_t *kv);
+kvspace_t *kvspaceShmOpen(const char *path, size_t data_size);
+void       kvspaceShmClose(kvspace_t *kv);
 
 /* ================================================================
  * 单点读写
  * ================================================================ */
 
 // Get: resolve=1 穿透 link，resolve=0 返回 link 本身。
-uint8_t *kvsc_get(kvspace_t *kv, const char *key, int resolve, int32_t *out_len);
+uint8_t *kvspaceShmGet(kvspace_t *kv, const char *key, int resolve, int32_t *out_len);
 
 // Set: 写入 value（TLV 编码的字节）。总是穿透 link 写入 target。
-int kvsc_set(kvspace_t *kv, const char *key, const uint8_t *val, int32_t val_len);
+int kvspaceShmSet(kvspace_t *kv, const char *key, const uint8_t *val, int32_t val_len);
 
 /* ================================================================
  * 目录操作
  * ================================================================ */
 
 // List: resolve=1 穿透 link 列出 target 子节点。
-int kvsc_list(kvspace_t *kv, const char *prefix, bool expand_ext,
+int kvspaceShmList(kvspace_t *kv, const char *prefix, bool expand_ext,
                  int resolve, char ***out_names, int32_t *out_count);
 
-int kvsc_del(kvspace_t *kv, const char *key);
-int kvsc_deltree(kvspace_t *kv, const char *prefix);
-int kvsc_mkindex(kvspace_t *kv, const char *path); // 递归创建目录
+int kvspaceShmDel(kvspace_t *kv, const char *key);
+int kvspaceShmDeltree(kvspace_t *kv, const char *prefix);
+int kvspaceShmMkindex(kvspace_t *kv, const char *path); // 递归创建目录
 
 /* ================================================================
  * ExtIndex
  * ================================================================ */
 
-int kvsc_extindex(kvspace_t *kv, const char *path, const char *extpath);
-int kvsc_delextindex(kvspace_t *kv, const char *path);    // 移除 extindex
+int kvspaceShmExtindex(kvspace_t *kv, const char *path, const char *extpath);
+int kvspaceShmDelextindex(kvspace_t *kv, const char *path);    // 移除 extindex
 
 /* ================================================================
  * Watch / Notify
  * ================================================================ */
 
-int kvsc_notify(kvspace_t *kv, const char *key, const uint8_t *val, int32_t val_len);
+int kvspaceShmNotify(kvspace_t *kv, const char *key, const uint8_t *val, int32_t val_len);
 
 // 阻塞等待通知，timeout_ms 毫秒。返回 malloc TLV，超时返回 NULL.
-uint8_t *kvsc_watch(kvspace_t *kv, const char *key, int32_t timeout_ms, int32_t *out_len);
+uint8_t *kvspaceShmWatch(kvspace_t *kv, const char *key, int32_t timeout_ms, int32_t *out_len);
 
 #endif
