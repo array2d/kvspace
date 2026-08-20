@@ -60,7 +60,37 @@ int kvspaceSet(void *h, const char *const *keys, const uint8_t *vals,
     return 0;
 }
 
+#define EXP_CAP 256
+static struct { char key[512]; int64_t dead_ns; int used; } exp_tab[EXP_CAP];
+static pthread_mutex_t exp_mu = PTHREAD_MUTEX_INITIALIZER;
+
+static int64_t exp_now_ns(void) {
+    struct timespec t;
+    clock_gettime(CLOCK_MONOTONIC, &t);
+    return (int64_t)t.tv_sec * 1000000000LL + t.tv_nsec;
+}
+
+/* 0=not listed, 1=hidden still Get-able, 2=dead */
+static int exp_state(const char *key) {
+    int64_t now = exp_now_ns();
+    pthread_mutex_lock(&exp_mu);
+    int st = 0;
+    for (int i = 0; i < EXP_CAP; i++) {
+        if (!exp_tab[i].used || strcmp(exp_tab[i].key, key) != 0) continue;
+        st = now >= exp_tab[i].dead_ns ? 2 : 1;
+        if (st == 2) exp_tab[i].used = 0;
+        break;
+    }
+    pthread_mutex_unlock(&exp_mu);
+    return st;
+}
+
 int kvspaceGet(void *h, const char *key, uint8_t **out, uint32_t *out_len) {
+    int st = exp_state(key);
+    if (st == 2) {
+        kvspaceShmDel((kvspace_t *)h, key);
+        *out = NULL; *out_len = 0; return 0;
+    }
     int32_t len;
     uint8_t *d = kvspaceShmGet((kvspace_t *)h, key, 1, &len);
     if (!d || len <= 0) { *out = NULL; *out_len = 0; return 0; }
@@ -76,6 +106,27 @@ int kvspaceList(void *h, const char *prefix, int expand_ext, int resolve,
     if (kvspaceShmList((kvspace_t *)h, prefix, expand_ext, resolve, &names, &count) != 0) {
         *out = NULL; *out_len = 0; return -1;
     }
+    size_t plen = prefix ? strlen(prefix) : 0;
+    int keepn = 0;
+    for (int32_t i = 0; i < count; i++) {
+        char full[2048];
+        if (prefix && plen && prefix[plen - 1] == '/')
+            snprintf(full, sizeof full, "%s%s", prefix, names[i]);
+        else
+            snprintf(full, sizeof full, "%s/%s", prefix ? prefix : "", names[i]);
+        int st = exp_state(full);
+        if (st == 0) { names[keepn++] = names[i]; continue; }
+        char sub[2048];
+        snprintf(sub, sizeof sub, "%s/", full);
+        char **kids = NULL; int32_t kn = 0;
+        kvspaceShmList((kvspace_t *)h, sub, 0, 1, &kids, &kn);
+        int live = kn > 0;
+        for (int32_t j = 0; j < kn; j++) free(kids[j]);
+        free(kids);
+        if (live) names[keepn++] = names[i];
+        else free(names[i]);
+    }
+    count = keepn;
     size_t total = 0;
     for (int32_t i = 0; i < count; i++) total += strlen(names[i]) + 1;
     uint8_t *buf = total ? malloc(total) : NULL;
@@ -420,5 +471,45 @@ int kvspaceIncr(void *h, const char *key, int64_t *out, char *err, uint32_t err_
     pthread_mutex_unlock(&incr_mu);
     if (rc != 0) { incr_err(err, err_cap, "Incr: set failed"); return 1; }
     *out = n;
+    return 0;
+}
+
+static int exp_valid_key(const char *key) {
+    if (!key || key[0] != '/') return 0;
+    size_t n = strlen(key);
+    if (n <= 1 || key[n - 1] == '/') return 0;
+    for (const char *p = key + 1; *p; ) {
+        const char *sl = strchr(p, '/');
+        size_t seglen = sl ? (size_t)(sl - p) : strlen(p);
+        if (seglen == 0 || (seglen == 1 && p[0] == '.') || (seglen == 2 && p[0] == '.' && p[1] == '.'))
+            return 0;
+        p = sl ? sl + 1 : p + seglen;
+    }
+    return 1;
+}
+
+int kvspaceExpire(void *h, const char *key, uint64_t ttl_ns, char *err, uint32_t err_cap) {
+    if (!h || !key) { incr_err(err, err_cap, "Expire: bad args"); return 1; }
+    if (ttl_ns == 0) { incr_err(err, err_cap, "Expire: ttl must be > 0"); return 1; }
+    if (!exp_valid_key(key)) {
+        incr_err(err, err_cap, key && key[0] && key[strlen(key) - 1] == '/' ? "Expire: directory" : "Expire: key is not an absolute path");
+        return 1;
+    }
+    int32_t len = 0;
+    uint8_t *d = kvspaceShmGet((kvspace_t *)h, key, 1, &len);
+    if (!d || len <= 0) { incr_err(err, err_cap, "Expire: missing key"); return 1; }
+    if (exp_state(key) == 2) { incr_err(err, err_cap, "Expire: missing key"); return 1; }
+    int64_t dead = exp_now_ns() + (int64_t)ttl_ns;
+    pthread_mutex_lock(&exp_mu);
+    int slot = -1;
+    for (int i = 0; i < EXP_CAP; i++) {
+        if (exp_tab[i].used && strcmp(exp_tab[i].key, key) == 0) { slot = i; break; }
+        if (slot < 0 && !exp_tab[i].used) slot = i;
+    }
+    if (slot < 0) { pthread_mutex_unlock(&exp_mu); abort(); }
+    snprintf(exp_tab[slot].key, sizeof exp_tab[slot].key, "%s", key);
+    exp_tab[slot].dead_ns = dead;
+    exp_tab[slot].used = 1;
+    pthread_mutex_unlock(&exp_mu);
     return 0;
 }
