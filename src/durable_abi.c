@@ -70,25 +70,25 @@ static int64_t exp_now_ns(void) {
     return (int64_t)t.tv_sec * 1000000000LL + t.tv_nsec;
 }
 
-/* 0=not listed, 1=hidden still Get-able, 2=dead */
-static int exp_state(const char *key) {
+/* 0 live, 1 hidden, 2 reaped (leaf deleted) */
+static int exp_reap(kvspace_t *kv, const char *key) {
     int64_t now = exp_now_ns();
     pthread_mutex_lock(&exp_mu);
     int st = 0;
     for (int i = 0; i < EXP_CAP; i++) {
         if (!exp_tab[i].used || strcmp(exp_tab[i].key, key) != 0) continue;
-        st = now >= exp_tab[i].dead_ns ? 2 : 1;
-        if (st == 2) exp_tab[i].used = 0;
+        if (now < exp_tab[i].dead_ns) { st = 1; break; }
+        exp_tab[i].used = 0;
+        st = 2;
         break;
     }
     pthread_mutex_unlock(&exp_mu);
+    if (st == 2) kvspaceShmDel(kv, key);
     return st;
 }
 
 int kvspaceGet(void *h, const char *key, uint8_t **out, uint32_t *out_len) {
-    int st = exp_state(key);
-    if (st == 2) {
-        kvspaceShmDel((kvspace_t *)h, key);
+    if (exp_reap((kvspace_t *)h, key) == 2) {
         *out = NULL; *out_len = 0; return 0;
     }
     int32_t len;
@@ -114,7 +114,7 @@ int kvspaceList(void *h, const char *prefix, int expand_ext, int resolve,
             snprintf(full, sizeof full, "%s%s", prefix, names[i]);
         else
             snprintf(full, sizeof full, "%s/%s", prefix ? prefix : "", names[i]);
-        int st = exp_state(full);
+        int st = exp_reap((kvspace_t *)h, full);
         if (st == 0) { names[keepn++] = names[i]; continue; }
         char sub[2048];
         snprintf(sub, sizeof sub, "%s/", full);
@@ -533,7 +533,7 @@ int kvspaceExpire(void *h, const char *key, uint64_t ttl_ns, char *err, uint32_t
     int32_t len = 0;
     uint8_t *d = kvspaceShmGet((kvspace_t *)h, key, 1, &len);
     if (!d || len <= 0) { incr_err(err, err_cap, "Expire: missing key"); return 1; }
-    if (exp_state(key) == 2) { incr_err(err, err_cap, "Expire: missing key"); return 1; }
+    if (exp_reap((kvspace_t *)h, key) == 2) { incr_err(err, err_cap, "Expire: missing key"); return 1; }
     int64_t dead = exp_now_ns() + (int64_t)ttl_ns;
     pthread_mutex_lock(&exp_mu);
     int slot = -1;
