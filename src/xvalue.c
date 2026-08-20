@@ -25,15 +25,21 @@ static int32_t header_array_len(int32_t ndim, const int32_t *dims) {
     return n;
 }
 
+/* 形状段字节数：标量(ndim=0)=0，数组(ndim≥1)=X_MAX_NDIM×4=32。 */
+static int32_t shape_seg(int32_t ndim) {
+    return ndim == 0 ? 0 : X_MAX_NDIM * 4;
+}
+
 int32_t kvspaceXvalueHeadLen(const xvalue_head_t *h) {
-    return 1 + h->kind_len + 1 + 1 + 4 * h->ndim + 4;
+    return 1 + h->kind_len + 1 + 1 + shape_seg(h->ndim) + 4;
 }
 
 static int32_t encode_head(const char *kind, int32_t ref,
                            const int32_t *dims, int32_t ndim,
                            const uint8_t *raw, int32_t raw_len, uint8_t **out) {
     int32_t kl = (int32_t)strlen(kind);
-    int32_t total = 1 + kl + 1 + 1 + 4 * ndim + 4 + raw_len;
+    int32_t seg = shape_seg(ndim);
+    int32_t total = 1 + kl + 1 + 1 + seg + 4 + raw_len;
     uint8_t *buf = (uint8_t *)malloc((size_t)total);
     if (!buf) return -1;
     buf[0] = (uint8_t)kl;
@@ -45,6 +51,9 @@ static int32_t encode_head(const char *kind, int32_t ref,
         wr_u32(buf + o, (uint32_t)dims[i]);
         o += 4;
     }
+    /* padding 段（seg - 4*ndim 字节）清零 */
+    if (seg > 4 * ndim) memset(buf + o, 0, (size_t)(seg - 4 * ndim));
+    o += seg - 4 * ndim;
     wr_u32(buf + o, (uint32_t)raw_len);
     o += 4;
     if (raw_len > 0 && raw) memcpy(buf + o, raw, (size_t)raw_len);
@@ -101,9 +110,10 @@ xvalue_head_t kvspaceXvalueDecodeHead(const uint8_t *data, int32_t data_len) {
     h.ref = data[o];
     h.ndim = data[o + 1];
     if (h.ndim > X_MAX_NDIM) return h;
-    if (data_len < o + 2 + 4 * h.ndim + 4) return h;
+    int32_t seg = shape_seg(h.ndim);
+    if (data_len < o + 2 + seg + 4) return h;
     for (int i = 0; i < h.ndim; i++) h.dims[i] = (int32_t)rd_u32(data + o + 2 + 4 * i);
-    int32_t raw_off = o + 2 + 4 * h.ndim;
+    int32_t raw_off = o + 2 + seg;
     h.raw_len = (int32_t)rd_u32(data + raw_off);
     if (data_len < raw_off + 4 + h.raw_len) return h;
     h.raw = data + raw_off + 4;

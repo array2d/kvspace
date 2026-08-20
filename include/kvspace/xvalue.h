@@ -1,10 +1,12 @@
 /*
  * xvalue.h — XValue 类型系统与 TLV 编解码（对齐 kvspace-durable 的 kindexp TLV）。
  *
- * TLV: [1B kind_len][kind][1B ref][1B ndim][ndim×4B dims LE][4B raw_len LE][raw]
+ * TLV: [1B kind_len][kind][1B ref][1B ndim][ndim×4B dims LE][padding][4B raw_len LE][raw]
  *   ref: 0=内联 1=软链接(Ptr, raw=目标路径) 2=扩展句柄(@)
  *   ndim: 0=标量(单值)，N=N 维数组；ndim 是唯一「是否数组」标志（无独立 arr_flag）
  *   dims: 各维长度（LE u32）
+ *   padding: 形状段(dims+padding)恒 X_MAX_NDIM×4=32B（仅 ndim≥1），使 body 偏移与 ndim 无关，
+ *            供 xv.reshape 原地改写 dims 不搬 body；ndim=0 标量无形状段(padding=0)
  *   char/* kind 恒为一维序列（ndim=1，含空串/单字符）
  * None 编码为 NULL/len=0。
  */
