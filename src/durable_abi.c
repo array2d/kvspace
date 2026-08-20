@@ -6,6 +6,7 @@
 
 #include "kvspace/kvspace.h"
 #include "kvspace/xvalue.h"
+#include <limits.h>
 #include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -366,4 +367,58 @@ int kvspaceTake(void *h, const char *key, uint64_t timeout_ns, uint8_t **out, ui
         if (elapsed >= timeout_ns) return 0;
         usleep(1000);
     }
+}
+
+static pthread_mutex_t incr_mu = PTHREAD_MUTEX_INITIALIZER;
+
+static void incr_err(char *err, uint32_t err_cap, const char *msg) {
+    if (!err || err_cap == 0) return;
+    snprintf(err, err_cap, "%s", msg);
+}
+
+int kvspaceIncr(void *h, const char *key, int64_t *out, char *err, uint32_t err_cap) {
+    if (!h || !key || !out) { incr_err(err, err_cap, "Incr: bad args"); return 1; }
+    *out = 0;
+    pthread_mutex_lock(&incr_mu);
+    int32_t len = 0;
+    uint8_t *d = kvspaceShmGet((kvspace_t *)h, key, 1, &len);
+    int64_t n = 0;
+    if (d && len > 0) {
+        xvalue_head_t hd = kvspaceXvalueDecodeHead(d, len);
+        if (hd.kind_len < 5 || memcmp(hd.kind, "char/", 5) != 0 || !hd.raw || hd.raw_len <= 0) {
+            pthread_mutex_unlock(&incr_mu);
+            incr_err(err, err_cap, "Incr: counter is not a Char");
+            return 1;
+        }
+        char *s = malloc((size_t)hd.raw_len + 1);
+        if (!s) abort();
+        memcpy(s, hd.raw, (size_t)hd.raw_len);
+        s[hd.raw_len] = 0;
+        char *end = NULL;
+        n = strtoll(s, &end, 10);
+        int bad = end == s || (end && *end);
+        free(s);
+        if (bad) {
+            pthread_mutex_unlock(&incr_mu);
+            incr_err(err, err_cap, "Incr: unparsable counter");
+            return 1;
+        }
+    }
+    if (n == INT64_MAX) {
+        pthread_mutex_unlock(&incr_mu);
+        incr_err(err, err_cap, "Incr: overflow");
+        return 1;
+    }
+    n++;
+    char buf[32];
+    snprintf(buf, sizeof buf, "%lld", (long long)n);
+    uint8_t *tlv = NULL;
+    int32_t tn = kvspaceXvalueNewCharUtf8(buf, &tlv);
+    if (tn < 0 || !tlv) abort();
+    int rc = kvspaceShmSet((kvspace_t *)h, key, tlv, tn);
+    free(tlv);
+    pthread_mutex_unlock(&incr_mu);
+    if (rc != 0) { incr_err(err, err_cap, "Incr: set failed"); return 1; }
+    *out = n;
+    return 0;
 }
