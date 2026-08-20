@@ -384,33 +384,68 @@ int kvspaceNotify(void *h, const char *key, const uint8_t *val, uint32_t len, ch
     return rc == 0 ? 0 : 1;
 }
 
+/* caller holds nq_mu. 1=popped, 0=empty */
+static int nq_try_pop(kvspace_t *kv, const char *key, uint8_t **out, uint32_t *out_len) {
+    char qk[2048];
+    nq_key(key, qk, sizeof qk);
+    uint8_t *body = NULL; uint32_t blen = 0;
+    nq_load(kv, qk, &body, &blen);
+    if (blen >= 4) {
+        uint32_t fl = nq_rd32(body);
+        if (4 + fl <= blen) {
+            uint8_t *item = malloc(fl ? fl : 1);
+            if (!item) abort();
+            if (fl) memcpy(item, body + 4, fl);
+            nq_save(kv, qk, body + 4 + fl, blen - 4 - fl);
+            free(body);
+            *out = item; *out_len = fl;
+            return 1;
+        }
+    }
+    free(body);
+    return 0;
+}
+
 int kvspaceTake(void *h, const char *key, uint64_t timeout_ns, uint8_t **out, uint32_t *out_len) {
     if (!out || !out_len) return 1;
     *out = NULL; *out_len = 0;
     if (!h || !key) return 1;
-    char qk[2048];
-    nq_key(key, qk, sizeof qk);
     struct timespec t0, tn;
     clock_gettime(CLOCK_MONOTONIC, &t0);
     for (;;) {
         pthread_mutex_lock(&nq_mu);
-        uint8_t *body = NULL; uint32_t blen = 0;
-        nq_load((kvspace_t *)h, qk, &body, &blen);
-        if (blen >= 4) {
-            uint32_t fl = nq_rd32(body);
-            if (4 + fl <= blen) {
-                uint8_t *item = malloc(fl ? fl : 1);
-                if (!item) abort();
-                if (fl) memcpy(item, body + 4, fl);
-                uint32_t rest = blen - 4 - fl;
-                nq_save((kvspace_t *)h, qk, body + 4 + fl, rest);
-                free(body);
+        int hit = nq_try_pop((kvspace_t *)h, key, out, out_len);
+        pthread_mutex_unlock(&nq_mu);
+        if (hit) return 0;
+        clock_gettime(CLOCK_MONOTONIC, &tn);
+        uint64_t elapsed = (uint64_t)(tn.tv_sec - t0.tv_sec) * 1000000000ULL +
+                           (uint64_t)(tn.tv_nsec - t0.tv_nsec);
+        if (elapsed >= timeout_ns) return 0;
+        usleep(1000);
+    }
+}
+
+int kvspaceWatchAny(void *h, const char *const *keys, uint32_t nkeys, uint64_t timeout_ns,
+                    uint8_t **out_key, uint32_t *out_key_len, uint8_t **out, uint32_t *out_len) {
+    if (!out_key || !out_key_len || !out || !out_len) return 1;
+    *out_key = NULL; *out_key_len = 0; *out = NULL; *out_len = 0;
+    if (!h || !keys || nkeys == 0) return 1;
+    struct timespec t0, tn;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    for (;;) {
+        pthread_mutex_lock(&nq_mu);
+        for (uint32_t i = 0; i < nkeys; i++) {
+            if (!keys[i]) continue;
+            if (nq_try_pop((kvspace_t *)h, keys[i], out, out_len)) {
+                size_t kl = strlen(keys[i]);
+                uint8_t *kb = malloc(kl + 1);
+                if (!kb) abort();
+                memcpy(kb, keys[i], kl + 1);
+                *out_key = kb; *out_key_len = (uint32_t)kl;
                 pthread_mutex_unlock(&nq_mu);
-                *out = item; *out_len = fl;
                 return 0;
             }
         }
-        free(body);
         pthread_mutex_unlock(&nq_mu);
         clock_gettime(CLOCK_MONOTONIC, &tn);
         uint64_t elapsed = (uint64_t)(tn.tv_sec - t0.tv_sec) * 1000000000ULL +
