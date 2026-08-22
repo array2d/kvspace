@@ -236,14 +236,14 @@ int32_t kvspaceXvalueAtChar(const xvalue_head_t *h, int32_t idx) {
 /* ── index / ptr / extindex ──────────────────────────────────────── */
 
 int32_t kvspaceXvalueNewIndex(const char **children, int32_t count, uint8_t **out) {
-    if (count == 0) return encode_al(KVSPACE_KIND_INDEX, NULL, 0, 1, out);
-    size_t total = 0;
+    size_t total = 4; /* [4B count LE] */
     for (int i = 0; i < count; i++) total += (children[i] ? strlen(children[i]) : 0);
-    total += (size_t)(count - 1);
+    if (count > 0) total += (size_t)(count - 1);
     if (total > (size_t)INT32_MAX) return -1;
     uint8_t *raw = (uint8_t *)malloc(total);
     if (!raw) return -1;
-    size_t pos = 0;
+    wr_u32(raw, (uint32_t)count);
+    size_t pos = 4;
     for (int i = 0; i < count; i++) {
         if (!children[i]) continue;
         size_t len = strlen(children[i]);
@@ -266,13 +266,14 @@ int32_t kvspaceXvalueNewPtr(const char *kind, const char *target, int32_t array_
 int32_t kvspaceXvalueNewExtindex(const char *extpath, const char **children, int32_t count, uint8_t **out) {
     if (!extpath) return -1;
     size_t plen = strlen(EXT_PREFIX) + strlen(extpath);
-    size_t total = plen;
+    size_t total = 4 + plen; /* [4B count LE] + extpath 段 */
     for (int i = 0; i < count; i++) total += (children[i] ? strlen(children[i]) : 0);
     if (count > 0) total += (size_t)count;
     if (total > (size_t)INT32_MAX) return -1;
     uint8_t *raw = (uint8_t *)malloc(total);
     if (!raw) return -1;
-    size_t pos = 0;
+    wr_u32(raw, (uint32_t)count);
+    size_t pos = 4;
     memcpy(raw + pos, EXT_PREFIX, strlen(EXT_PREFIX)); pos += strlen(EXT_PREFIX);
     memcpy(raw + pos, extpath, strlen(extpath)); pos += strlen(extpath);
     for (int i = 0; i < count; i++) {
