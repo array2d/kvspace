@@ -31,22 +31,23 @@ static int32_t shape_seg(int32_t ndim) {
 }
 
 int32_t kvspaceXvalueHeadLen(const xvalue_head_t *h) {
-    return 1 + h->kind_len + 1 + 1 + shape_seg(h->ndim) + 4;
+    return 1 + h->kind_len + 1 + 1 + 4 + shape_seg(h->ndim) + 4;
 }
 
-static int32_t encode_head(const char *kind, int32_t ref,
+static int32_t encode_head(const char *kind, int32_t ref, int32_t ro, uint32_t vid,
                            const int32_t *dims, int32_t ndim,
                            const uint8_t *raw, int32_t raw_len, uint8_t **out) {
     int32_t kl = (int32_t)strlen(kind);
     int32_t seg = shape_seg(ndim);
-    int32_t total = 1 + kl + 1 + 1 + seg + 4 + raw_len;
+    int32_t total = 1 + kl + 1 + 1 + 4 + seg + 4 + raw_len;
     uint8_t *buf = (uint8_t *)malloc((size_t)total);
     if (!buf) return -1;
     buf[0] = (uint8_t)kl;
     memcpy(buf + 1, kind, (size_t)kl);
     int32_t o = 1 + kl;
-    buf[o++] = (uint8_t)ref;
+    buf[o++] = (uint8_t)((ref & 0x03) | (ro ? 0x04 : 0));
     buf[o++] = (uint8_t)ndim;
+    wr_u32(buf + o, vid); o += 4;
     for (int i = 0; i < ndim; i++) {
         wr_u32(buf + o, (uint32_t)dims[i]);
         o += 4;
@@ -67,7 +68,7 @@ int32_t kvspaceXvalueEncode(const char *kind, const uint8_t *raw, int32_t raw_le
     if (ndim < 0) ndim = 0;
     if (ndim > X_MAX_NDIM) return -1;
     if (raw_len < 0) raw_len = 0;
-    return encode_head(kind, 0, dims, ndim, raw, raw_len, out);
+    return encode_head(kind, 0, 0, 0, dims, ndim, raw, raw_len, out);
 }
 
 int32_t kvspaceXvalueEncodePtr(const char *kind, const uint8_t *raw, int32_t raw_len,
@@ -76,7 +77,17 @@ int32_t kvspaceXvalueEncodePtr(const char *kind, const uint8_t *raw, int32_t raw
     if (ndim < 0) ndim = 0;
     if (ndim > X_MAX_NDIM) return -1;
     if (raw_len < 0) raw_len = 0;
-    return encode_head(kind, 1, dims, ndim, raw, raw_len, out);
+    return encode_head(kind, 1, 0, 0, dims, ndim, raw, raw_len, out);
+}
+
+int32_t kvspaceXvalueEncodeMode(const char *kind, const uint8_t *raw, int32_t raw_len,
+                          const int32_t *dims, int32_t ndim, int32_t ref, int32_t ro, uint32_t vid,
+                          uint8_t **out) {
+    if (!out || !kind) return -1;
+    if (ndim < 0) ndim = 0;
+    if (ndim > X_MAX_NDIM) return -1;
+    if (raw_len < 0) raw_len = 0;
+    return encode_head(kind, ref, ro, vid, dims, ndim, raw, raw_len, out);
 }
 
 /* 标量/一维便捷编码（内部）：array_len → dims。char/* 恒一维（含空串/单字符）；
@@ -105,15 +116,18 @@ xvalue_head_t kvspaceXvalueDecodeHead(const uint8_t *data, int32_t data_len) {
     if (!data || data_len < 4) return h;
     h.kind_len = (int32_t)data[0];
     int32_t o = 1 + h.kind_len;
-    if (data_len < o + 2 + 4) return h;
+    if (data_len < o + 2 + 4 + 4) return h;
     h.kind = (const char *)(data + 1);
-    h.ref = data[o];
+    uint8_t mode = data[o];
+    h.ref = mode & 0x03;
+    h.ro = (mode >> 2) & 0x01;
     h.ndim = data[o + 1];
     if (h.ndim > X_MAX_NDIM) return h;
+    h.vid = rd_u32(data + o + 2);
     int32_t seg = shape_seg(h.ndim);
-    if (data_len < o + 2 + seg + 4) return h;
-    for (int i = 0; i < h.ndim; i++) h.dims[i] = (int32_t)rd_u32(data + o + 2 + 4 * i);
-    int32_t raw_off = o + 2 + seg;
+    if (data_len < o + 6 + seg + 4) return h;
+    for (int i = 0; i < h.ndim; i++) h.dims[i] = (int32_t)rd_u32(data + o + 6 + 4 * i);
+    int32_t raw_off = o + 6 + seg;
     h.raw_len = (int32_t)rd_u32(data + raw_off);
     if (data_len < raw_off + 4 + h.raw_len) return h;
     h.raw = data + raw_off + 4;

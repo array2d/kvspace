@@ -25,6 +25,20 @@ typedef struct {
     int32_t dims[8];
 } kvspaceHead_t;
 
+/* kvspaceHeadV_t — 带权限字段（ref/ro/vid）的扩展 head，供 kvspaceDecodeHeadV 返回。 */
+typedef struct {
+    uint8_t kind[32];
+    uint8_t is_ptr;
+    uint8_t ref;
+    uint8_t ro;
+    int32_t array_len;
+    int32_t body_len;
+    int32_t body_offset;
+    int32_t ndim;
+    int32_t dims[8];
+    uint32_t vid;
+} kvspaceHeadV_t;
+
 static int parse_shm_path(const char *dsn, char *out, size_t osz) {
     const char *sep = strstr(dsn, "://");
     if (!sep || strncmp(dsn, "shm", (size_t)(sep - dsn)) != 0) return -1;
@@ -142,6 +156,15 @@ int kvspaceTlvEncodePtr(const char *kind, const uint8_t *raw, uint32_t raw_len,
     return 0;
 }
 
+int kvspaceTlvEncodeMode(const char *kind, const uint8_t *raw, uint32_t raw_len,
+                           const int32_t *dims, int32_t ndim, int32_t ref, uint8_t ro, uint32_t vid,
+                           uint8_t **out, uint32_t *out_len) {
+    int32_t n = kvspaceXvalueEncodeMode(kind, raw, (int32_t)raw_len, dims, ndim, ref, (int32_t)ro, vid, out);
+    if (n < 0) return 1;
+    *out_len = (uint32_t)n;
+    return 0;
+}
+
 int kvspaceDecodeHead(const uint8_t *data, uint32_t data_len, kvspaceHead_t *out) {
     if (!out) return 1;
     xvalue_head_t h = kvspaceXvalueDecodeHead(data, (int32_t)data_len);
@@ -156,6 +179,26 @@ int kvspaceDecodeHead(const uint8_t *data, uint32_t data_len, kvspaceHead_t *out
     out->body_offset = kvspaceXvalueHeadLen(&h);
     out->ndim = h.ndim;
     for (int i = 0; i < 8 && i < h.ndim; i++) out->dims[i] = h.dims[i];
+    return 0;
+}
+
+int kvspaceDecodeHeadV(const uint8_t *data, uint32_t data_len, kvspaceHeadV_t *out) {
+    if (!out) return 1;
+    xvalue_head_t h = kvspaceXvalueDecodeHead(data, (int32_t)data_len);
+    memset(out, 0, sizeof(*out));
+    uint32_t kl = (uint32_t)h.kind_len;
+    if (kl > 31) kl = 31;
+    memcpy(out->kind, h.kind, kl);
+    out->kind[kl] = 0;
+    out->is_ptr = (h.ref == 1);
+    out->ref = (uint8_t)h.ref;
+    out->ro = (uint8_t)h.ro;
+    out->array_len = h.array_len;
+    out->body_len = h.raw_len;
+    out->body_offset = kvspaceXvalueHeadLen(&h);
+    out->ndim = h.ndim;
+    for (int i = 0; i < 8 && i < h.ndim; i++) out->dims[i] = h.dims[i];
+    out->vid = h.vid;
     return 0;
 }
 

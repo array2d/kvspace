@@ -1,8 +1,9 @@
 /*
  * xvalue.h — XValue 类型系统与 TLV 编解码（对齐 kvspace-durable 的 kindexp TLV）。
  *
- * TLV: [1B kind_len][kind][1B ref][1B ndim][ndim×4B dims LE][padding][4B raw_len LE][raw]
- *   ref: 0=内联 1=软链接(Ptr, raw=目标路径) 2=扩展句柄(@)
+ * TLV: [1B kind_len][kind][1B ref|ro][1B ndim][4B vid LE][ndim×4B dims LE][padding][4B raw_len LE][raw]
+ *   ref|ro 字节：bit[1:0]=ref（0=内联 1=软链接(Ptr, raw=目标路径) 2=@扩展句柄），bit[2]=ro（1=只读），bit[7:3] 保留
+ *   vid: vthread id（LE u32，默认 0）
  *   ndim: 0=标量(单值)，N=N 维数组；ndim 是唯一「是否数组」标志（无独立 arr_flag）
  *   dims: 各维长度（LE u32）
  *   padding: 形状段(dims+padding)恒 X_MAX_NDIM×4=32B（仅 ndim≥1），使 body 偏移与 ndim 无关，
@@ -49,6 +50,8 @@ typedef struct {
     const char    *kind;      /* 非 NUL-terminated，用 kind_len */
     int32_t        kind_len;
     int32_t        ref;       /* 0=内联 1=软链接 2=扩展句柄 */
+    int32_t        ro;        /* 1=只读，0=可写 */
+    uint32_t       vid;       /* vthread id（默认 0） */
     int32_t        ndim;      /* 0=标量，N=N 维数组（唯一「是否数组」标志） */
     int32_t        dims[X_MAX_NDIM];
     int32_t        array_len; /* 派生：标量=1，定长=∏dims，变长=raw_len/elem_size */
@@ -65,6 +68,10 @@ int32_t kvspaceXvalueEncode(const char *kind, const uint8_t *raw, int32_t raw_le
 /* 软链接编码（ref=1），raw 为目标路径。 */
 int32_t kvspaceXvalueEncodePtr(const char *kind, const uint8_t *raw, int32_t raw_len,
                           const int32_t *dims, int32_t ndim, uint8_t **out);
+/* 带权限编码（ref + ro + vid）。 */
+int32_t kvspaceXvalueEncodeMode(const char *kind, const uint8_t *raw, int32_t raw_len,
+                          const int32_t *dims, int32_t ndim, int32_t ref, int32_t ro, uint32_t vid,
+                          uint8_t **out);
 xvalue_head_t kvspaceXvalueDecodeHead(const uint8_t *data, int32_t data_len);
 
 /* raw 读取 helpers（小端） */
