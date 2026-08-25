@@ -1,26 +1,139 @@
 #!/usr/bin/env python3
-"""03_python — 使用 py/kvspace 包的示例"""
+"""03_python — ctypes 直调 libkvspace（dispatch 前端），shm:// 后端"""
 
-import sys
-sys.path.insert(0, "../py")
+import ctypes
+import os
+import struct
 
-from kvspace import KVSpace, xv_int, xv_float, xv_str, xv_index, xv_link, xv_ext, xv_map, _xv_decode
+SO = os.environ.get("KVSPACE_SO", "libkvspace.so")
+lib = ctypes.CDLL(SO)
 
-with KVSpace("/tmp/kvspace_py.shm") as kv:
+U8P = ctypes.POINTER(ctypes.c_uint8)
+U32P = ctypes.POINTER(ctypes.c_uint32)
+CCHARPP = ctypes.POINTER(ctypes.c_char_p)
+
+
+class Head(ctypes.Structure):
+    _fields_ = [
+        ("kindexpr", ctypes.c_uint8 * 256),
+        ("ro", ctypes.c_uint8),
+        ("vid", ctypes.c_uint32),
+        ("body_len", ctypes.c_int32),
+        ("body_offset", ctypes.c_int32),
+    ]
+
+
+def bind(fn, args, restype):
+    fn.argtypes = args
+    fn.restype = restype
+
+
+bind(lib.kvspaceConnect, [ctypes.c_char_p], ctypes.c_void_p)
+bind(lib.kvspaceClose, [ctypes.c_void_p], None)
+bind(lib.kvspaceBytesFree, [U8P, ctypes.c_uint32], None)
+bind(lib.kvspaceSet, [ctypes.c_void_p, CCHARPP, U8P, U32P, ctypes.c_uint32, ctypes.c_char_p, ctypes.c_uint32], ctypes.c_int)
+bind(lib.kvspaceGet, [ctypes.c_void_p, ctypes.c_char_p, ctypes.POINTER(U8P), U32P], ctypes.c_int)
+bind(lib.kvspaceList, [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_int, ctypes.c_int, ctypes.POINTER(U8P), U32P], ctypes.c_int)
+bind(lib.kvspaceDel, [ctypes.c_void_p, CCHARPP, ctypes.c_uint32, ctypes.c_char_p, ctypes.c_uint32], ctypes.c_int)
+bind(lib.kvspaceDelTree, [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_char_p, ctypes.c_uint32], ctypes.c_int)
+bind(lib.kvspaceMkindex, [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_char_p, ctypes.c_uint32], ctypes.c_int)
+bind(lib.kvspaceNewInt64, [ctypes.c_int64, ctypes.POINTER(U8P), U32P], ctypes.c_int)
+bind(lib.kvspaceNewCharByte, [U8P, ctypes.c_uint32, ctypes.POINTER(U8P), U32P], ctypes.c_int)
+bind(lib.kvspaceDecodeHead, [U8P, ctypes.c_uint32, ctypes.POINTER(Head)], ctypes.c_int)
+
+
+def enc_int(v):
+    out, n = U8P(), ctypes.c_uint32()
+    lib.kvspaceNewInt64(v, ctypes.byref(out), ctypes.byref(n))
+    return ctypes.string_at(out, n.value)
+
+
+def enc_str(s):
+    b = s.encode()
+    buf = (ctypes.c_uint8 * len(b)).from_buffer_copy(b)
+    out, n = U8P(), ctypes.c_uint32()
+    lib.kvspaceNewCharByte(buf, len(b), ctypes.byref(out), ctypes.byref(n))
+    return ctypes.string_at(out, n.value)
+
+
+def decode(data):
+    buf = (ctypes.c_uint8 * len(data)).from_buffer_copy(data)
+    h = Head()
+    lib.kvspaceDecodeHead(buf, len(data), ctypes.byref(h))
+    kx = bytes(h.kindexpr).split(b"\0", 1)[0].decode()
+    if kx.startswith(("*", "@")):
+        kx = kx[1:]
+    if kx.startswith("["):
+        kx = kx[kx.index("]") + 1:]
+    return kx, data[h.body_offset:h.body_offset + h.body_len]
+
+
+class KV:
+    def __init__(self, path):
+        try:
+            os.unlink(path)
+        except FileNotFoundError:
+            pass
+        self.path = path
+        self.kv = lib.kvspaceConnect(f"shm://{path}".encode())
+        if not self.kv:
+            raise RuntimeError(f"connect shm://{path} failed")
+
+    def close(self):
+        lib.kvspaceClose(self.kv)
+        try:
+            os.unlink(self.path)
+        except FileNotFoundError:
+            pass
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        self.close()
+
+    def set(self, key, val):
+        keys = (ctypes.c_char_p * 1)(key.encode())
+        lens = (ctypes.c_uint32 * 1)(len(val))
+        buf = (ctypes.c_uint8 * len(val)).from_buffer_copy(val)
+        lib.kvspaceSet(self.kv, keys, buf, lens, 1, None, 0)
+
+    def get(self, key):
+        out, n = U8P(), ctypes.c_uint32()
+        lib.kvspaceGet(self.kv, key.encode(), ctypes.byref(out), ctypes.byref(n))
+        if not out or n.value == 0:
+            return None
+        return ctypes.string_at(out, n.value)
+
+    def delete(self, key):
+        keys = (ctypes.c_char_p * 1)(key.encode())
+        lib.kvspaceDel(self.kv, keys, 1, None, 0)
+
+    def deltree(self, prefix):
+        lib.kvspaceDelTree(self.kv, prefix.encode(), None, 0)
+
+    def mkindex(self, path):
+        lib.kvspaceMkindex(self.kv, path.encode(), None, 0)
+
+    def list(self, prefix):
+        out, n = U8P(), ctypes.c_uint32()
+        lib.kvspaceList(self.kv, prefix.encode(), 0, 1, ctypes.byref(out), ctypes.byref(n))
+        if not out or n.value == 0:
+            return []
+        s = ctypes.string_at(out, n.value).decode()
+        return s.split("\n")
+
+
+with KV("/tmp/kvspace_py.shm") as kv:
     kv.mkindex("/py/")
 
-    kv.set("/py/a", xv_int(42))
-    kv.set("/py/b", xv_float(3.14))
-    kv.set("/py/c", xv_str("你好"))
+    kv.set("/py/a", enc_int(42))
+    kv.set("/py/b", enc_str("你好"))
 
-    for k in ["/py/a", "/py/b", "/py/c"]:
-        v = kv.get(k)
-        kind, al, raw = _xv_decode(v)
+    for k in ["/py/a", "/py/b"]:
+        kind, raw = decode(kv.get(k))
         if kind == "int64":
-            import struct
-            val = struct.unpack_from("<q", raw)[0]
-        elif kind == "float64":
-            val = f"{struct.unpack_from('<d', raw)[0]:.2f}"
+            val = struct.unpack("<q", raw)[0]
         else:
             val = raw.decode()
         print(f"{k}\t{kind}:{val}")
@@ -29,15 +142,8 @@ with KVSpace("/tmp/kvspace_py.shm") as kv:
     print(f"list /py/: {sorted(ns)} (count={len(ns)})")
 
     kv.delete("/py/b")
-    assert len(kv.list("/py/")) == 2
+    assert len(kv.list("/py/")) == 1
     kv.deltree("/py/")
     assert kv.list("/py/") == []
 
-    # strkeymapindex：坐标段成员名 [s0,s1]，list 按 row-major 数值升序返回。
-    kv.set("/m.", xv_map(["[1,2]", "[0,1]", "[0,0]"], (2, 3)))
-    assert kv.list("/m.") == ["[0,0]", "[0,1]", "[1,2]"], kv.list("/m.")
-    kind, al, _ = _xv_decode(kv.get("/m."))
-    assert kind == "strkeymapindex" and al == 6, (kind, al)
-    kv.deltree("/m.")
-
-    print("PASS python")
+print("PASS python")

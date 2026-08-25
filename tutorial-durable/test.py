@@ -10,9 +10,10 @@ import subprocess
 import sys
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parent.parent
-DURABLE_SO = ROOT / "target" / "debug" / "libkvspace_durable.so"
-KVSPACE_C_DIR = ROOT.parent / "kvspace-c"
+ROOT = Path(__file__).resolve().parent.parent  # kvspace/
+WS = ROOT.parent  # array2d/
+DURABLE_SO = WS / "kvspace-durable" / "target" / "release" / "libkvspace_durable.so"
+KVSPACE_C_DIR = WS / "kvspace-c"
 KVSPACE_C_SO = KVSPACE_C_DIR / "build" / "libkvspace-c.so"
 
 def extract_expected(script):
@@ -58,16 +59,11 @@ def test_script(script):
 
 class HeadV(ctypes.Structure):
     _fields_ = [
-        ("kind", ctypes.c_uint8 * 32),
-        ("is_ptr", ctypes.c_uint8),
-        ("ref", ctypes.c_uint8),
+        ("kindexpr", ctypes.c_uint8 * 256),
         ("ro", ctypes.c_uint8),
-        ("array_len", ctypes.c_int32),
+        ("vid", ctypes.c_uint32),
         ("body_len", ctypes.c_int32),
         ("body_offset", ctypes.c_int32),
-        ("ndim", ctypes.c_int32),
-        ("dims", ctypes.c_int32 * 8),
-        ("vid", ctypes.c_uint32),
     ]
 
 
@@ -81,8 +77,8 @@ def setup_lib(lib):
     lib.kvspaceTlvEncodeMode.argtypes = [ctypes.c_char_p, U8P, ctypes.c_uint32, I32P, ctypes.c_int32,
                                          ctypes.c_int, ctypes.c_uint8, ctypes.c_uint32, U8PP, U32P]
     lib.kvspaceTlvEncodeMode.restype = ctypes.c_int
-    lib.kvspaceDecodeHeadV.argtypes = [U8P, ctypes.c_uint32, ctypes.POINTER(HeadV)]
-    lib.kvspaceDecodeHeadV.restype = ctypes.c_int
+    lib.kvspaceDecodeHead.argtypes = [U8P, ctypes.c_uint32, ctypes.POINTER(HeadV)]
+    lib.kvspaceDecodeHead.restype = ctypes.c_int
     lib.kvspaceBytesFree.argtypes = [U8P, ctypes.c_uint32]
 
 
@@ -103,12 +99,11 @@ def encode(lib, kind, raw, dims=(), ref=0, ro=0, vid=0):
 def decode(lib, data):
     buf = (ctypes.c_uint8 * len(data)).from_buffer_copy(data)
     h = HeadV()
-    rc = lib.kvspaceDecodeHeadV(buf, len(data), ctypes.byref(h))
+    rc = lib.kvspaceDecodeHead(buf, len(data), ctypes.byref(h))
     assert rc == 0, f"decode rc={rc}"
     return {
-        "kind": bytes(h.kind).split(b"\0", 1)[0].decode(),
-        "is_ptr": h.is_ptr, "ref": h.ref, "ro": h.ro, "vid": h.vid,
-        "ndim": h.ndim, "dims": list(h.dims[:h.ndim]), "array_len": h.array_len,
+        "kindexpr": bytes(h.kindexpr).split(b"\0", 1)[0].decode(),
+        "ro": h.ro, "vid": h.vid,
         "body_len": h.body_len, "body_offset": h.body_offset,
     }
 
@@ -156,8 +151,9 @@ def test_kvspace_c_alignment():
 
 
 def main():
+    here = os.path.dirname(os.path.abspath(__file__))
     scripts = sorted(
-        os.path.join('tutorial', f) for f in os.listdir('tutorial')
+        os.path.join(here, f) for f in os.listdir(here)
         if f.endswith('.sh')
     )
     if not scripts:

@@ -81,7 +81,7 @@ void *kvspaceConnect(const char *dsn) {
         if (!(vt)->field) { free(vt); dlclose(dl); return NULL; }   \
     } while (0)
 
-    LOAD(free, "kvspaceFree");
+    LOAD(free, "kvspaceClose");
     LOAD(disconnect, "kvspaceDisconnect");
     LOAD(set, "kvspaceSet");
     LOAD(get, "kvspaceGet");
@@ -107,7 +107,7 @@ void *kvspaceConnect(const char *dsn) {
     return h;
 }
 
-void kvspaceFree(void *h) {
+void kvspaceClose(void *h) {
     if (!h) return;
     kvspace_handle *x = H(h);
     if (x->vt->free) x->vt->free(x->backend);

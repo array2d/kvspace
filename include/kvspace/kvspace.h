@@ -31,7 +31,7 @@ typedef struct {
 
 /* ── 生命周期 ─────────────────────────────────────────────────── */
 void *kvspaceConnect(const char *dsn);
-void  kvspaceFree(void *h);
+void  kvspaceClose(void *h);
 void  kvspaceBytesFree(uint8_t *p, uint32_t len);
 int   kvspaceDisconnect(void *h, char *err, uint32_t err_cap);
 

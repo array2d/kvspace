@@ -17,7 +17,7 @@ struct Head {
 #[link(name = "kvspace")]
 extern "C" {
     fn kvspaceConnect(dsn: *const c_char) -> *mut c_void;
-    fn kvspaceFree(h: *mut c_void);
+    fn kvspaceClose(h: *mut c_void);
     fn kvspaceBytesFree(p: *mut u8, len: u32);
     fn kvspaceSet(
         h: *mut c_void,
@@ -326,17 +326,44 @@ fn set_one(kv: *mut c_void, key: &str, val: &[u8]) {
     }
 }
 
-fn list_names(kv: *mut c_void, prefix: &str) -> Vec<String> {
+fn list_names(kv: *mut c_void, prefix: &str, expand_ext: bool) -> Vec<String> {
     let mut out: *mut u8 = std::ptr::null_mut();
     let mut len: u32 = 0;
     unsafe {
-        if kvspaceList(kv, cs(prefix), 0, 1, &mut out, &mut len) != 0 || out.is_null() || len == 0 {
+        if kvspaceList(kv, cs(prefix), expand_ext as c_int, 1, &mut out, &mut len) != 0
+            || out.is_null()
+            || len == 0
+        {
             return vec![];
         }
         let s = String::from_utf8_lossy(std::slice::from_raw_parts(out, len as usize)).into_owned();
         kvspaceBytesFree(out, len);
         s.split('\n').filter(|x| !x.is_empty()).map(|x| x.to_string()).collect()
     }
+}
+
+fn join_path(parent: &str, child: &str) -> String {
+    if parent == "/" {
+        return format!("/{}", child);
+    }
+    if parent.ends_with('/') || parent.ends_with('.') {
+        return format!("{}{}", parent, child);
+    }
+    format!("{}/{}", parent, child)
+}
+
+fn read_ext(kv: *mut c_void, prefix: &str) -> String {
+    let v = get(kv, prefix);
+    if v.is_empty() {
+        return String::new();
+    }
+    let d = decode(&v);
+    if d.kind != "extindex" || d.body.len() < 4 {
+        return String::new();
+    }
+    let s = String::from_utf8_lossy(&d.body[4..]).into_owned();
+    let first = s.split('\n').next().unwrap_or("");
+    first.strip_prefix('…').unwrap_or(first).to_string()
 }
 
 fn main() {
@@ -453,10 +480,17 @@ fn main() {
         "extindex" => {
             if tail.len() >= 2 {
                 let mut err = [0u8; 256];
-                unsafe { kvspaceMkindexExt(kv, cs(&tail[0]), cs(&tail[1]), err.as_mut_ptr() as *mut c_char, 256); }
+                let rc = unsafe {
+                    kvspaceMkindexExt(kv, cs(&tail[0]), cs(&tail[1]), err.as_mut_ptr() as *mut c_char, 256)
+                };
+                if rc != 0 {
+                    let msg = String::from_utf8_lossy(&err[..err.iter().position(|&b| b == 0).unwrap_or(err.len())]);
+                    fatalf(&msg);
+                }
             }
         }
         "list" | "ls" => {
+            let mut show_ext = true;
             let mut show_kind = true;
             let mut prefix: Option<&str> = None;
             for a in tail {
@@ -464,29 +498,20 @@ fn main() {
                     show_kind = true;
                 } else if a == "--kind=false" {
                     show_kind = false;
-                } else if a.starts_with("--showext") {
-                    // 忽略 showext（extindex 展开暂不实现）
+                } else if a == "--showext" {
+                    show_ext = true;
+                } else if a == "--showext=false" {
+                    show_ext = false;
                 } else {
                     prefix = Some(a);
                 }
             }
             if let Some(p) = prefix {
-                for name in list_names(kv, p) {
-                    let full = format!("{}{}", p, name);
-                    let v = get(kv, &full);
-                    if v.is_empty() {
-                        println!("{}\tNone", name);
-                    } else if show_kind {
-                        let d = decode(&v);
-                        println!("{}\t{}\t{}", name, d.kind, plain(&d));
-                    } else {
-                        let d = decode(&v);
-                        println!("{}\t{}", name, plain(&d));
-                    }
-                }
+                fprint_list(kv, p, show_ext, show_kind);
             }
         }
         "tree" => {
+            let mut show_ext = true;
             let mut show_kind = false;
             let mut prefix: Option<&str> = None;
             for a in tail {
@@ -494,14 +519,17 @@ fn main() {
                     show_kind = true;
                 } else if a == "--kind=false" {
                     show_kind = false;
-                } else if a.starts_with("--showext") {
+                } else if a == "--showext" {
+                    show_ext = true;
+                } else if a == "--showext=false" {
+                    show_ext = false;
                 } else {
                     prefix = Some(a);
                 }
             }
             if let Some(p) = prefix {
                 println!("{}", p);
-                print_tree(kv, p, "", show_kind);
+                fprint_tree(kv, p, "", show_ext, show_kind);
             }
         }
         "clear" => {
@@ -514,29 +542,89 @@ fn main() {
         }
     }
 
-    unsafe { kvspaceFree(kv); }
+    unsafe { kvspaceClose(kv); }
 }
 
-fn print_tree(kv: *mut c_void, prefix: &str, indent: &str, show_kind: bool) {
-    let mut names = list_names(kv, prefix);
-    names.sort_by(|a, b| {
-        let aa = a.trim_end_matches('/');
-        let bb = b.trim_end_matches('/');
-        if aa == bb { a.ends_with('/').cmp(&b.ends_with('/')) } else { aa.cmp(bb) }
+fn strip_ext_children(kv: *mut c_void, prefix: &str, children: Vec<String>) -> Vec<String> {
+    let ext = read_ext(kv, prefix);
+    if ext.is_empty() {
+        return children;
+    }
+    let ext_children = list_names(kv, &ext, false);
+    let n = children.len().saturating_sub(ext_children.len());
+    children[..n].to_vec()
+}
+
+fn has_dir(kv: *mut c_void, prefix: &str, name: &str) -> bool {
+    let child_dir = format!("{}/", join_path(prefix, name));
+    if !list_names(kv, &child_dir, false).is_empty() {
+        return true;
+    }
+    !get(kv, &join_path(prefix, &format!("{}/", name))).is_empty()
+}
+
+fn fprint_list(kv: *mut c_void, prefix: &str, show_ext: bool, show_kind: bool) {
+    let mut children = list_names(kv, prefix, true);
+    if !show_ext {
+        children = strip_ext_children(kv, prefix, children);
+    }
+    for c in children {
+        let full = join_path(prefix, &c);
+        let mut v = get(kv, &full);
+        let mut key = c.clone();
+        if has_dir(kv, prefix, &c) {
+            key = format!("{}/", c.trim_end_matches('/'));
+            v = vec![];
+        }
+        if v.is_empty() {
+            println!("{}", key);
+        } else if show_kind {
+            let d = decode(&v);
+            println!("{}\t{}\t{}", key, d.kind, plain(&d));
+        } else {
+            let d = decode(&v);
+            println!("{}\t{}", key, plain(&d));
+        }
+    }
+    if !show_ext {
+        let ext = read_ext(kv, prefix);
+        if !ext.is_empty() {
+            println!("…{}", ext);
+            for c in list_names(kv, &ext, false) {
+                println!("  {}", c);
+            }
+        }
+    }
+}
+
+fn fprint_tree(kv: *mut c_void, prefix: &str, indent: &str, show_ext: bool, show_kind: bool) {
+    let mut children = list_names(kv, prefix, true);
+    if !show_ext {
+        children = strip_ext_children(kv, prefix, children);
+    }
+    children.sort_by(|a, b| {
+        let (aa, bb) = (a.trim_end_matches('/'), b.trim_end_matches('/'));
+        if aa == bb {
+            a.ends_with('/').cmp(&b.ends_with('/'))
+        } else {
+            aa.cmp(bb)
+        }
     });
-    let n = names.len();
-    for (i, c) in names.iter().enumerate() {
-        let full = format!("{}{}", prefix, c);
+
+    let n = children.len();
+    for (i, c) in children.iter().enumerate() {
+        let full = join_path(prefix, c);
         let v = get(kv, &full);
         let base = c.trim_end_matches('/');
-        let child_dir = format!("{}{}/", prefix, base);
-        let has_child = !list_names(kv, &child_dir).is_empty();
+        let child_dir = format!("{}/", join_path(prefix, base));
+        let has_child = !list_names(kv, &child_dir, false).is_empty()
+            || !get(kv, &join_path(prefix, &format!("{}/", base))).is_empty();
         let last = i == n - 1;
         let branch = if last { "└── " } else { "├── " };
         let next_indent = format!("{}{}", indent, if last { "    " } else { "│   " });
         if has_child && c.ends_with('/') {
             println!("{}{}{}", indent, branch, c);
-            print_tree(kv, &child_dir, &next_indent, show_kind);
+            fprint_tree(kv, &child_dir, &next_indent, show_ext, show_kind);
         } else if v.is_empty() {
             println!("{}{}{}", indent, branch, c);
         } else if show_kind {
@@ -545,6 +633,12 @@ fn print_tree(kv: *mut c_void, prefix: &str, indent: &str, show_kind: bool) {
         } else {
             let d = decode(&v);
             println!("{}{}{}\t{}", indent, branch, c, plain(&d));
+        }
+    }
+    if !show_ext {
+        let ext = read_ext(kv, prefix);
+        if !ext.is_empty() {
+            println!("{}└── …{}", indent, ext);
         }
     }
 }
