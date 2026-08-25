@@ -346,7 +346,7 @@ fn join_path(parent: &str, child: &str) -> String {
     if parent == "/" {
         return format!("/{}", child);
     }
-    if parent.ends_with('/') || parent.ends_with('.') {
+    if parent.ends_with('/') || parent.ends_with('·') {
         return format!("{}{}", parent, child);
     }
     format!("{}/{}", parent, child)
