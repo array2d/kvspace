@@ -5,9 +5,9 @@
  * codec（TlvEncode、DecodeHead、New 等）无 handle，由前端静态实现，byte-identical。
  *
  * 后端装载名：
- *   shm://...           → libkvspace-c.so.1
- *   其余（redis/fs/s3） → libkvspace_durable.so.1
- * 目录由 KVSPACE_BACKEND_PATH 覆盖（默认走动态链接器搜索路径）。
+ *   shm://...           → libkvspace-c.so
+ *   其余（redis/fs/s3） → libkvspace_durable.so
+ * 目录由 KVSPACE_BACKEND_PATH 覆盖（默认 /usr/lib）。
  */
 
 #include "kvspace/kvspace.h"
@@ -52,13 +52,13 @@ static kvspace_handle *H(void *h) { return (kvspace_handle *)h; }
 
 static const char *backend_soname(const char *dsn) {
     return (dsn && strncmp(dsn, "shm://", 6) == 0)
-        ? "libkvspace-c.so.1"
-        : "libkvspace_durable.so.1";
+        ? "libkvspace-c.so"
+        : "libkvspace_durable.so";
 }
 
 static char *backend_path(const char *soname, char *buf, size_t cap) {
     const char *dir = getenv("KVSPACE_BACKEND_PATH");
-    if (!dir || !dir[0]) dir = "/usr/lib/kvspace";
+    if (!dir || !dir[0]) dir = "/usr/lib";
     snprintf(buf, cap, "%s/%s", dir, soname);
     return buf;
 }
