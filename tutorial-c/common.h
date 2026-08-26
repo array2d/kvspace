@@ -19,7 +19,7 @@ static inline uint8_t *enc_int64(int64_t v, uint32_t *len) {
 
 static inline uint8_t *enc_str(const char *s, uint32_t *len) {
     uint8_t *out = NULL; uint32_t n = 0;
-    kvspaceNewCharByte((const uint8_t *)s, (uint32_t)strlen(s), &out, &n);
+    kvspaceNewChar((const uint8_t *)s, (uint32_t)strlen(s), &out, &n);
     *len = n; return out;
 }
 

@@ -26,7 +26,7 @@ extern "C" {
     fn kvspaceDelTree(h: *mut c_void, prefix: *const c_char, err: *mut c_char, err_cap: u32) -> c_int;
     fn kvspaceMkindex(h: *mut c_void, path: *const c_char, err: *mut c_char, err_cap: u32) -> c_int;
     fn kvspaceNewInt64(v: i64, out: *mut *mut u8, out_len: *mut u32) -> c_int;
-    fn kvspaceNewCharByte(bytes: *const u8, len: u32, out: *mut *mut u8, out_len: *mut u32) -> c_int;
+    fn kvspaceNewChar(bytes: *const u8, len: u32, out: *mut *mut u8, out_len: *mut u32) -> c_int;
     fn kvspaceDecodeHead(data: *const u8, data_len: u32, out: *mut Head) -> c_int;
 }
 
@@ -43,7 +43,7 @@ fn enc_str(s: &str) -> Vec<u8> {
     let b = s.as_bytes();
     let mut out: *mut u8 = ptr::null_mut();
     let mut n: u32 = 0;
-    unsafe { kvspaceNewCharByte(b.as_ptr(), b.len() as u32, &mut out, &mut n); }
+    unsafe { kvspaceNewChar(b.as_ptr(), b.len() as u32, &mut out, &mut n); }
     let r = unsafe { std::slice::from_raw_parts(out, n as usize) }.to_vec();
     unsafe { kvspaceBytesFree(out, n); }
     r

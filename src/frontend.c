@@ -264,19 +264,6 @@ static int al_to_dims(const char *kind, int32_t array_len, int32_t *dims) {
     return 0;
 }
 
-static uint32_t utf8_next(const uint8_t *s, int len, int *i) {
-    uint32_t cp = s[*i];
-    if (cp < 0x80) { (*i)++; return cp; }
-    int n;
-    if ((cp & 0xE0) == 0xC0)      { n = 1; cp &= 0x1F; }
-    else if ((cp & 0xF0) == 0xE0) { n = 2; cp &= 0x0F; }
-    else if ((cp & 0xF8) == 0xF0) { n = 3; cp &= 0x07; }
-    else { (*i)++; return 0xFFFD; }
-    (*i)++;
-    for (int j = 0; j < n && *i < len; j++, (*i)++) cp = (cp << 6) | (s[*i] & 0x3F);
-    return cp;
-}
-
 int kvspaceTlvEncode(const char *kind, const uint8_t *raw, uint32_t raw_len,
                      const int32_t *dims, int32_t ndim, uint8_t **out, uint32_t *out_len) {
     if (!out || !out_len || !kind) return 1;
@@ -331,26 +318,7 @@ int kvspaceNewPtr(const char *kind, const char *target, int32_t array_len,
                        (const uint8_t *)target, (uint32_t)strlen(target), out, out_len);
 }
 
-int kvspaceNewChar(const char *kind, const char *s, uint8_t **out, uint32_t *out_len) {
-    if (!kind || !s || !out || !out_len) return 1;
-    if (strcmp(kind, "char/utf32") != 0) {
-        size_t sl = strlen(s);
-        int32_t d[1] = { (int32_t)sl };
-        return encode_head(kind, 0, 0, 0, d, 1, (const uint8_t *)s, (uint32_t)sl, out, out_len);
-    }
-    /* char/utf32：UTF-8 → UTF-32 LE 码点 */
-    int slen = (int)strlen(s);
-    uint8_t *raw = malloc((size_t)slen * 4);
-    if (!raw) return 1;
-    int n = 0, i = 0;
-    while (i < slen) { uint32_t cp = utf8_next((const uint8_t *)s, slen, &i); wr_u32(raw + n * 4, cp); n++; }
-    int32_t d[1] = { n };
-    int rc = encode_head("char/utf32", 0, 0, 0, d, 1, raw, (uint32_t)(n * 4), out, out_len);
-    free(raw);
-    return rc;
-}
-
-int kvspaceNewCharByte(const uint8_t *bytes, uint32_t len, uint8_t **out, uint32_t *out_len) {
+int kvspaceNewChar(const uint8_t *bytes, uint32_t len, uint8_t **out, uint32_t *out_len) {
     if (!bytes || !out || !out_len) return 1;
     int32_t d[1] = { (int32_t)len };
     return encode_head("char/utf8", 0, 0, 0, d, 1, bytes, len, out, out_len);

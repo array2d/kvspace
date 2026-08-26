@@ -65,7 +65,7 @@ extern "C" {
         out_len: *mut u32,
     ) -> c_int;
     fn kvspaceNewPtr(kind: *const c_char, target: *const c_char, array_len: i32, out: *mut *mut u8, out_len: *mut u32) -> c_int;
-    fn kvspaceNewCharByte(bytes: *const u8, len: u32, out: *mut *mut u8, out_len: *mut u32) -> c_int;
+    fn kvspaceNewChar(bytes: *const u8, len: u32, out: *mut *mut u8, out_len: *mut u32) -> c_int;
     fn kvspaceNewBool(v: u8, out: *mut *mut u8, out_len: *mut u32) -> c_int;
     fn kvspaceNewInt64(v: i64, out: *mut *mut u8, out_len: *mut u32) -> c_int;
     fn kvspaceNewFloat64(v: f64, out: *mut *mut u8, out_len: *mut u32) -> c_int;
@@ -290,7 +290,7 @@ fn parse_value(raw: &str) -> Vec<u8> {
                 let b = repr == "true";
                 unsafe { kvspaceNewBool(b as u8, &mut out, &mut len) == 0 }
             }
-            "string" => unsafe { kvspaceNewCharByte(repr.as_ptr(), repr.len() as u32, &mut out, &mut len) == 0 },
+            "string" => unsafe { kvspaceNewChar(repr.as_ptr(), repr.len() as u32, &mut out, &mut len) == 0 },
             "nil" => {
                 return vec![];
             }

@@ -38,7 +38,7 @@ bind(lib.kvspaceDel, [ctypes.c_void_p, CCHARPP, ctypes.c_uint32, ctypes.c_char_p
 bind(lib.kvspaceDelTree, [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_char_p, ctypes.c_uint32], ctypes.c_int)
 bind(lib.kvspaceMkindex, [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_char_p, ctypes.c_uint32], ctypes.c_int)
 bind(lib.kvspaceNewInt64, [ctypes.c_int64, ctypes.POINTER(U8P), U32P], ctypes.c_int)
-bind(lib.kvspaceNewCharByte, [U8P, ctypes.c_uint32, ctypes.POINTER(U8P), U32P], ctypes.c_int)
+bind(lib.kvspaceNewChar, [U8P, ctypes.c_uint32, ctypes.POINTER(U8P), U32P], ctypes.c_int)
 bind(lib.kvspaceDecodeHead, [U8P, ctypes.c_uint32, ctypes.POINTER(Head)], ctypes.c_int)
 
 
@@ -52,7 +52,7 @@ def enc_str(s):
     b = s.encode()
     buf = (ctypes.c_uint8 * len(b)).from_buffer_copy(b)
     out, n = U8P(), ctypes.c_uint32()
-    lib.kvspaceNewCharByte(buf, len(b), ctypes.byref(out), ctypes.byref(n))
+    lib.kvspaceNewChar(buf, len(b), ctypes.byref(out), ctypes.byref(n))
     return ctypes.string_at(out, n.value)
 
 

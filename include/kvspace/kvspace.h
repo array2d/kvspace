@@ -66,8 +66,7 @@ int kvspaceDecodeHead(const uint8_t *data, uint32_t data_len, kvspaceHead_t *out
 
 int kvspaceNewPtr(const char *kind, const char *target, int32_t array_len,
                   uint8_t **out, uint32_t *out_len);
-int kvspaceNewChar(const char *kind, const char *s, uint8_t **out, uint32_t *out_len);
-int kvspaceNewCharByte(const uint8_t *bytes, uint32_t len, uint8_t **out, uint32_t *out_len);
+int kvspaceNewChar(const uint8_t *bytes, uint32_t len, uint8_t **out, uint32_t *out_len);
 int kvspaceNewBool(uint8_t v, uint8_t **out, uint32_t *out_len);
 int kvspaceNewInt64(int64_t v, uint8_t **out, uint32_t *out_len);
 int kvspaceNewFloat64(double v, uint8_t **out, uint32_t *out_len);

@@ -2,3 +2,5 @@
 target/
 *.so
 *.so.*
+__pycache__/
+*.pyc
