@@ -63,6 +63,22 @@ static char *backend_path(const char *soname, char *buf, size_t cap) {
     return buf;
 }
 
+/* ── 常量查询（const.h 的 X 宏表生成查找表） ───────────────────────── */
+
+#define KVSPACE_ENTRY(name) { #name, name },
+static const struct { const char *key; const char *val; } kvspace_consts[] = {
+    KVSPACE_KV(KVSPACE_ENTRY)
+};
+#undef KVSPACE_ENTRY
+
+const char *kvspaceConst(const char *name) {
+    if (!name) return NULL;
+    for (size_t i = 0; i < sizeof kvspace_consts / sizeof kvspace_consts[0]; i++)
+        if (strcmp(kvspace_consts[i].key, name) == 0)
+            return kvspace_consts[i].val;
+    return NULL;
+}
+
 /* ── 生命周期 ───────────────────────────────────────────────────────── */
 
 void *kvspaceConnect(const char *dsn) {

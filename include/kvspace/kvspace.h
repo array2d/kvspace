@@ -16,6 +16,8 @@
 
 #include <stdint.h>
 
+#include "kvspace/const.h"
+
 #ifdef __cplusplus
 extern "C" {
 #endif
