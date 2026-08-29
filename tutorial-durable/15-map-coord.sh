@@ -1,7 +1,7 @@
 #!/bin/bash
 # expected:
 # === map head ===
-# /m·	strkeymapindex	ref=0	ro=0	vid=0	ndim=2	dims=[2,3]
+# /m	stringkeymap	ref=0	ro=0	vid=0	ndim=2	dims=[2,3]
 # === map list ===
 # [0,0]	float32	1.0
 # [0,1]	float32	3.140000104904175
@@ -21,7 +21,7 @@ $KV deltree /h/
 
 echo "=== map head ==="
 $KV set /m· 'map[2,3]:'
-$KV head /m·
+$KV head /m
 
 echo "=== map list ==="
 $KV set '/m·[0,1]' 'float32:3.14'
@@ -33,7 +33,7 @@ echo "=== get ==="
 $KV get '/m·[1,2]' '/m·[9,9]'
 
 echo "=== obj vs coord ==="
-$KV set /h· 'objindex:'
+$KV set /h· 'object:'
 $KV set /h·x 'int:1'
 $KV set '/h·[0]' 'int:2'
 $KV list /h· --kind=false --showext=false

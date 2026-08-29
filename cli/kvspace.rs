@@ -181,14 +181,13 @@ fn plain(v: &Value) -> String {
             .chunks(4)
             .map(|c| char::from_u32(le_u32(c)).unwrap_or('\u{FFFD}'))
             .collect(),
-        "strkeymapindex" => format!(
-            "map[{}]{{{}}}",
-            v.dims.iter().map(|d| d.to_string()).collect::<Vec<_>>().join(","),
-            count_names(&v.body)
+        "stringkeymap" => format!(
+            "map[{}]",
+            v.dims.iter().map(|d| d.to_string()).collect::<Vec<_>>().join(",")
         ),
-        "objindex" => {
+        "object" => {
             let n = count_names(&v.body);
-            if n == 0 { "objindex".to_string() } else { format!("{{{}}}", n) }
+            if n == 0 { "object".to_string() } else { format!("{{{}}}", n) }
         }
         "index" => format!("({})", count_names(&v.body)),
         "extindex" => String::from_utf8_lossy(&v.body).into_owned(),
@@ -265,10 +264,10 @@ fn parse_value(raw: &str) -> Vec<u8> {
         if dims.is_empty() {
             fatalf("map 需要 dims，如 map[2,3]:");
         }
-        let zero = [0u8; 4];
+        let empty = [0u8; 0];
         let ndim = dims.len() as i32;
         unsafe {
-            kvspaceTlvEncode(cs("strkeymapindex"), zero.as_ptr(), 4, dims.as_ptr(), ndim, &mut out, &mut len) == 0
+            kvspaceTlvEncode(cs("stringkeymap"), empty.as_ptr(), 0, dims.as_ptr(), ndim, &mut out, &mut len) == 0
         }
     } else {
         let split = raw.find(':').unwrap_or(raw.len());
@@ -298,9 +297,9 @@ fn parse_value(raw: &str) -> Vec<u8> {
                 let zero = [0u8; 4];
                 unsafe { kvspaceTlvEncode(cs("index"), zero.as_ptr(), 4, std::ptr::null(), 0, &mut out, &mut len) == 0 }
             }
-            "objindex" => {
-                let zero = [0u8; 4];
-                unsafe { kvspaceTlvEncode(cs("objindex"), zero.as_ptr(), 4, std::ptr::null(), 0, &mut out, &mut len) == 0 }
+            "object" => {
+                let empty = [0u8; 0];
+                unsafe { kvspaceTlvEncode(cs("object"), empty.as_ptr(), 0, std::ptr::null(), 0, &mut out, &mut len) == 0 }
             }
             _ => {
                 fatalf(&format!("unknown kind: {:?}", kind));

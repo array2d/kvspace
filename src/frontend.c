@@ -257,7 +257,7 @@ static int encode_head(const char *kind, int ref, int ro, uint32_t vid,
     return 0;
 }
 
-/* array_len → dims：char/* 恒一维；其余 >1 才一维，否则标量。 */
+/* array_len → dims：char/ 前缀 kind 恒一维；其余 >1 才一维，否则标量。 */
 static int al_to_dims(const char *kind, int32_t array_len, int32_t *dims) {
     if (strncmp(kind, "char/", 5) == 0) { dims[0] = array_len < 0 ? 0 : array_len; return 1; }
     if (array_len > 1) { dims[0] = array_len; return 1; }
@@ -321,22 +321,22 @@ int kvspaceNewPtr(const char *kind, const char *target, int32_t array_len,
 int kvspaceNewChar(const uint8_t *bytes, uint32_t len, uint8_t **out, uint32_t *out_len) {
     if (!bytes || !out || !out_len) return 1;
     int32_t d[1] = { (int32_t)len };
-    return encode_head("char/utf8", 0, 0, 0, d, 1, bytes, len, out, out_len);
+    return encode_head(KVSPACE_KIND_CHAR_UTF8, 0, 0, 0, d, 1, bytes, len, out, out_len);
 }
 
 int kvspaceNewBool(uint8_t v, uint8_t **out, uint32_t *out_len) {
     uint8_t b = v ? 1 : 0;
-    return encode_head("bool", 0, 0, 0, NULL, 0, &b, 1, out, out_len);
+    return encode_head(KVSPACE_KIND_BOOL, 0, 0, 0, NULL, 0, &b, 1, out, out_len);
 }
 
 int kvspaceNewInt64(int64_t v, uint8_t **out, uint32_t *out_len) {
     uint8_t b[8]; wr_u64(b, (uint64_t)v);
-    return encode_head("int64", 0, 0, 0, NULL, 0, b, 8, out, out_len);
+    return encode_head(KVSPACE_KIND_INT64, 0, 0, 0, NULL, 0, b, 8, out, out_len);
 }
 
 int kvspaceNewFloat64(double v, uint8_t **out, uint32_t *out_len) {
     uint8_t b[8];
     uint64_t bits; memcpy(&bits, &v, 8);
     wr_u64(b, bits);
-    return encode_head("float64", 0, 0, 0, NULL, 0, b, 8, out, out_len);
+    return encode_head(KVSPACE_KIND_FLOAT64, 0, 0, 0, NULL, 0, b, 8, out, out_len);
 }
