@@ -8,7 +8,7 @@
  *
  * 头格式（byte-identical，两边一致，由前端静态实现 codec）：
  *   [1B kindexprlen][kindexpr 含 0x00 padding][1B ro][4B vid LE][4B raw_len LE][raw]
- *   kindexpr 串首字节 * =软链接(Ptr) / @ =扩展句柄 / 无 =内联，其后 [d0,d1]kind 承载 ndim+dims。
+ *   kindexpr 串首字节 * =指针(Ptr) / @ =扩展句柄 / 无 =内联，其后 [d0,d1]kind 承载 ndim+dims。
  */
 
 #ifndef KVSPACE_H
@@ -57,14 +57,12 @@ int kvspaceWatch(void *h, const char *key, const uint8_t *target, uint32_t targe
 /* ── codec（无 handle，由前端静态实现，byte-identical） ─────────── */
 int kvspaceTlvEncode(const char *kind, const uint8_t *raw, uint32_t raw_len,
                      const int32_t *dims, int32_t ndim, uint8_t **out, uint32_t *out_len);
-int kvspaceTlvEncodePtr(const char *kind, const uint8_t *raw, uint32_t raw_len,
-                        const int32_t *dims, int32_t ndim, uint8_t **out, uint32_t *out_len);
 int kvspaceTlvEncodeMode(const char *kind, const uint8_t *raw, uint32_t raw_len,
                          const int32_t *dims, int32_t ndim, int32_t ref, uint8_t ro, uint32_t vid,
                          uint8_t **out, uint32_t *out_len);
 int kvspaceDecodeHead(const uint8_t *data, uint32_t data_len, kvspaceHead_t *out);
 
-int kvspaceNewPtr(const char *kind, const char *target, int32_t array_len,
+int kvspaceNewPtr(const char *target_kindexpr, const char *target,
                   uint8_t **out, uint32_t *out_len);
 int kvspaceNewChar(const uint8_t *bytes, uint32_t len, uint8_t **out, uint32_t *out_len);
 int kvspaceNewBool(uint8_t v, uint8_t **out, uint32_t *out_len);

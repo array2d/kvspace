@@ -28,7 +28,12 @@ extern "C" {
         err: *mut c_char,
         err_cap: u32,
     ) -> c_int;
-    fn kvspaceGet(h: *mut c_void, key: *const c_char, out: *mut *mut u8, out_len: *mut u32) -> c_int;
+    fn kvspaceGet(
+        h: *mut c_void,
+        key: *const c_char,
+        out: *mut *mut u8,
+        out_len: *mut u32,
+    ) -> c_int;
     fn kvspaceList(
         h: *mut c_void,
         prefix: *const c_char,
@@ -37,11 +42,34 @@ extern "C" {
         out: *mut *mut u8,
         out_len: *mut u32,
     ) -> c_int;
-    fn kvspaceDel(h: *mut c_void, keys: *const *const c_char, nkeys: u32, err: *mut c_char, err_cap: u32) -> c_int;
-    fn kvspaceDelTree(h: *mut c_void, prefix: *const c_char, err: *mut c_char, err_cap: u32) -> c_int;
-    fn kvspaceMkindex(h: *mut c_void, path: *const c_char, err: *mut c_char, err_cap: u32) -> c_int;
-    fn kvspaceMkindexExt(h: *mut c_void, path: *const c_char, ext: *const c_char, err: *mut c_char, err_cap: u32) -> c_int;
-    fn kvspaceRmindexExt(h: *mut c_void, path: *const c_char, err: *mut c_char, err_cap: u32) -> c_int;
+    fn kvspaceDel(
+        h: *mut c_void,
+        keys: *const *const c_char,
+        nkeys: u32,
+        err: *mut c_char,
+        err_cap: u32,
+    ) -> c_int;
+    fn kvspaceDelTree(
+        h: *mut c_void,
+        prefix: *const c_char,
+        err: *mut c_char,
+        err_cap: u32,
+    ) -> c_int;
+    fn kvspaceMkindex(h: *mut c_void, path: *const c_char, err: *mut c_char, err_cap: u32)
+        -> c_int;
+    fn kvspaceMkindexExt(
+        h: *mut c_void,
+        path: *const c_char,
+        ext: *const c_char,
+        err: *mut c_char,
+        err_cap: u32,
+    ) -> c_int;
+    fn kvspaceRmindexExt(
+        h: *mut c_void,
+        path: *const c_char,
+        err: *mut c_char,
+        err_cap: u32,
+    ) -> c_int;
     fn kvspaceClear(h: *mut c_void, err: *mut c_char, err_cap: u32) -> c_int;
     fn kvspaceTlvEncode(
         kind: *const c_char,
@@ -64,7 +92,12 @@ extern "C" {
         out: *mut *mut u8,
         out_len: *mut u32,
     ) -> c_int;
-    fn kvspaceNewPtr(kind: *const c_char, target: *const c_char, array_len: i32, out: *mut *mut u8, out_len: *mut u32) -> c_int;
+    fn kvspaceNewPtr(
+        target_kindexpr: *const c_char,
+        target: *const c_char,
+        out: *mut *mut u8,
+        out_len: *mut u32,
+    ) -> c_int;
     fn kvspaceNewChar(bytes: *const u8, len: u32, out: *mut *mut u8, out_len: *mut u32) -> c_int;
     fn kvspaceNewBool(v: u8, out: *mut *mut u8, out_len: *mut u32) -> c_int;
     fn kvspaceNewInt64(v: i64, out: *mut *mut u8, out_len: *mut u32) -> c_int;
@@ -106,14 +139,27 @@ fn decode(data: &[u8]) -> Value {
         kvspaceDecodeHead(data.as_ptr(), data.len() as u32, &mut h);
     }
     let kx = String::from_utf8_lossy(
-        &h.kindexpr[..h.kindexpr.iter().position(|&b| b == 0).unwrap_or(h.kindexpr.len())],
+        &h.kindexpr[..h
+            .kindexpr
+            .iter()
+            .position(|&b| b == 0)
+            .unwrap_or(h.kindexpr.len())],
     )
     .into_owned();
     let (r, dims, kind) = parse_kindexpr(&kx);
     let off = h.body_offset as usize;
     let len = h.body_len.max(0) as usize;
-    let body = if off + len <= data.len() { data[off..off + len].to_vec() } else { vec![] };
-    Value { kind, r#ref: r, dims, body }
+    let body = if off + len <= data.len() {
+        data[off..off + len].to_vec()
+    } else {
+        vec![]
+    };
+    Value {
+        kind,
+        r#ref: r,
+        dims,
+        body,
+    }
 }
 
 fn parse_kindexpr(kx: &str) -> (i32, Vec<i32>, String) {
@@ -141,12 +187,18 @@ fn le_u32(b: &[u8]) -> u32 {
     (b[0] as u32) | ((b[1] as u32) << 8) | ((b[2] as u32) << 16) | ((b[3] as u32) << 24)
 }
 fn le_u64(b: &[u8]) -> u64 {
-    b.iter().enumerate().fold(0u64, |a, (i, &x)| a | ((x as u64) << (8 * i)))
+    b.iter()
+        .enumerate()
+        .fold(0u64, |a, (i, &x)| a | ((x as u64) << (8 * i)))
 }
 
 fn fmt_float(v: f64) -> String {
     let s = format!("{}", v);
-    if s.contains('.') { s } else { format!("{}.0", s) }
+    if s.contains('.') {
+        s
+    } else {
+        format!("{}.0", s)
+    }
 }
 
 fn count_names(body: &[u8]) -> usize {
@@ -167,7 +219,9 @@ fn plain(v: &Value) -> String {
         "bool" => (v.body.first().copied().unwrap_or(0) != 0).to_string(),
         "int8" => (v.body.first().map(|&b| b as i8).unwrap_or(0) as i64).to_string(),
         "int16" => (i16::from_le_bytes([v.body[0], v.body[1]]) as i64).to_string(),
-        "int32" => (i32::from_le_bytes([v.body[0], v.body[1], v.body[2], v.body[3]]) as i64).to_string(),
+        "int32" => {
+            (i32::from_le_bytes([v.body[0], v.body[1], v.body[2], v.body[3]]) as i64).to_string()
+        }
         "int64" => (i64::from_le_bytes(v.body[..8].try_into().unwrap())).to_string(),
         "uint8" => v.body.first().copied().unwrap_or(0).to_string(),
         "uint16" => (u16::from_le_bytes([v.body[0], v.body[1]])).to_string(),
@@ -183,11 +237,19 @@ fn plain(v: &Value) -> String {
             .collect(),
         "stringkeymap" => format!(
             "map[{}]",
-            v.dims.iter().map(|d| d.to_string()).collect::<Vec<_>>().join(",")
+            v.dims
+                .iter()
+                .map(|d| d.to_string())
+                .collect::<Vec<_>>()
+                .join(",")
         ),
         "object" => {
             let n = count_names(&v.body);
-            if n == 0 { "object".to_string() } else { format!("{{{}}}", n) }
+            if n == 0 {
+                "object".to_string()
+            } else {
+                format!("{{{}}}", n)
+            }
         }
         "index" => format!("({})", count_names(&v.body)),
         "extindex" => String::from_utf8_lossy(&v.body).into_owned(),
@@ -212,7 +274,11 @@ fn reencode(tlv: &[u8], ro: u8, vid: u32) -> Vec<u8> {
     let dims = d.dims.clone();
     let ndim = dims.len() as i32;
     unsafe {
-        let dp = if ndim > 0 { dims.as_ptr() } else { std::ptr::null() };
+        let dp = if ndim > 0 {
+            dims.as_ptr()
+        } else {
+            std::ptr::null()
+        };
         kvspaceTlvEncodeMode(
             cs(&d.kind),
             d.body.as_ptr(),
@@ -252,7 +318,7 @@ fn parse_value(raw: &str) -> Vec<u8> {
             Some(i) => (&rest[..i], &rest[i + 1..]),
             None => ("", rest),
         };
-        unsafe { kvspaceNewPtr(cs(k), cs(t), 1, &mut out, &mut len) == 0 }
+        unsafe { kvspaceNewPtr(cs(k), cs(t), &mut out, &mut len) == 0 }
     } else if raw.starts_with("map") {
         let dims: Vec<i32> = raw
             .trim_start_matches("map")
@@ -267,7 +333,15 @@ fn parse_value(raw: &str) -> Vec<u8> {
         let empty = [0u8; 0];
         let ndim = dims.len() as i32;
         unsafe {
-            kvspaceTlvEncode(cs("stringkeymap"), empty.as_ptr(), 0, dims.as_ptr(), ndim, &mut out, &mut len) == 0
+            kvspaceTlvEncode(
+                cs("stringkeymap"),
+                empty.as_ptr(),
+                0,
+                dims.as_ptr(),
+                ndim,
+                &mut out,
+                &mut len,
+            ) == 0
         }
     } else {
         let split = raw.find(':').unwrap_or(raw.len());
@@ -275,31 +349,67 @@ fn parse_value(raw: &str) -> Vec<u8> {
         let repr = raw[split..].trim_start_matches(':');
         match kind {
             "int" => unsafe {
-                repr.parse::<i64>().map(|i| kvspaceNewInt64(i, &mut out, &mut len) == 0).unwrap_or(false)
+                repr.parse::<i64>()
+                    .map(|i| kvspaceNewInt64(i, &mut out, &mut len) == 0)
+                    .unwrap_or(false)
             },
             "float" => unsafe {
-                repr.parse::<f64>().map(|f| kvspaceNewFloat64(f, &mut out, &mut len) == 0).unwrap_or(false)
+                repr.parse::<f64>()
+                    .map(|f| kvspaceNewFloat64(f, &mut out, &mut len) == 0)
+                    .unwrap_or(false)
             },
             "float32" => unsafe {
                 repr.parse::<f32>()
-                    .map(|f| kvspaceTlvEncode(cs("float32"), (&f as *const f32 as *const u8), 4, std::ptr::null(), 0, &mut out, &mut len) == 0)
+                    .map(|f| {
+                        kvspaceTlvEncode(
+                            cs("float32"),
+                            (&f as *const f32 as *const u8),
+                            4,
+                            std::ptr::null(),
+                            0,
+                            &mut out,
+                            &mut len,
+                        ) == 0
+                    })
                     .unwrap_or(false)
             },
             "bool" => {
                 let b = repr == "true";
                 unsafe { kvspaceNewBool(b as u8, &mut out, &mut len) == 0 }
             }
-            "string" => unsafe { kvspaceNewChar(repr.as_ptr(), repr.len() as u32, &mut out, &mut len) == 0 },
+            "string" => unsafe {
+                kvspaceNewChar(repr.as_ptr(), repr.len() as u32, &mut out, &mut len) == 0
+            },
             "nil" => {
                 return vec![];
             }
             "index" => {
                 let zero = [0u8; 4];
-                unsafe { kvspaceTlvEncode(cs("index"), zero.as_ptr(), 4, std::ptr::null(), 0, &mut out, &mut len) == 0 }
+                unsafe {
+                    kvspaceTlvEncode(
+                        cs("index"),
+                        zero.as_ptr(),
+                        4,
+                        std::ptr::null(),
+                        0,
+                        &mut out,
+                        &mut len,
+                    ) == 0
+                }
             }
             "object" => {
                 let empty = [0u8; 0];
-                unsafe { kvspaceTlvEncode(cs("object"), empty.as_ptr(), 0, std::ptr::null(), 0, &mut out, &mut len) == 0 }
+                unsafe {
+                    kvspaceTlvEncode(
+                        cs("object"),
+                        empty.as_ptr(),
+                        0,
+                        std::ptr::null(),
+                        0,
+                        &mut out,
+                        &mut len,
+                    ) == 0
+                }
             }
             _ => {
                 fatalf(&format!("unknown kind: {:?}", kind));
@@ -320,8 +430,21 @@ fn set_one(kv: *mut c_void, key: &str, val: &[u8]) {
     let keys = [cs(key)];
     let lens = [val.len() as u32];
     let mut err = [0u8; 256];
-    unsafe {
-        kvspaceSet(kv, keys.as_ptr(), val.as_ptr(), lens.as_ptr(), 1, err.as_mut_ptr() as *mut c_char, 256);
+    let rc = unsafe {
+        kvspaceSet(
+            kv,
+            keys.as_ptr(),
+            val.as_ptr(),
+            lens.as_ptr(),
+            1,
+            err.as_mut_ptr() as *mut c_char,
+            256,
+        )
+    };
+    if rc != 0 {
+        let n = err.iter().position(|&b| b == 0).unwrap_or(err.len());
+        eprintln!("set {}: {}", key, String::from_utf8_lossy(&err[..n]));
+        std::process::exit(1);
     }
 }
 
@@ -337,7 +460,10 @@ fn list_names(kv: *mut c_void, prefix: &str, expand_ext: bool) -> Vec<String> {
         }
         let s = String::from_utf8_lossy(std::slice::from_raw_parts(out, len as usize)).into_owned();
         kvspaceBytesFree(out, len);
-        s.split('\n').filter(|x| !x.is_empty()).map(|x| x.to_string()).collect()
+        s.split('\n')
+            .filter(|x| !x.is_empty())
+            .map(|x| x.to_string())
+            .collect()
     }
 }
 
@@ -420,8 +546,16 @@ fn main() {
                 }
                 if ro != 0 || vid != 0 {
                     val = reencode(&val, ro, vid);
-                    let mut hh = Head { kindexpr:[0;256], ro:0, vid:0, body_len:0, body_offset:0 };
-                    unsafe { kvspaceDecodeHead(val.as_ptr(), val.len() as u32, &mut hh); }
+                    let mut hh = Head {
+                        kindexpr: [0; 256],
+                        ro: 0,
+                        vid: 0,
+                        body_len: 0,
+                        body_offset: 0,
+                    };
+                    unsafe {
+                        kvspaceDecodeHead(val.as_ptr(), val.len() as u32, &mut hh);
+                    }
                 }
             }
             set_one(kv, &tail[0], &val);
@@ -433,10 +567,22 @@ fn main() {
                     println!("{}\t(nil)", k);
                 } else {
                     let d = decode(&v);
-                    let mut h = Head { kindexpr: [0; 256], ro: 0, vid: 0, body_len: 0, body_offset: 0 };
-                    unsafe { kvspaceDecodeHead(v.as_ptr(), v.len() as u32, &mut h); }
+                    let mut h = Head {
+                        kindexpr: [0; 256],
+                        ro: 0,
+                        vid: 0,
+                        body_len: 0,
+                        body_offset: 0,
+                    };
+                    unsafe {
+                        kvspaceDecodeHead(v.as_ptr(), v.len() as u32, &mut h);
+                    }
                     let kx = String::from_utf8_lossy(
-                        &h.kindexpr[..h.kindexpr.iter().position(|&b| b == 0).unwrap_or(h.kindexpr.len())],
+                        &h.kindexpr[..h
+                            .kindexpr
+                            .iter()
+                            .position(|&b| b == 0)
+                            .unwrap_or(h.kindexpr.len())],
                     );
                     let (r, dims, kind) = parse_kindexpr(&kx);
                     println!(
@@ -447,7 +593,10 @@ fn main() {
                         h.ro,
                         h.vid,
                         dims.len(),
-                        dims.iter().map(|d| d.to_string()).collect::<Vec<_>>().join(",")
+                        dims.iter()
+                            .map(|d| d.to_string())
+                            .collect::<Vec<_>>()
+                            .join(",")
                     );
                     let _ = d;
                 }
@@ -456,34 +605,56 @@ fn main() {
         "del" => {
             let keys: Vec<*const c_char> = tail.iter().map(|k| cs(k)).collect();
             let mut err = [0u8; 256];
-            unsafe { kvspaceDel(kv, keys.as_ptr(), keys.len() as u32, err.as_mut_ptr() as *mut c_char, 256); }
+            unsafe {
+                kvspaceDel(
+                    kv,
+                    keys.as_ptr(),
+                    keys.len() as u32,
+                    err.as_mut_ptr() as *mut c_char,
+                    256,
+                );
+            }
         }
         "deltree" => {
             if let Some(p) = tail.first() {
                 let mut err = [0u8; 256];
-                unsafe { kvspaceDelTree(kv, cs(p), err.as_mut_ptr() as *mut c_char, 256); }
+                unsafe {
+                    kvspaceDelTree(kv, cs(p), err.as_mut_ptr() as *mut c_char, 256);
+                }
             }
         }
         "mkindex" => {
             if let Some(p) = tail.first() {
                 let mut err = [0u8; 256];
-                unsafe { kvspaceMkindex(kv, cs(p), err.as_mut_ptr() as *mut c_char, 256); }
+                unsafe {
+                    kvspaceMkindex(kv, cs(p), err.as_mut_ptr() as *mut c_char, 256);
+                }
             }
         }
         "delextindex" => {
             if let Some(p) = tail.first() {
                 let mut err = [0u8; 256];
-                unsafe { kvspaceRmindexExt(kv, cs(p), err.as_mut_ptr() as *mut c_char, 256); }
+                unsafe {
+                    kvspaceRmindexExt(kv, cs(p), err.as_mut_ptr() as *mut c_char, 256);
+                }
             }
         }
         "extindex" => {
             if tail.len() >= 2 {
                 let mut err = [0u8; 256];
                 let rc = unsafe {
-                    kvspaceMkindexExt(kv, cs(&tail[0]), cs(&tail[1]), err.as_mut_ptr() as *mut c_char, 256)
+                    kvspaceMkindexExt(
+                        kv,
+                        cs(&tail[0]),
+                        cs(&tail[1]),
+                        err.as_mut_ptr() as *mut c_char,
+                        256,
+                    )
                 };
                 if rc != 0 {
-                    let msg = String::from_utf8_lossy(&err[..err.iter().position(|&b| b == 0).unwrap_or(err.len())]);
+                    let msg = String::from_utf8_lossy(
+                        &err[..err.iter().position(|&b| b == 0).unwrap_or(err.len())],
+                    );
                     fatalf(&msg);
                 }
             }
@@ -533,7 +704,9 @@ fn main() {
         }
         "clear" => {
             let mut err = [0u8; 256];
-            unsafe { kvspaceClear(kv, err.as_mut_ptr() as *mut c_char, 256); }
+            unsafe {
+                kvspaceClear(kv, err.as_mut_ptr() as *mut c_char, 256);
+            }
         }
         other => {
             eprintln!("unknown subcommand: {}", other);
@@ -541,7 +714,9 @@ fn main() {
         }
     }
 
-    unsafe { kvspaceClose(kv); }
+    unsafe {
+        kvspaceClose(kv);
+    }
 }
 
 fn strip_ext_children(kv: *mut c_void, prefix: &str, children: Vec<String>) -> Vec<String> {

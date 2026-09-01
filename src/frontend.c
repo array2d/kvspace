@@ -257,27 +257,12 @@ static int encode_head(const char *kind, int ref, int ro, uint32_t vid,
     return 0;
 }
 
-/* array_len → dims：char/ 前缀 kind 恒一维；其余 >1 才一维，否则标量。 */
-static int al_to_dims(const char *kind, int32_t array_len, int32_t *dims) {
-    if (strncmp(kind, "char/", 5) == 0) { dims[0] = array_len < 0 ? 0 : array_len; return 1; }
-    if (array_len > 1) { dims[0] = array_len; return 1; }
-    return 0;
-}
-
 int kvspaceTlvEncode(const char *kind, const uint8_t *raw, uint32_t raw_len,
                      const int32_t *dims, int32_t ndim, uint8_t **out, uint32_t *out_len) {
     if (!out || !out_len || !kind) return 1;
     if (ndim < 0) ndim = 0;
     if (ndim > 8) return 1;
     return encode_head(kind, 0, 0, 0, dims, ndim, raw, raw_len, out, out_len);
-}
-
-int kvspaceTlvEncodePtr(const char *kind, const uint8_t *raw, uint32_t raw_len,
-                        const int32_t *dims, int32_t ndim, uint8_t **out, uint32_t *out_len) {
-    if (!out || !out_len || !kind) return 1;
-    if (ndim < 0) ndim = 0;
-    if (ndim > 8) return 1;
-    return encode_head(kind, 1, 0, 0, dims, ndim, raw, raw_len, out, out_len);
 }
 
 int kvspaceTlvEncodeMode(const char *kind, const uint8_t *raw, uint32_t raw_len,
@@ -309,12 +294,12 @@ int kvspaceDecodeHead(const uint8_t *data, uint32_t data_len, kvspaceHead_t *out
     return 0;
 }
 
-int kvspaceNewPtr(const char *kind, const char *target, int32_t array_len,
+/* 指针（ref=1）：head kindexpr = "*" + target_kindexpr（目标完整 kindexpr，含其自身
+ * 的引用/形状前缀），body = 目标 key 路径。指针恒标量，不派生 dims。 */
+int kvspaceNewPtr(const char *target_kindexpr, const char *target,
                   uint8_t **out, uint32_t *out_len) {
-    if (!kind || !target || !out || !out_len) return 1;
-    if (array_len <= 0) array_len = 1;
-    int32_t dims[1]; int ndim = al_to_dims(kind, array_len, dims);
-    return encode_head(kind, 1, 0, 0, ndim ? dims : NULL, ndim,
+    if (!target_kindexpr || !target || !out || !out_len) return 1;
+    return encode_head(target_kindexpr, 1, 0, 0, NULL, 0,
                        (const uint8_t *)target, (uint32_t)strlen(target), out, out_len);
 }
 
