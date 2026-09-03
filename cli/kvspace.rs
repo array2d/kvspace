@@ -506,21 +506,10 @@ fn read_ext(kv: *mut c_void, prefix: &str) -> String {
 }
 
 fn main() {
-    let args: Vec<String> = env::args().skip(1).collect();
-    let mut dsn = default_dsn();
-    let mut rest: Vec<String> = Vec::new();
-    let mut i = 0;
-    while i < args.len() {
-        if args[i] == "--kvspace" && i + 1 < args.len() {
-            dsn = args[i + 1].clone();
-            i += 2;
-        } else {
-            rest.push(args[i].clone());
-            i += 1;
-        }
-    }
+    let rest: Vec<String> = env::args().skip(1).collect();
+    let dsn = default_dsn();
     if rest.is_empty() {
-        eprintln!("usage: kvspace [--kvspace dsn] <subcommand> [args]");
+        eprintln!("usage: kvspace <subcommand> [args]   (DSN from env KVSPACE)");
         exit(1);
     }
 
