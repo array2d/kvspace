@@ -55,6 +55,20 @@ extern "C" {
         err: *mut c_char,
         err_cap: u32,
     ) -> c_int;
+    fn kvspaceCp(
+        h: *mut c_void,
+        src: *const c_char,
+        dst: *const c_char,
+        err: *mut c_char,
+        err_cap: u32,
+    ) -> c_int;
+    fn kvspaceCpTree(
+        h: *mut c_void,
+        src: *const c_char,
+        dst: *const c_char,
+        err: *mut c_char,
+        err_cap: u32,
+    ) -> c_int;
     fn kvspaceMkindex(h: *mut c_void, path: *const c_char, err: *mut c_char, err_cap: u32)
         -> c_int;
     fn kvspaceMkindexExt(
@@ -620,6 +634,32 @@ fn main() {
                 let mut err = [0u8; 256];
                 unsafe {
                     kvspaceDelTree(kv, cs(p), err.as_mut_ptr() as *mut c_char, 256);
+                }
+            }
+        }
+        "cp" => {
+            if tail.len() >= 2 {
+                let mut err = [0u8; 256];
+                let rc = unsafe {
+                    kvspaceCp(kv, cs(&tail[0]), cs(&tail[1]), err.as_mut_ptr() as *mut c_char, 256)
+                };
+                if rc != 0 {
+                    fatalf(&String::from_utf8_lossy(
+                        &err[..err.iter().position(|&b| b == 0).unwrap_or(err.len())],
+                    ));
+                }
+            }
+        }
+        "cpdir" => {
+            if tail.len() >= 2 {
+                let mut err = [0u8; 256];
+                let rc = unsafe {
+                    kvspaceCpTree(kv, cs(&tail[0]), cs(&tail[1]), err.as_mut_ptr() as *mut c_char, 256)
+                };
+                if rc != 0 {
+                    fatalf(&String::from_utf8_lossy(
+                        &err[..err.iter().position(|&b| b == 0).unwrap_or(err.len())],
+                    ));
                 }
             }
         }

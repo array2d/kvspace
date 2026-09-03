@@ -47,12 +47,19 @@ int kvspaceList(void *h, const char *prefix, int expand_ext, int resolve,
                 uint8_t **out, uint32_t *out_len);
 int kvspaceDel(void *h, const char *const *keys, uint32_t nkeys, char *err, uint32_t err_cap);
 int kvspaceDelTree(void *h, const char *prefix, char *err, uint32_t err_cap);
+int kvspaceCp(void *h, const char *src, const char *dst, char *err, uint32_t err_cap);
+int kvspaceCpTree(void *h, const char *src, const char *dst, char *err, uint32_t err_cap);
 int kvspaceMkindex(void *h, const char *path, char *err, uint32_t err_cap);
 int kvspaceMkindexExt(void *h, const char *path, const char *ext_path, char *err, uint32_t err_cap);
 int kvspaceRmindexExt(void *h, const char *path, char *err, uint32_t err_cap);
 int kvspaceClear(void *h, char *err, uint32_t err_cap);
 int kvspaceWatch(void *h, const char *key, const uint8_t *target, uint32_t target_len,
                  uint64_t tick_ns, uint8_t **out, uint32_t *out_len);
+
+/* 零拷贝 body 指针（可读可写）：返回 key 的 XValue body 在后端存储内的直接指针，并填 out_head。
+ * 仅 shm 后端支持——durable 等非 shm 后端返回 NULL（unsupported）；key 不存在/空值亦返回 NULL。
+ * 指针指向 shm mmap，生命周期同该槽，调用方不得 free；写入即就地持久生效。 */
+uint8_t *kvspaceXvalueBodyPtr(void *h, const char *key, int resolve, kvspaceHead_t *out_head);
 
 /* ── codec（无 handle，由前端静态实现，byte-identical） ─────────── */
 int kvspaceTlvEncode(const char *kind, const uint8_t *raw, uint32_t raw_len,

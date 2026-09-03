@@ -1,6 +1,6 @@
 /* frontend.c — KVSpace dispatch 前端。
  *
- * 导出与两个后端完全相同的 25 个 kvspace* 符号。运行期按 DSN scheme 用 dlopen
+ * 导出与两个后端完全相同的 27 个 kvspace* 符号。运行期按 DSN scheme 用 dlopen
  * （RTLD_NOW | RTLD_LOCAL）装载后端，把 handle 包一层 {vtable, dl, backend}。
  * codec（TlvEncode、DecodeHead、New 等）无 handle，由前端静态实现，byte-identical。
  *
@@ -32,12 +32,16 @@ typedef struct {
                  uint8_t **out, uint32_t *out_len);
     int  (*del)(void *h, const char *const *keys, uint32_t nkeys, char *err, uint32_t err_cap);
     int  (*deltree)(void *h, const char *prefix, char *err, uint32_t err_cap);
+    int  (*cp)(void *h, const char *src, const char *dst, char *err, uint32_t err_cap);
+    int  (*cptree)(void *h, const char *src, const char *dst, char *err, uint32_t err_cap);
     int  (*mkindex)(void *h, const char *path, char *err, uint32_t err_cap);
     int  (*mkindexext)(void *h, const char *path, const char *ext_path, char *err, uint32_t err_cap);
     int  (*rmindexext)(void *h, const char *path, char *err, uint32_t err_cap);
     int  (*clear)(void *h, char *err, uint32_t err_cap);
     int  (*watch)(void *h, const char *key, const uint8_t *target, uint32_t target_len,
                   uint64_t tick_ns, uint8_t **out, uint32_t *out_len);
+    /* 可选：仅 shm 后端提供的零拷贝取值；durable 等后端为 NULL。 */
+    uint8_t *(*shmget)(void *h, const char *key, int resolve, int32_t *out_len);
 } kvspace_vt;
 
 typedef struct {
@@ -105,12 +109,17 @@ void *kvspaceConnect(const char *dsn) {
     LOAD(list, "kvspaceList");
     LOAD(del, "kvspaceDel");
     LOAD(deltree, "kvspaceDelTree");
+    LOAD(cp, "kvspaceCp");
+    LOAD(cptree, "kvspaceCpTree");
     LOAD(mkindex, "kvspaceMkindex");
     LOAD(mkindexext, "kvspaceMkindexExt");
     LOAD(rmindexext, "kvspaceRmindexExt");
     LOAD(clear, "kvspaceClear");
     LOAD(watch, "kvspaceWatch");
     #undef LOAD
+
+    /* 零拷贝取值仅 shm 后端有，非致命：durable 缺失时留 NULL，kvspaceXvalueBodyPtr 返回 unsupported。 */
+    *(void **)&vt->shmget = dlsym(dl, "kvspaceShmGet");
 
     void *(*connect)(const char *) = dlsym(dl, "kvspaceConnect");
     if (!connect) { free(vt); dlclose(dl); return NULL; }
@@ -178,6 +187,16 @@ int kvspaceDelTree(void *h, const char *prefix, char *err, uint32_t err_cap) {
     return x->vt->deltree(x->backend, prefix, err, err_cap);
 }
 
+int kvspaceCp(void *h, const char *src, const char *dst, char *err, uint32_t err_cap) {
+    kvspace_handle *x = H(h);
+    return x->vt->cp(x->backend, src, dst, err, err_cap);
+}
+
+int kvspaceCpTree(void *h, const char *src, const char *dst, char *err, uint32_t err_cap) {
+    kvspace_handle *x = H(h);
+    return x->vt->cptree(x->backend, src, dst, err, err_cap);
+}
+
 int kvspaceMkindex(void *h, const char *path, char *err, uint32_t err_cap) {
     kvspace_handle *x = H(h);
     return x->vt->mkindex(x->backend, path, err, err_cap);
@@ -202,6 +221,19 @@ int kvspaceWatch(void *h, const char *key, const uint8_t *target, uint32_t targe
                  uint64_t tick_ns, uint8_t **out, uint32_t *out_len) {
     kvspace_handle *x = H(h);
     return x->vt->watch(x->backend, key, target, target_len, tick_ns, out, out_len);
+}
+
+/* 零拷贝 body 指针：经后端 kvspaceShmGet 取整条 XValue 指针，DecodeHead 后返回 body 起始。
+ * 非 shm 后端（vt->shmget==NULL）返回 NULL = unsupported。 */
+uint8_t *kvspaceXvalueBodyPtr(void *h, const char *key, int resolve, kvspaceHead_t *out_head) {
+    if (!h || !key || !out_head) return NULL;
+    kvspace_handle *x = H(h);
+    if (!x->vt->shmget) return NULL;
+    int32_t len = 0;
+    uint8_t *data = x->vt->shmget(x->backend, key, resolve, &len);
+    if (!data || len <= 0) return NULL;
+    if (kvspaceDecodeHead(data, (uint32_t)len, out_head) != 0 || out_head->body_len < 0) return NULL;
+    return data + out_head->body_offset;
 }
 
 /* ── codec（静态，byte-identical 头格式） ──────────────────────────── */
