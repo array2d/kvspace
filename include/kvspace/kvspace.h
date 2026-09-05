@@ -34,17 +34,31 @@ typedef struct {
 /* ── 生命周期 ─────────────────────────────────────────────────── */
 void *kvspaceConnect(const char *dsn);
 void  kvspaceClose(void *h);
-void  kvspaceBytesFree(uint8_t *p, uint32_t len);
 int   kvspaceDisconnect(void *h, char *err, uint32_t err_cap);
 
 /* ── 单点读写 / 目录 ──────────────────────────────────────────── */
-int kvspaceSet(void *h, const char *const *keys, const uint8_t *vals,
-               const uint32_t *lens, uint32_t n, char *err, uint32_t err_cap);
-int kvspaceGet(void *h, const char *key, uint8_t **out, uint32_t *out_len);
-int kvspaceGetBatch(void *h, const char *prefix, const char *const *names,
-                    uint32_t nnames, uint8_t **out, uint32_t *out_len);
-int kvspaceList(void *h, const char *prefix, int expand_ext, int resolve,
-                uint8_t **out, uint32_t *out_len);
+
+/* 借用读：*out 指向后端常驻空间（shm mmap / durable 常驻映射），生命周期同该槽，
+ * 调用方不得 free。resolve=1 穿透 link。key 不存在/空值 → *out=NULL、*out_len=0、返回 0。 */
+int kvspaceGet(void *h, const char *key, int resolve, uint8_t **out, uint32_t *out_len);
+
+/* 就地写：key 必须已存在、kind 不变、body_len 必须等于原 body_len——返回原 box 的 body
+ * 偏移指针供调用方直接写。违反前置条件 → 非 0 + err（绝不静默重分配、绝不回落）。写即持久。 */
+int kvspaceWriteInPlace(void *h, const char *key, int resolve, uint32_t body_len,
+                        uint8_t **body, char *err, uint32_t err_cap);
+
+/* 新位置写：按 (kindexpr, body_len) 分配新 box、写好 head，返回 body 偏移指针供直接写。
+ * 用于新建 key 或 kind/尺寸变化。写即持久。 */
+int kvspaceWriteNewPlace(void *h, const char *key, const char *kindexpr, uint32_t body_len,
+                         uint8_t **body, char *err, uint32_t err_cap);
+
+/* 只返回前缀下子项计数，无缓冲、无需释放。resolve=1 穿透 link。 */
+int kvspaceListLen(void *h, const char *prefix, int expand_ext, int resolve, int32_t *out_count);
+
+/* 借用枚举：*out 指向后端常驻/回收缓冲（\n 连接的直接子项名），生命周期至下次同线程 List，
+ * 调用方不得 free。空目录 → *out=NULL、*out_len=0。resolve=1 穿透 link；expand_ext=1 展开 extindex。 */
+int kvspaceList(void *h, const char *prefix, int expand_ext, int resolve, uint8_t **out, uint32_t *out_len);
+
 int kvspaceDel(void *h, const char *const *keys, uint32_t nkeys, char *err, uint32_t err_cap);
 int kvspaceDelTree(void *h, const char *prefix, char *err, uint32_t err_cap);
 int kvspaceCp(void *h, const char *src, const char *dst, char *err, uint32_t err_cap);
@@ -53,13 +67,9 @@ int kvspaceMkindex(void *h, const char *path, char *err, uint32_t err_cap);
 int kvspaceMkindexExt(void *h, const char *path, const char *ext_path, char *err, uint32_t err_cap);
 int kvspaceRmindexExt(void *h, const char *path, char *err, uint32_t err_cap);
 int kvspaceClear(void *h, char *err, uint32_t err_cap);
+/* 借用：*out 指向后端常驻空间，调用方不得 free。 */
 int kvspaceWatch(void *h, const char *key, const uint8_t *target, uint32_t target_len,
                  uint64_t tick_ns, uint8_t **out, uint32_t *out_len);
-
-/* 零拷贝 body 指针（可读可写）：返回 key 的 XValue body 在后端存储内的直接指针，并填 out_head。
- * 仅 shm 后端支持——durable 等非 shm 后端返回 NULL（unsupported）；key 不存在/空值亦返回 NULL。
- * 指针指向 shm mmap，生命周期同该槽，调用方不得 free；写入即就地持久生效。 */
-uint8_t *kvspaceXvalueBodyPtr(void *h, const char *key, int resolve, kvspaceHead_t *out_head);
 
 /* ── codec（无 handle，由前端静态实现，byte-identical） ─────────── */
 int kvspaceTlvEncode(const char *kind, const uint8_t *raw, uint32_t raw_len,

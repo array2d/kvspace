@@ -23,13 +23,13 @@
 typedef struct {
     void (*free)(void *h);
     int  (*disconnect)(void *h, char *err, uint32_t err_cap);
-    int  (*set)(void *h, const char *const *keys, const uint8_t *vals,
-                const uint32_t *lens, uint32_t n, char *err, uint32_t err_cap);
-    int  (*get)(void *h, const char *key, uint8_t **out, uint32_t *out_len);
-    int  (*getbatch)(void *h, const char *prefix, const char *const *names,
-                     uint32_t nnames, uint8_t **out, uint32_t *out_len);
-    int  (*list)(void *h, const char *prefix, int expand_ext, int resolve,
-                 uint8_t **out, uint32_t *out_len);
+    int  (*get)(void *h, const char *key, int resolve, uint8_t **out, uint32_t *out_len);
+    int  (*writeinplace)(void *h, const char *key, int resolve, uint32_t body_len,
+                         uint8_t **body, char *err, uint32_t err_cap);
+    int  (*writenewplace)(void *h, const char *key, const char *kindexpr, uint32_t body_len,
+                          uint8_t **body, char *err, uint32_t err_cap);
+    int  (*listlen)(void *h, const char *prefix, int expand_ext, int resolve, int32_t *out_count);
+    int  (*list)(void *h, const char *prefix, int expand_ext, int resolve, uint8_t **out, uint32_t *out_len);
     int  (*del)(void *h, const char *const *keys, uint32_t nkeys, char *err, uint32_t err_cap);
     int  (*deltree)(void *h, const char *prefix, char *err, uint32_t err_cap);
     int  (*cp)(void *h, const char *src, const char *dst, char *err, uint32_t err_cap);
@@ -40,8 +40,6 @@ typedef struct {
     int  (*clear)(void *h, char *err, uint32_t err_cap);
     int  (*watch)(void *h, const char *key, const uint8_t *target, uint32_t target_len,
                   uint64_t tick_ns, uint8_t **out, uint32_t *out_len);
-    /* 可选：仅 shm 后端提供的零拷贝取值；durable 等后端为 NULL。 */
-    uint8_t *(*shmget)(void *h, const char *key, int resolve, int32_t *out_len);
 } kvspace_vt;
 
 typedef struct {
@@ -103,9 +101,10 @@ void *kvspaceConnect(const char *dsn) {
 
     LOAD(free, "kvspaceClose");
     LOAD(disconnect, "kvspaceDisconnect");
-    LOAD(set, "kvspaceSet");
     LOAD(get, "kvspaceGet");
-    LOAD(getbatch, "kvspaceGetBatch");
+    LOAD(writeinplace, "kvspaceWriteInPlace");
+    LOAD(writenewplace, "kvspaceWriteNewPlace");
+    LOAD(listlen, "kvspaceListLen");
     LOAD(list, "kvspaceList");
     LOAD(del, "kvspaceDel");
     LOAD(deltree, "kvspaceDelTree");
@@ -117,9 +116,6 @@ void *kvspaceConnect(const char *dsn) {
     LOAD(clear, "kvspaceClear");
     LOAD(watch, "kvspaceWatch");
     #undef LOAD
-
-    /* 零拷贝取值仅 shm 后端有，非致命：durable 缺失时留 NULL，kvspaceXvalueBodyPtr 返回 unsupported。 */
-    *(void **)&vt->shmget = dlsym(dl, "kvspaceShmGet");
 
     void *(*connect)(const char *) = dlsym(dl, "kvspaceConnect");
     if (!connect) { free(vt); dlclose(dl); return NULL; }
@@ -141,12 +137,6 @@ void kvspaceClose(void *h) {
     free(x);
 }
 
-void kvspaceBytesFree(uint8_t *p, uint32_t len) {
-    /* 空值（durable 返回悬垂指针 0x1 + len=0）不 free；对齐 durable 的 Box<[u8]>::from_raw 语义。 */
-    if (p && len > 0)
-        free(p);
-}
-
 int kvspaceDisconnect(void *h, char *err, uint32_t err_cap) {
     kvspace_handle *x = H(h);
     return x->vt->disconnect ? x->vt->disconnect(x->backend, err, err_cap) : 0;
@@ -154,25 +144,29 @@ int kvspaceDisconnect(void *h, char *err, uint32_t err_cap) {
 
 /* ── 单点读写 / 目录（trampoline） ─────────────────────────────────── */
 
-int kvspaceSet(void *h, const char *const *keys, const uint8_t *vals,
-               const uint32_t *lens, uint32_t n, char *err, uint32_t err_cap) {
+int kvspaceGet(void *h, const char *key, int resolve, uint8_t **out, uint32_t *out_len) {
     kvspace_handle *x = H(h);
-    return x->vt->set(x->backend, keys, vals, lens, n, err, err_cap);
+    return x->vt->get(x->backend, key, resolve, out, out_len);
 }
 
-int kvspaceGet(void *h, const char *key, uint8_t **out, uint32_t *out_len) {
+int kvspaceWriteInPlace(void *h, const char *key, int resolve, uint32_t body_len,
+                        uint8_t **body, char *err, uint32_t err_cap) {
     kvspace_handle *x = H(h);
-    return x->vt->get(x->backend, key, out, out_len);
+    return x->vt->writeinplace(x->backend, key, resolve, body_len, body, err, err_cap);
 }
 
-int kvspaceGetBatch(void *h, const char *prefix, const char *const *names,
-                    uint32_t nnames, uint8_t **out, uint32_t *out_len) {
+int kvspaceWriteNewPlace(void *h, const char *key, const char *kindexpr, uint32_t body_len,
+                         uint8_t **body, char *err, uint32_t err_cap) {
     kvspace_handle *x = H(h);
-    return x->vt->getbatch(x->backend, prefix, names, nnames, out, out_len);
+    return x->vt->writenewplace(x->backend, key, kindexpr, body_len, body, err, err_cap);
 }
 
-int kvspaceList(void *h, const char *prefix, int expand_ext, int resolve,
-                uint8_t **out, uint32_t *out_len) {
+int kvspaceListLen(void *h, const char *prefix, int expand_ext, int resolve, int32_t *out_count) {
+    kvspace_handle *x = H(h);
+    return x->vt->listlen(x->backend, prefix, expand_ext, resolve, out_count);
+}
+
+int kvspaceList(void *h, const char *prefix, int expand_ext, int resolve, uint8_t **out, uint32_t *out_len) {
     kvspace_handle *x = H(h);
     return x->vt->list(x->backend, prefix, expand_ext, resolve, out, out_len);
 }
@@ -221,19 +215,6 @@ int kvspaceWatch(void *h, const char *key, const uint8_t *target, uint32_t targe
                  uint64_t tick_ns, uint8_t **out, uint32_t *out_len) {
     kvspace_handle *x = H(h);
     return x->vt->watch(x->backend, key, target, target_len, tick_ns, out, out_len);
-}
-
-/* 零拷贝 body 指针：经后端 kvspaceShmGet 取整条 XValue 指针，DecodeHead 后返回 body 起始。
- * 非 shm 后端（vt->shmget==NULL）返回 NULL = unsupported。 */
-uint8_t *kvspaceXvalueBodyPtr(void *h, const char *key, int resolve, kvspaceHead_t *out_head) {
-    if (!h || !key || !out_head) return NULL;
-    kvspace_handle *x = H(h);
-    if (!x->vt->shmget) return NULL;
-    int32_t len = 0;
-    uint8_t *data = x->vt->shmget(x->backend, key, resolve, &len);
-    if (!data || len <= 0) return NULL;
-    if (kvspaceDecodeHead(data, (uint32_t)len, out_head) != 0 || out_head->body_len < 0) return NULL;
-    return data + out_head->body_offset;
 }
 
 /* ── codec（静态，byte-identical 头格式） ──────────────────────────── */
