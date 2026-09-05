@@ -30,11 +30,12 @@ typedef struct {
                           uint8_t **body, char *err, uint32_t err_cap);
     int  (*listlen)(void *h, const char *prefix, int expand_ext, int resolve, int32_t *out_count);
     int  (*listat)(void *h, const char *prefix, int expand_ext, int resolve, int32_t idx,
-                   uint8_t **out, uint32_t *out_len);
+                   uint8_t *buf, uint32_t buf_cap, uint32_t *out_len);
     int  (*del)(void *h, const char *const *keys, uint32_t nkeys, char *err, uint32_t err_cap);
     int  (*deltree)(void *h, const char *prefix, char *err, uint32_t err_cap);
     int  (*cp)(void *h, const char *src, const char *dst, char *err, uint32_t err_cap);
     int  (*cptree)(void *h, const char *src, const char *dst, char *err, uint32_t err_cap);
+    int  (*cplist)(void *h, const char *src, const char *dst, char *err, uint32_t err_cap);
     int  (*mkindex)(void *h, const char *path, char *err, uint32_t err_cap);
     int  (*mkindexext)(void *h, const char *path, const char *ext_path, char *err, uint32_t err_cap);
     int  (*rmindexext)(void *h, const char *path, char *err, uint32_t err_cap);
@@ -111,6 +112,7 @@ void *kvspaceConnect(const char *dsn) {
     LOAD(deltree, "kvspaceDelTree");
     LOAD(cp, "kvspaceCp");
     LOAD(cptree, "kvspaceCpTree");
+    LOAD(cplist, "kvspaceCpList");
     LOAD(mkindex, "kvspaceMkindex");
     LOAD(mkindexext, "kvspaceMkindexExt");
     LOAD(rmindexext, "kvspaceRmindexExt");
@@ -168,9 +170,9 @@ int kvspaceListLen(void *h, const char *prefix, int expand_ext, int resolve, int
 }
 
 int kvspaceListAt(void *h, const char *prefix, int expand_ext, int resolve, int32_t idx,
-                  uint8_t **out, uint32_t *out_len) {
+                  uint8_t *buf, uint32_t buf_cap, uint32_t *out_len) {
     kvspace_handle *x = H(h);
-    return x->vt->listat(x->backend, prefix, expand_ext, resolve, idx, out, out_len);
+    return x->vt->listat(x->backend, prefix, expand_ext, resolve, idx, buf, buf_cap, out_len);
 }
 
 int kvspaceDel(void *h, const char *const *keys, uint32_t nkeys, char *err, uint32_t err_cap) {
@@ -191,6 +193,11 @@ int kvspaceCp(void *h, const char *src, const char *dst, char *err, uint32_t err
 int kvspaceCpTree(void *h, const char *src, const char *dst, char *err, uint32_t err_cap) {
     kvspace_handle *x = H(h);
     return x->vt->cptree(x->backend, src, dst, err, err_cap);
+}
+
+int kvspaceCpList(void *h, const char *src, const char *dst, char *err, uint32_t err_cap) {
+    kvspace_handle *x = H(h);
+    return x->vt->cplist(x->backend, src, dst, err, err_cap);
 }
 
 int kvspaceMkindex(void *h, const char *path, char *err, uint32_t err_cap) {

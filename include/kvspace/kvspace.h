@@ -55,17 +55,18 @@ int kvspaceWriteNewPlace(void *h, const char *key, const char *kindexpr, uint32_
 /* 只返回前缀下子项计数，无缓冲、无需释放。resolve=1 穿透 link。 */
 int kvspaceListLen(void *h, const char *prefix, int expand_ext, int resolve, int32_t *out_count);
 
-/* 借用索引取项：返回前缀下第 idx 个直接子项名，*out 指向后端常驻/回收缓冲，生命周期至下次
- * 同线程 ListAt，调用方不得 free。idx 越界 → *out=NULL、*out_len=0、返回非 0。配合
- * kvspaceListLen 遍历（listlen 定计数，逐 idx 取名），不再一次性返回整段名单缓冲。
+/* 索引取项：把前缀下第 idx 个直接子项名写进调用方自备缓冲 buf（容量 buf_cap），*out_len
+ * 置该名长度（不含 NUL）。库侧零状态、调用方不得 free。idx 越界或缓冲不足 → 返回非 0
+ * （缓冲不足时 *out_len 仍为所需长度，不静默截断）。配合 kvspaceListLen 遍历。
  * resolve=1 穿透 link；expand_ext=1 展开 extindex。 */
 int kvspaceListAt(void *h, const char *prefix, int expand_ext, int resolve, int32_t idx,
-                  uint8_t **out, uint32_t *out_len);
+                  uint8_t *buf, uint32_t buf_cap, uint32_t *out_len);
 
 int kvspaceDel(void *h, const char *const *keys, uint32_t nkeys, char *err, uint32_t err_cap);
 int kvspaceDelTree(void *h, const char *prefix, char *err, uint32_t err_cap);
 int kvspaceCp(void *h, const char *src, const char *dst, char *err, uint32_t err_cap);
 int kvspaceCpTree(void *h, const char *src, const char *dst, char *err, uint32_t err_cap);
+int kvspaceCpList(void *h, const char *src, const char *dst, char *err, uint32_t err_cap);
 int kvspaceMkindex(void *h, const char *path, char *err, uint32_t err_cap);
 int kvspaceMkindexExt(void *h, const char *path, const char *ext_path, char *err, uint32_t err_cap);
 int kvspaceRmindexExt(void *h, const char *path, char *err, uint32_t err_cap);
