@@ -18,27 +18,48 @@ struct Head {
 extern "C" {
     fn kvspaceConnect(dsn: *const c_char) -> *mut c_void;
     fn kvspaceClose(h: *mut c_void);
-    fn kvspaceBytesFree(p: *mut u8, len: u32);
-    fn kvspaceSet(
-        h: *mut c_void,
-        keys: *const *const c_char,
-        vals: *const u8,
-        lens: *const u32,
-        n: u32,
-        err: *mut c_char,
-        err_cap: u32,
-    ) -> c_int;
+    fn free(p: *mut c_void); // libc：释放 codec 产出的 frontend malloc 缓冲
+    // 借用读：*out 指向后端常驻/回收空间，调用方不得 free。resolve=1 穿透 link。
     fn kvspaceGet(
         h: *mut c_void,
         key: *const c_char,
+        resolve: c_int,
         out: *mut *mut u8,
         out_len: *mut u32,
     ) -> c_int;
-    fn kvspaceList(
+    // 写即构造：key 已存在且 body_len 相等 → 返回原 box body 偏移指针（就地改）；否则新位置写。
+    fn kvspaceWriteInPlace(
+        h: *mut c_void,
+        key: *const c_char,
+        resolve: c_int,
+        body_len: u32,
+        body: *mut *mut u8,
+        err: *mut c_char,
+        err_cap: u32,
+    ) -> c_int;
+    fn kvspaceWriteNewPlace(
+        h: *mut c_void,
+        key: *const c_char,
+        kindexpr: *const c_char,
+        body_len: u32,
+        body: *mut *mut u8,
+        err: *mut c_char,
+        err_cap: u32,
+    ) -> c_int;
+    // 前缀遍历：listlen 定计数，逐 idx 取名（借用回收缓冲，不得 free），不一次性返回整段名单。
+    fn kvspaceListLen(
         h: *mut c_void,
         prefix: *const c_char,
         expand_ext: c_int,
         resolve: c_int,
+        out_count: *mut i32,
+    ) -> c_int;
+    fn kvspaceListAt(
+        h: *mut c_void,
+        prefix: *const c_char,
+        expand_ext: c_int,
+        resolve: c_int,
+        idx: i32,
         out: *mut *mut u8,
         out_len: *mut u32,
     ) -> c_int;
@@ -91,18 +112,6 @@ extern "C" {
         raw_len: u32,
         dims: *const i32,
         ndim: i32,
-        out: *mut *mut u8,
-        out_len: *mut u32,
-    ) -> c_int;
-    fn kvspaceTlvEncodeMode(
-        kind: *const c_char,
-        raw: *const u8,
-        raw_len: u32,
-        dims: *const i32,
-        ndim: i32,
-        r#ref: i32,
-        ro: u8,
-        vid: u32,
         out: *mut *mut u8,
         out_len: *mut u32,
     ) -> c_int;
@@ -281,46 +290,15 @@ fn format_value(v: &Value) -> String {
     format!("{}:{}", v.kind, plain(v))
 }
 
-fn reencode(tlv: &[u8], ro: u8, vid: u32) -> Vec<u8> {
-    let d = decode(tlv);
-    let mut out: *mut u8 = std::ptr::null_mut();
-    let mut len: u32 = 0;
-    let dims = d.dims.clone();
-    let ndim = dims.len() as i32;
-    unsafe {
-        let dp = if ndim > 0 {
-            dims.as_ptr()
-        } else {
-            std::ptr::null()
-        };
-        kvspaceTlvEncodeMode(
-            cs(&d.kind),
-            d.body.as_ptr(),
-            d.body.len() as u32,
-            dp,
-            ndim,
-            d.r#ref,
-            ro,
-            vid,
-            &mut out,
-            &mut len,
-        );
-        let v = std::slice::from_raw_parts(out, len as usize).to_vec();
-        kvspaceBytesFree(out, len);
-        v
-    }
-}
-
+// 借用读：kvspaceGet 返回后端常驻/回收空间偏移指针，读出即拷贝自持，绝不 free。resolve=0 不穿透 link。
 fn get(kv: *mut c_void, key: &str) -> Vec<u8> {
     let mut out: *mut u8 = std::ptr::null_mut();
     let mut len: u32 = 0;
     unsafe {
-        if kvspaceGet(kv, cs(key), &mut out, &mut len) != 0 || out.is_null() || len == 0 {
+        if kvspaceGet(kv, cs(key), 0, &mut out, &mut len) != 0 || out.is_null() || len == 0 {
             return vec![];
         }
-        let v = std::slice::from_raw_parts(out, len as usize).to_vec();
-        kvspaceBytesFree(out, len);
-        v
+        std::slice::from_raw_parts(out, len as usize).to_vec()
     }
 }
 
@@ -377,7 +355,7 @@ fn parse_value(raw: &str) -> Vec<u8> {
                     .map(|f| {
                         kvspaceTlvEncode(
                             cs("float32"),
-                            (&f as *const f32 as *const u8),
+                            &f as *const f32 as *const u8,
                             4,
                             std::ptr::null(),
                             0,
@@ -435,49 +413,95 @@ fn parse_value(raw: &str) -> Vec<u8> {
     }
     unsafe {
         let v = std::slice::from_raw_parts(out, len as usize).to_vec();
-        kvspaceBytesFree(out, len);
+        free(out as *mut c_void); // codec 产出为 frontend malloc，libc free
         v
     }
 }
 
+// 写即构造：解 val 的 TLV 头取 (kindexpr, body)，向后端要可写 body 偏移指针后直接写字节——
+// key 已存在且 body 尺寸不变 → WriteInPlace（原 box 就地）；否则 WriteNewPlace（分配新 box + 写 head）。
 fn set_one(kv: *mut c_void, key: &str, val: &[u8]) {
-    let keys = [cs(key)];
-    let lens = [val.len() as u32];
+    if val.is_empty() {
+        return; // nil：不写
+    }
+    let mut h = Head {
+        kindexpr: [0; 256],
+        ro: 0,
+        vid: 0,
+        body_len: 0,
+        body_offset: 0,
+    };
+    unsafe {
+        kvspaceDecodeHead(val.as_ptr(), val.len() as u32, &mut h);
+    }
+    let kx_end = h
+        .kindexpr
+        .iter()
+        .position(|&b| b == 0)
+        .unwrap_or(h.kindexpr.len());
+    let kindexpr = std::ffi::CString::new(&h.kindexpr[..kx_end]).unwrap();
+    let off = h.body_offset as usize;
+    let blen = h.body_len.max(0) as usize;
+    let body = &val[off..off + blen];
+    let ck = cs(key);
+    let mut bp: *mut u8 = std::ptr::null_mut();
     let mut err = [0u8; 256];
-    let rc = unsafe {
-        kvspaceSet(
+    unsafe {
+        let rc = kvspaceWriteInPlace(
             kv,
-            keys.as_ptr(),
-            val.as_ptr(),
-            lens.as_ptr(),
+            ck,
             1,
+            blen as u32,
+            &mut bp,
             err.as_mut_ptr() as *mut c_char,
             256,
-        )
-    };
-    if rc != 0 {
-        let n = err.iter().position(|&b| b == 0).unwrap_or(err.len());
-        eprintln!("set {}: {}", key, String::from_utf8_lossy(&err[..n]));
-        std::process::exit(1);
+        );
+        if rc != 0 {
+            let rc2 = kvspaceWriteNewPlace(
+                kv,
+                ck,
+                kindexpr.as_ptr(),
+                blen as u32,
+                &mut bp,
+                err.as_mut_ptr() as *mut c_char,
+                256,
+            );
+            if rc2 != 0 {
+                let n = err.iter().position(|&b| b == 0).unwrap_or(err.len());
+                eprintln!("set {}: {}", key, String::from_utf8_lossy(&err[..n]));
+                std::process::exit(1);
+            }
+        }
+        if !body.is_empty() && !bp.is_null() {
+            std::ptr::copy_nonoverlapping(body.as_ptr(), bp, body.len());
+        }
     }
 }
 
+// 前缀遍历：先 ListLen 定计数，再逐 idx ListAt 取名（借用回收缓冲，读出即自持）。resolve=1 穿透 link。
 fn list_names(kv: *mut c_void, prefix: &str, expand_ext: bool) -> Vec<String> {
-    let mut out: *mut u8 = std::ptr::null_mut();
-    let mut len: u32 = 0;
+    let p = cs(prefix);
+    let mut count: i32 = 0;
     unsafe {
-        if kvspaceList(kv, cs(prefix), expand_ext as c_int, 1, &mut out, &mut len) != 0
-            || out.is_null()
-            || len == 0
-        {
+        if kvspaceListLen(kv, p, expand_ext as c_int, 1, &mut count) != 0 || count <= 0 {
             return vec![];
         }
-        let s = String::from_utf8_lossy(std::slice::from_raw_parts(out, len as usize)).into_owned();
-        kvspaceBytesFree(out, len);
-        s.split('\n')
-            .filter(|x| !x.is_empty())
-            .map(|x| x.to_string())
-            .collect()
+        let mut v = Vec::with_capacity(count as usize);
+        for i in 0..count {
+            let mut out: *mut u8 = std::ptr::null_mut();
+            let mut len: u32 = 0;
+            if kvspaceListAt(kv, p, expand_ext as c_int, 1, i, &mut out, &mut len) == 0
+                && !out.is_null()
+                && len > 0
+            {
+                let name =
+                    String::from_utf8_lossy(std::slice::from_raw_parts(out, len as usize)).into_owned();
+                if !name.is_empty() {
+                    v.push(name);
+                }
+            }
+        }
+        v
     }
 }
 
@@ -533,34 +557,9 @@ fn main() {
         }
         "set" => {
             if tail.len() < 2 {
-                fatalf("usage: kvspace set <key> <value> [ro|rw] [vid]");
+                fatalf("usage: kvspace set <key> <value>");
             }
-            let mut val = parse_value(&tail[1]);
-            if !val.is_empty() {
-                let mut ro = 0u8;
-                let mut vid = 0u32;
-                let mut i = 2;
-                if i < tail.len() && (tail[i] == "ro" || tail[i] == "rw") {
-                    ro = if tail[i] == "ro" { 1 } else { 0 };
-                    i += 1;
-                    if i < tail.len() {
-                        vid = tail[i].parse().unwrap_or(0);
-                    }
-                }
-                if ro != 0 || vid != 0 {
-                    val = reencode(&val, ro, vid);
-                    let mut hh = Head {
-                        kindexpr: [0; 256],
-                        ro: 0,
-                        vid: 0,
-                        body_len: 0,
-                        body_offset: 0,
-                    };
-                    unsafe {
-                        kvspaceDecodeHead(val.as_ptr(), val.len() as u32, &mut hh);
-                    }
-                }
-            }
+            let val = parse_value(&tail[1]);
             set_one(kv, &tail[0], &val);
         }
         "head" => {
@@ -825,8 +824,8 @@ fn fprint_tree(kv: *mut c_void, prefix: &str, indent: &str, show_ext: bool, show
         let last = i == n - 1;
         let branch = if last { "└── " } else { "├── " };
         let next_indent = format!("{}{}", indent, if last { "    " } else { "│   " });
-        if has_child && c.ends_with('/') {
-            println!("{}{}{}", indent, branch, c);
+        if has_child {
+            println!("{}{}{}/", indent, branch, base);
             fprint_tree(kv, &child_dir, &next_indent, show_ext, show_kind);
         } else if v.is_empty() {
             println!("{}{}{}", indent, branch, c);

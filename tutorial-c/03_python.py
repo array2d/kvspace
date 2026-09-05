@@ -30,10 +30,14 @@ def bind(fn, args, restype):
 
 bind(lib.kvspaceConnect, [ctypes.c_char_p], ctypes.c_void_p)
 bind(lib.kvspaceClose, [ctypes.c_void_p], None)
-bind(lib.kvspaceBytesFree, [U8P, ctypes.c_uint32], None)
-bind(lib.kvspaceSet, [ctypes.c_void_p, CCHARPP, U8P, U32P, ctypes.c_uint32, ctypes.c_char_p, ctypes.c_uint32], ctypes.c_int)
-bind(lib.kvspaceGet, [ctypes.c_void_p, ctypes.c_char_p, ctypes.POINTER(U8P), U32P], ctypes.c_int)
-bind(lib.kvspaceList, [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_int, ctypes.c_int, ctypes.POINTER(U8P), U32P], ctypes.c_int)
+# 借用读：out 指向 kvspace 常驻空间，string_at 拷出后不 free。resolve 穿透 link。
+bind(lib.kvspaceGet, [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_int, ctypes.POINTER(U8P), U32P], ctypes.c_int)
+# 写即构造：就地/新位置二选一原语，往返回的 body 偏移指针写字节。
+bind(lib.kvspaceWriteInPlace, [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_int, ctypes.c_uint32, ctypes.POINTER(U8P), ctypes.c_char_p, ctypes.c_uint32], ctypes.c_int)
+bind(lib.kvspaceWriteNewPlace, [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_char_p, ctypes.c_uint32, ctypes.POINTER(U8P), ctypes.c_char_p, ctypes.c_uint32], ctypes.c_int)
+# 前缀枚举：ListLen 定计数 + 逐 idx ListAt 借用取名。
+bind(lib.kvspaceListLen, [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_int, ctypes.c_int, ctypes.POINTER(ctypes.c_int32)], ctypes.c_int)
+bind(lib.kvspaceListAt, [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_int, ctypes.c_int, ctypes.c_int32, ctypes.POINTER(U8P), U32P], ctypes.c_int)
 bind(lib.kvspaceDel, [ctypes.c_void_p, CCHARPP, ctypes.c_uint32, ctypes.c_char_p, ctypes.c_uint32], ctypes.c_int)
 bind(lib.kvspaceDelTree, [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_char_p, ctypes.c_uint32], ctypes.c_int)
 bind(lib.kvspaceMkindex, [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_char_p, ctypes.c_uint32], ctypes.c_int)
@@ -93,14 +97,21 @@ class KV:
         self.close()
 
     def set(self, key, val):
-        keys = (ctypes.c_char_p * 1)(key.encode())
-        lens = (ctypes.c_uint32 * 1)(len(val))
         buf = (ctypes.c_uint8 * len(val)).from_buffer_copy(val)
-        lib.kvspaceSet(self.kv, keys, buf, lens, 1, None, 0)
+        h = Head()
+        lib.kvspaceDecodeHead(buf, len(val), ctypes.byref(h))
+        bl = h.body_len if h.body_len > 0 else 0
+        kindexpr = bytes(h.kindexpr).split(b"\0", 1)[0]
+        dst = U8P()
+        err = ctypes.create_string_buffer(256)
+        if lib.kvspaceWriteInPlace(self.kv, key.encode(), 1, bl, ctypes.byref(dst), err, 256) != 0:
+            lib.kvspaceWriteNewPlace(self.kv, key.encode(), kindexpr, bl, ctypes.byref(dst), err, 256)
+        if bl > 0 and dst:
+            ctypes.memmove(dst, ctypes.byref(buf, h.body_offset), bl)
 
     def get(self, key):
         out, n = U8P(), ctypes.c_uint32()
-        lib.kvspaceGet(self.kv, key.encode(), ctypes.byref(out), ctypes.byref(n))
+        lib.kvspaceGet(self.kv, key.encode(), 0, ctypes.byref(out), ctypes.byref(n))
         if not out or n.value == 0:
             return None
         return ctypes.string_at(out, n.value)
@@ -116,12 +127,15 @@ class KV:
         lib.kvspaceMkindex(self.kv, path.encode(), None, 0)
 
     def list(self, prefix):
-        out, n = U8P(), ctypes.c_uint32()
-        lib.kvspaceList(self.kv, prefix.encode(), 0, 1, ctypes.byref(out), ctypes.byref(n))
-        if not out or n.value == 0:
+        count = ctypes.c_int32()
+        if lib.kvspaceListLen(self.kv, prefix.encode(), 0, 1, ctypes.byref(count)) != 0 or count.value <= 0:
             return []
-        s = ctypes.string_at(out, n.value).decode()
-        return s.split("\n")
+        names = []
+        for i in range(count.value):
+            out, n = U8P(), ctypes.c_uint32()
+            if lib.kvspaceListAt(self.kv, prefix.encode(), 0, 1, i, ctypes.byref(out), ctypes.byref(n)) == 0 and out:
+                names.append(ctypes.string_at(out, n.value).decode())
+        return names
 
 
 with KV("/tmp/kvspace_py.shm") as kv:

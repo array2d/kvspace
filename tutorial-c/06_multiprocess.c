@@ -72,7 +72,7 @@ static int reader(const char *path, int64_t seed) {
 
     printf("[reader] listing /mp/\n");
     uint32_t len; uint8_t *out = NULL;
-    kvspaceList(kv, "/mp/", 0, 1, &out, &len);
+    kv_list(kv, "/mp/", &out, &len);
     int count = 0;
     for (uint32_t i = 0; i < len; i++) if (out[i] == '\n') count++;
     if (len > 0) count++;

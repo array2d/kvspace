@@ -72,6 +72,9 @@ I32P = ctypes.POINTER(ctypes.c_int32)
 U32P = ctypes.POINTER(ctypes.c_uint32)
 U8PP = ctypes.POINTER(U8P)
 
+# codec 产出为 frontend malloc 缓冲，拷出后以 libc free 释放（无 kvspaceBytesFree）。
+_libc = ctypes.CDLL(None); _libc.free.argtypes = [ctypes.c_void_p]
+
 
 def setup_lib(lib):
     lib.kvspaceTlvEncodeMode.argtypes = [ctypes.c_char_p, U8P, ctypes.c_uint32, I32P, ctypes.c_int32,
@@ -79,7 +82,6 @@ def setup_lib(lib):
     lib.kvspaceTlvEncodeMode.restype = ctypes.c_int
     lib.kvspaceDecodeHead.argtypes = [U8P, ctypes.c_uint32, ctypes.POINTER(HeadV)]
     lib.kvspaceDecodeHead.restype = ctypes.c_int
-    lib.kvspaceBytesFree.argtypes = [U8P, ctypes.c_uint32]
 
 
 def encode(lib, kind, raw, dims=(), ref=0, ro=0, vid=0):
@@ -92,7 +94,7 @@ def encode(lib, kind, raw, dims=(), ref=0, ro=0, vid=0):
                                   ref, ro, vid, ctypes.byref(out), ctypes.byref(out_len))
     assert rc == 0, f"encode({kind}) rc={rc}"
     data = ctypes.string_at(out, out_len.value)
-    lib.kvspaceBytesFree(out, out_len.value)
+    _libc.free(ctypes.cast(out, ctypes.c_void_p))
     return data
 
 

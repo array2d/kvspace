@@ -28,14 +28,20 @@ struct KV {
     }
     ~KV() { kvspaceClose(kv); ::unlink(path.c_str()); }
 
+    // 写即构造：解预编码 TLV 取 kindexpr+body，就地/新位置二选一原语，往返回指针写 body。
     void set(const char *key, const uint8_t *val, uint32_t len) {
-        const char *keys[1] = { key };
-        const uint32_t lens[1] = { len };
-        kvspaceSet(kv, keys, val, lens, 1, nullptr, 0);
+        kvspaceHead_t h;
+        if (kvspaceDecodeHead(val, len, &h) != 0) return;
+        uint32_t bl = h.body_len > 0 ? (uint32_t)h.body_len : 0;
+        uint8_t *dst = nullptr; char err[256];
+        if (kvspaceWriteInPlace(kv, key, 1, bl, &dst, err, sizeof(err)) != 0)
+            kvspaceWriteNewPlace(kv, key, (const char *)h.kindexpr, bl, &dst, err, sizeof(err));
+        if (bl && dst) memcpy(dst, val + h.body_offset, bl);
     }
+    // 借用读：out 指向 kvspace 常驻空间，拷进 std::string 后即失效，不 free。
     bool get(const char *key, std::string &kind, std::string &raw) {
         uint8_t *out = nullptr; uint32_t len = 0;
-        kvspaceGet(kv, key, &out, &len);
+        kvspaceGet(kv, key, 0, &out, &len);
         if (!out || len == 0) return false;
         kvspaceHead_t h;
         kvspaceDecodeHead(out, len, &h);
@@ -44,7 +50,6 @@ struct KV {
         if (k[0] == '[') { const char *e = strchr(k, ']'); if (e) k = e + 1; }
         kind = k;
         raw.assign((const char *)(out + h.body_offset), h.body_len > 0 ? h.body_len : 0);
-        kvspaceBytesFree(out, len);
         return true;
     }
     void del(const char *key) {
@@ -53,20 +58,15 @@ struct KV {
     }
     void deltree(const char *p) { kvspaceDelTree(kv, p, nullptr, 0); }
     void mkindex(const char *p) { kvspaceMkindex(kv, p, nullptr, 0); }
+    // 前缀枚举：ListLen 定计数 + 逐 idx ListAt 借用取名（读出即拷入 vector）。
     std::vector<std::string> list(const char *prefix) {
-        uint8_t *out = nullptr; uint32_t len = 0;
-        kvspaceList(kv, prefix, 0, 1, &out, &len);
         std::vector<std::string> r;
-        if (out && len) {
-            const char *s = (const char *)out;
-            size_t i = 0;
-            while (i < len) {
-                const void *nl = memchr(s + i, '\n', len - i);
-                size_t n = nl ? (size_t)((const char *)nl - (s + i)) : len - i;
-                r.push_back(std::string(s + i, n));
-                i += n + (nl ? 1 : 0);
-            }
-            kvspaceBytesFree(out, len);
+        int32_t count = 0;
+        if (kvspaceListLen(kv, prefix, 0, 1, &count) != 0 || count <= 0) return r;
+        for (int32_t i = 0; i < count; i++) {
+            uint8_t *nm = nullptr; uint32_t nl = 0;
+            if (kvspaceListAt(kv, prefix, 0, 1, i, &nm, &nl) == 0 && nm)
+                r.push_back(std::string((const char *)nm, nl));
         }
         return r;
     }
@@ -78,7 +78,7 @@ int main() {
         return std::pair<uint8_t *, uint32_t>{b, n};
     };
     auto xv_str = [](const char *s) {
-        uint8_t *b; uint32_t n; kvspaceNewCharByte((const uint8_t *)s, (uint32_t)strlen(s), &b, &n);
+        uint8_t *b; uint32_t n; kvspaceNewChar((const uint8_t *)s, (uint32_t)strlen(s), &b, &n);
         return std::pair<uint8_t *, uint32_t>{b, n};
     };
 

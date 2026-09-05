@@ -44,7 +44,7 @@ static void set_str(void *kv, const char *key, const char *s) {
 }
 static void list(void *kv, const char *dir, int show_kind) {
     uint32_t len; uint8_t *out = NULL;
-    kvspaceList(kv, dir, 0, 1, &out, &len);
+    kv_list(kv, dir, &out, &len);
     if (!out || len == 0) return;
     uint32_t i = 0;
     while (i < len) {
