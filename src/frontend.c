@@ -29,7 +29,8 @@ typedef struct {
     int  (*writenewplace)(void *h, const char *key, const char *kindexpr, uint32_t body_len,
                           uint8_t **body, char *err, uint32_t err_cap);
     int  (*listlen)(void *h, const char *prefix, int expand_ext, int resolve, int32_t *out_count);
-    int  (*list)(void *h, const char *prefix, int expand_ext, int resolve, uint8_t **out, uint32_t *out_len);
+    int  (*listat)(void *h, const char *prefix, int expand_ext, int resolve, int32_t idx,
+                   uint8_t **out, uint32_t *out_len);
     int  (*del)(void *h, const char *const *keys, uint32_t nkeys, char *err, uint32_t err_cap);
     int  (*deltree)(void *h, const char *prefix, char *err, uint32_t err_cap);
     int  (*cp)(void *h, const char *src, const char *dst, char *err, uint32_t err_cap);
@@ -105,7 +106,7 @@ void *kvspaceConnect(const char *dsn) {
     LOAD(writeinplace, "kvspaceWriteInPlace");
     LOAD(writenewplace, "kvspaceWriteNewPlace");
     LOAD(listlen, "kvspaceListLen");
-    LOAD(list, "kvspaceList");
+    LOAD(listat, "kvspaceListAt");
     LOAD(del, "kvspaceDel");
     LOAD(deltree, "kvspaceDelTree");
     LOAD(cp, "kvspaceCp");
@@ -166,9 +167,10 @@ int kvspaceListLen(void *h, const char *prefix, int expand_ext, int resolve, int
     return x->vt->listlen(x->backend, prefix, expand_ext, resolve, out_count);
 }
 
-int kvspaceList(void *h, const char *prefix, int expand_ext, int resolve, uint8_t **out, uint32_t *out_len) {
+int kvspaceListAt(void *h, const char *prefix, int expand_ext, int resolve, int32_t idx,
+                  uint8_t **out, uint32_t *out_len) {
     kvspace_handle *x = H(h);
-    return x->vt->list(x->backend, prefix, expand_ext, resolve, out, out_len);
+    return x->vt->listat(x->backend, prefix, expand_ext, resolve, idx, out, out_len);
 }
 
 int kvspaceDel(void *h, const char *const *keys, uint32_t nkeys, char *err, uint32_t err_cap) {

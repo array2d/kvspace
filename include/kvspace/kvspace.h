@@ -55,9 +55,12 @@ int kvspaceWriteNewPlace(void *h, const char *key, const char *kindexpr, uint32_
 /* 只返回前缀下子项计数，无缓冲、无需释放。resolve=1 穿透 link。 */
 int kvspaceListLen(void *h, const char *prefix, int expand_ext, int resolve, int32_t *out_count);
 
-/* 借用枚举：*out 指向后端常驻/回收缓冲（\n 连接的直接子项名），生命周期至下次同线程 List，
- * 调用方不得 free。空目录 → *out=NULL、*out_len=0。resolve=1 穿透 link；expand_ext=1 展开 extindex。 */
-int kvspaceList(void *h, const char *prefix, int expand_ext, int resolve, uint8_t **out, uint32_t *out_len);
+/* 借用索引取项：返回前缀下第 idx 个直接子项名，*out 指向后端常驻/回收缓冲，生命周期至下次
+ * 同线程 ListAt，调用方不得 free。idx 越界 → *out=NULL、*out_len=0、返回非 0。配合
+ * kvspaceListLen 遍历（listlen 定计数，逐 idx 取名），不再一次性返回整段名单缓冲。
+ * resolve=1 穿透 link；expand_ext=1 展开 extindex。 */
+int kvspaceListAt(void *h, const char *prefix, int expand_ext, int resolve, int32_t idx,
+                  uint8_t **out, uint32_t *out_len);
 
 int kvspaceDel(void *h, const char *const *keys, uint32_t nkeys, char *err, uint32_t err_cap);
 int kvspaceDelTree(void *h, const char *prefix, char *err, uint32_t err_cap);
