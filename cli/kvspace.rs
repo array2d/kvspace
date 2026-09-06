@@ -90,8 +90,13 @@ extern "C" {
         err: *mut c_char,
         err_cap: u32,
     ) -> c_int;
-    fn kvspaceMkindex(h: *mut c_void, path: *const c_char, err: *mut c_char, err_cap: u32)
-        -> c_int;
+    fn kvspaceMkindex(
+        h: *mut c_void,
+        path: *const c_char,
+        capacity: u32,
+        err: *mut c_char,
+        err_cap: u32,
+    ) -> c_int;
     fn kvspaceMkindexExt(
         h: *mut c_void,
         path: *const c_char,
@@ -653,9 +658,10 @@ fn main() {
         }
         "mkindex" => {
             if let Some(p) = tail.first() {
+                let capacity: u32 = tail.get(1).and_then(|s| s.parse().ok()).unwrap_or(0);
                 let mut err = [0u8; 256];
                 unsafe {
-                    kvspaceMkindex(kv, cs(p), err.as_mut_ptr() as *mut c_char, 256);
+                    kvspaceMkindex(kv, cs(p), capacity, err.as_mut_ptr() as *mut c_char, 256);
                 }
             }
         }

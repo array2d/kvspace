@@ -67,7 +67,7 @@ int kvspaceDelTree(void *h, const char *prefix, char *err, uint32_t err_cap);
 int kvspaceCp(void *h, const char *src, const char *dst, char *err, uint32_t err_cap);
 int kvspaceCpTree(void *h, const char *src, const char *dst, char *err, uint32_t err_cap);
 int kvspaceCpList(void *h, const char *src, const char *dst, char *err, uint32_t err_cap);
-int kvspaceMkindex(void *h, const char *path, char *err, uint32_t err_cap);
+int kvspaceMkindex(void *h, const char *path, uint32_t capacity, char *err, uint32_t err_cap);
 int kvspaceMkindexExt(void *h, const char *path, const char *ext_path, char *err, uint32_t err_cap);
 int kvspaceRmindexExt(void *h, const char *path, char *err, uint32_t err_cap);
 int kvspaceClear(void *h, char *err, uint32_t err_cap);

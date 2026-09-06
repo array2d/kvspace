@@ -36,7 +36,7 @@ typedef struct {
     int  (*cp)(void *h, const char *src, const char *dst, char *err, uint32_t err_cap);
     int  (*cptree)(void *h, const char *src, const char *dst, char *err, uint32_t err_cap);
     int  (*cplist)(void *h, const char *src, const char *dst, char *err, uint32_t err_cap);
-    int  (*mkindex)(void *h, const char *path, char *err, uint32_t err_cap);
+    int  (*mkindex)(void *h, const char *path, uint32_t capacity, char *err, uint32_t err_cap);
     int  (*mkindexext)(void *h, const char *path, const char *ext_path, char *err, uint32_t err_cap);
     int  (*rmindexext)(void *h, const char *path, char *err, uint32_t err_cap);
     int  (*clear)(void *h, char *err, uint32_t err_cap);
@@ -200,9 +200,9 @@ int kvspaceCpList(void *h, const char *src, const char *dst, char *err, uint32_t
     return x->vt->cplist(x->backend, src, dst, err, err_cap);
 }
 
-int kvspaceMkindex(void *h, const char *path, char *err, uint32_t err_cap) {
+int kvspaceMkindex(void *h, const char *path, uint32_t capacity, char *err, uint32_t err_cap) {
     kvspace_handle *x = H(h);
-    return x->vt->mkindex(x->backend, path, err, err_cap);
+    return x->vt->mkindex(x->backend, path, capacity, err, err_cap);
 }
 
 int kvspaceMkindexExt(void *h, const char *path, const char *ext_path, char *err, uint32_t err_cap) {
