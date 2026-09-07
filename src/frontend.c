@@ -26,8 +26,8 @@ typedef struct {
     int  (*get)(void *h, const char *key, int resolve, uint8_t **out, uint32_t *out_len);
     int  (*writeinplace)(void *h, const char *key, int resolve, uint32_t body_len,
                          uint8_t **body, char *err, uint32_t err_cap);
-    int  (*writenewplace)(void *h, const char *key, const char *kindexpr, uint32_t body_len,
-                          uint8_t **body, char *err, uint32_t err_cap);
+    int  (*writenewplace)(void *h, const char *key, uint8_t xkind, const char *kindexpr,
+                          uint32_t body_len, uint8_t **body, char *err, uint32_t err_cap);
     int  (*listlen)(void *h, const char *prefix, int expand_ext, int resolve, int32_t *out_count);
     int  (*listat)(void *h, const char *prefix, int expand_ext, int resolve, int32_t idx,
                    uint8_t *buf, uint32_t buf_cap, uint32_t *out_len);
@@ -158,10 +158,10 @@ int kvspaceWriteInPlace(void *h, const char *key, int resolve, uint32_t body_len
     return x->vt->writeinplace(x->backend, key, resolve, body_len, body, err, err_cap);
 }
 
-int kvspaceWriteNewPlace(void *h, const char *key, const char *kindexpr, uint32_t body_len,
-                         uint8_t **body, char *err, uint32_t err_cap) {
+int kvspaceWriteNewPlace(void *h, const char *key, uint8_t xkind, const char *kindexpr,
+                         uint32_t body_len, uint8_t **body, char *err, uint32_t err_cap) {
     kvspace_handle *x = H(h);
-    return x->vt->writenewplace(x->backend, key, kindexpr, body_len, body, err, err_cap);
+    return x->vt->writenewplace(x->backend, key, xkind, kindexpr, body_len, body, err, err_cap);
 }
 
 int kvspaceListLen(void *h, const char *prefix, int expand_ext, int resolve, int32_t *out_count) {
@@ -239,11 +239,9 @@ static uint32_t rd_u32(const uint8_t *d) {
     return (uint32_t)d[0] | ((uint32_t)d[1] << 8) | ((uint32_t)d[2] << 16) | ((uint32_t)d[3] << 24);
 }
 
-static int build_kindexpr(char *buf, size_t cap, const char *kind, int ref,
+static int build_kindexpr(char *buf, size_t cap, const char *kind,
                           const int32_t *dims, int ndim) {
     int o = 0;
-    if (ref == 1) buf[o++] = '*';
-    else if (ref == 2) buf[o++] = '@';
     if (ndim > 0) {
         buf[o++] = '[';
         for (int i = 0; i < ndim; i++) {
@@ -257,20 +255,32 @@ static int build_kindexpr(char *buf, size_t cap, const char *kind, int ref,
     return o + (int)kl;
 }
 
+static int is_def_kind(const char *kind) {
+    return strcmp(kind, KVSPACE_KIND_RWFUNC) == 0 || strcmp(kind, KVSPACE_KIND_DEF_RWIR) == 0;
+}
+
+static uint8_t xkind_of(const char *kind, int ref) {
+    if (ref == 1) return KVSPACE_XKIND_PTR;
+    if (ref == 2) return KVSPACE_XKIND_EXTVALUE;
+    if (is_def_kind(kind)) return KVSPACE_XKIND_DEFKINDEXPR;
+    return KVSPACE_XKIND_REALVALUE;
+}
+
 static int encode_head(const char *kind, int ref, int ro, uint32_t vid,
                        const int32_t *dims, int ndim,
                        const uint8_t *raw, uint32_t raw_len,
                        uint8_t **out, uint32_t *out_len) {
     char kx[256];
-    int kxl = build_kindexpr(kx, sizeof kx, kind, ref, dims, ndim);
+    int kxl = build_kindexpr(kx, sizeof kx, kind, dims, ndim);
     int slot = kxl + 1;
-    uint32_t total = 1u + (uint32_t)slot + 1u + 4u + 4u + raw_len;
+    uint32_t total = 2u + (uint32_t)slot + 1u + 4u + 4u + raw_len;
     uint8_t *buf = malloc(total);
     if (!buf) return 1;
-    buf[0] = (uint8_t)slot;
-    memcpy(buf + 1, kx, (size_t)kxl);
-    buf[1 + kxl] = 0;
-    int o = 1 + slot;
+    buf[0] = xkind_of(kind, ref);
+    buf[1] = (uint8_t)slot;
+    memcpy(buf + 2, kx, (size_t)kxl);
+    buf[2 + kxl] = 0;
+    int o = 2 + slot;
     buf[o] = (uint8_t)(ro ? 1 : 0);
     wr_u32(buf + o + 1, vid);
     wr_u32(buf + o + 5, raw_len);
@@ -299,16 +309,31 @@ int kvspaceTlvEncodeMode(const char *kind, const uint8_t *raw, uint32_t raw_len,
 int kvspaceDecodeHead(const uint8_t *data, uint32_t data_len, kvspaceHead_t *out) {
     if (!out) return 1;
     memset(out, 0, sizeof(*out));
-    if (!data || data_len < 1) return 1;
-    int slot = data[0];
-    int o = 1 + slot;
+    if (!data || data_len < 2) return 1;
+    out->xkind = data[0];
+    int slot = data[1];
+    int o = 2 + slot;
     if ((uint32_t)o + 9 > data_len) return 1;
-    const uint8_t *kx = data + 1;
+    const uint8_t *kx = data + 2;
     int kxl = 0;
     while (kxl < slot && kx[kxl] != 0) kxl++;
     int n = kxl > 255 ? 255 : kxl;
     memcpy(out->kindexpr, kx, (size_t)n);
     out->kindexpr[n] = 0;
+    /* kindexpr 无前缀：可选前导 [d0,d1,...] 承载 ndim+dims，其后为 base 种类。 */
+    int ko = 0;
+    if (out->kindexpr[0] == '[') {
+        int i = 1, nd = 0, v = 0, has = 0;
+        for (; out->kindexpr[i] && out->kindexpr[i] != ']'; i++) {
+            uint8_t c = out->kindexpr[i];
+            if (c == ',') { if (nd < 8) out->dims[nd] = v; nd++; v = 0; has = 0; }
+            else if (c >= '0' && c <= '9') { v = v * 10 + (c - '0'); has = 1; }
+        }
+        if (has || nd > 0) { if (nd < 8) out->dims[nd] = v; nd++; }
+        out->ndim = nd;
+        if (out->kindexpr[i] == ']') ko = i + 1;
+    }
+    out->kind_off = ko;
     out->ro = data[o] & 1;
     out->vid = rd_u32(data + o + 1);
     out->body_len = (int32_t)rd_u32(data + o + 5);
@@ -316,8 +341,8 @@ int kvspaceDecodeHead(const uint8_t *data, uint32_t data_len, kvspaceHead_t *out
     return 0;
 }
 
-/* 指针（ref=1）：head kindexpr = "*" + target_kindexpr（目标完整 kindexpr，含其自身
- * 的引用/形状前缀），body = 目标 key 路径。指针恒标量，不派生 dims。 */
+/* 指针（xkind=PTR）：head kindexpr = target_kindexpr（目标完整 kindexpr，无前缀），
+ * body = 目标 key 路径。指针恒标量，不派生 dims。 */
 int kvspaceNewPtr(const char *target_kindexpr, const char *target,
                   uint8_t **out, uint32_t *out_len) {
     if (!target_kindexpr || !target || !out || !out_len) return 1;

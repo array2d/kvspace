@@ -7,8 +7,9 @@
  *   其余（redis/fs/s3）→ libkvspace_durable.so.1
  *
  * 头格式（byte-identical，两边一致，由前端静态实现 codec）：
- *   [1B kindexprlen][kindexpr 含 0x00 padding][1B ro][4B vid LE][4B raw_len LE][raw]
- *   kindexpr 串首字节 * =指针(Ptr) / @ =扩展句柄 / 无 =内联，其后 [d0,d1]kind 承载 ndim+dims。
+ *   [1B xkind][1B kindexprlen][kindexpr 含 0x00 padding][1B ro][4B vid LE][4B raw_len LE][raw]
+ *   xkind 五分类：0=None 1=Ptr 2=ExtValue 3=DefKindexpr 4=RealValue（Ptr/ExtValue 出前缀）。
+ *   kindexpr 无前缀，前导 [d0,d1] 承载 ndim+dims，其后为 base 种类。
  */
 
 #ifndef KVSPACE_H
@@ -22,9 +23,20 @@
 extern "C" {
 #endif
 
+/* XValue 五分类（head 首字节 xkind）。*/
+#define KVSPACE_XKIND_NONE        0
+#define KVSPACE_XKIND_PTR         1
+#define KVSPACE_XKIND_EXTVALUE    2
+#define KVSPACE_XKIND_DEFKINDEXPR 3
+#define KVSPACE_XKIND_REALVALUE   4
+
 /* XValue 头（repr C）。kindexpr 为唯一类型真相，body 靠 offset/len 定位。 */
 typedef struct {
-    uint8_t  kindexpr[256]; /* NUL 终止（含 ref 前缀与 [dims]，去 padding） */
+    uint8_t  xkind;         /* 五分类：见 KVSPACE_XKIND_* */
+    uint8_t  kindexpr[256]; /* NUL 终止（含 [dims]、无前缀，去 padding） */
+    int32_t  kind_off;      /* base 种类在 kindexpr 内的起始字节偏移（越过 [dims]） */
+    int32_t  ndim;          /* 维数（标量=0） */
+    int32_t  dims[8];       /* 各维长度 */
     uint8_t  ro;            /* 1=只读，0=可写 */
     uint32_t vid;           /* vthread id（默认 0） */
     int32_t  body_len;      /* body 字节数 */
@@ -47,10 +59,10 @@ int kvspaceGet(void *h, const char *key, int resolve, uint8_t **out, uint32_t *o
 int kvspaceWriteInPlace(void *h, const char *key, int resolve, uint32_t body_len,
                         uint8_t **body, char *err, uint32_t err_cap);
 
-/* 新位置写：按 (kindexpr, body_len) 分配新 box、写好 head，返回 body 偏移指针供直接写。
+/* 新位置写：按 (xkind, kindexpr, body_len) 分配新 box、写好 head，返回 body 偏移指针供直接写。
  * 用于新建 key 或 kind/尺寸变化。写即持久。 */
-int kvspaceWriteNewPlace(void *h, const char *key, const char *kindexpr, uint32_t body_len,
-                         uint8_t **body, char *err, uint32_t err_cap);
+int kvspaceWriteNewPlace(void *h, const char *key, uint8_t xkind, const char *kindexpr,
+                         uint32_t body_len, uint8_t **body, char *err, uint32_t err_cap);
 
 /* 只返回前缀下子项计数，无缓冲、无需释放。resolve=1 穿透 link。 */
 int kvspaceListLen(void *h, const char *prefix, int expand_ext, int resolve, int32_t *out_count);
