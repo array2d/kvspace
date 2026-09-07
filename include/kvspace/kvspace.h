@@ -7,9 +7,17 @@
  *   其余（redis/fs/s3）→ libkvspace_durable.so.1
  *
  * 头格式（byte-identical，两边一致，由前端静态实现 codec）：
- *   [1B xkind][1B kindexprlen][kindexpr 含 0x00 padding][1B ro][4B vid LE][4B raw_len LE][raw]
- *   xkind 五分类：0=None 1=Ptr 2=ExtValue 3=DefKindexpr 4=RealValue（Ptr/ExtValue 出前缀）。
- *   kindexpr 无前缀，前导 [d0,d1] 承载 ndim+dims，其后为 base 种类。
+ *   head = [headlen u16 LE][ref u8][storetype u8][ro u8][vid u32 LE][body_len u32 LE]
+ *          [storetype 物理字段（变长，按 storetype）][langtype kindexpr 串（占至 headlen）]
+ *   body = [body_len B raw]
+ *
+ *   三正交轴：
+ *     ref       存储位置：0=inline（body=值本体）/1=ptr（body=目标 key）/2=@ext（body=扩展定位符）
+ *     storetype 物理布局（codec 唯一分派）：NONE / ATOM / ARRAYND / index / extindex
+ *     langtype  语义类型真相：完整 kindexpr 串（含 [dims]、map key·value、struct 原型路径、def 族名），
+ *               恒为 head 最后一段，无独立长度字段（长度 = headlen − 当前偏移），不含 ptr/ext 前缀。
+ *   物理字段：ARRAYND = ndim u8 + dims[ndim] u32 LE；index/extindex = 成员名矩阵 dims=[len,cap,M]。
+ *   body 起始偏移 = headlen。None：storetype=NONE、langtype=""、body 空。
  */
 
 #ifndef KVSPACE_H
@@ -23,24 +31,31 @@
 extern "C" {
 #endif
 
-/* XValue 五分类（head 首字节 xkind）。*/
-#define KVSPACE_XKIND_NONE        0
-#define KVSPACE_XKIND_PTR         1
-#define KVSPACE_XKIND_EXTVALUE    2
-#define KVSPACE_XKIND_DEFKINDEXPR 3
-#define KVSPACE_XKIND_REALVALUE   4
+/* ref：存储位置维（head 第 2 字节）。只决定 body 语义与是否间接寻址。 */
+#define KVSPACE_REF_INLINE 0  /* body = 值本体 raw */
+#define KVSPACE_REF_PTR    1  /* body = 目标 key 路径（软链接，单跳同型） */
+#define KVSPACE_REF_EXT    2  /* body = 扩展世界定位符（fs 文件 / gpu tensordata） */
 
-/* XValue 头（repr C）。kindexpr 为唯一类型真相，body 靠 offset/len 定位。 */
+/* storetype：物理布局维（head 第 3 字节，codec 唯一分派）。 */
+#define KVSPACE_STORETYPE_NONE     0  /* 无物理字段，body 空 */
+#define KVSPACE_STORETYPE_ATOM     1  /* 无物理字段，body 定宽 raw */
+#define KVSPACE_STORETYPE_ARRAYND  2  /* 物理字段 ndim u8 + dims[ndim] u32 LE，body 稠密等宽数组 */
+#define KVSPACE_STORETYPE_INDEX    3  /* 成员名矩阵 dims=[len,cap,M]（静态目录/值容器） */
+#define KVSPACE_STORETYPE_EXTINDEX 4  /* 同 index，cap 可增长（运行栈等） */
+
+/* XValue 头（repr C）。三正交轴 ref/storetype/langtype；body 靠 headlen 定位。 */
 typedef struct {
-    uint8_t  xkind;         /* 五分类：见 KVSPACE_XKIND_* */
-    uint8_t  kindexpr[256]; /* NUL 终止（含 [dims]、无前缀，去 padding） */
-    int32_t  kind_off;      /* base 种类在 kindexpr 内的起始字节偏移（越过 [dims]） */
-    int32_t  ndim;          /* 维数（标量=0） */
-    int32_t  dims[8];       /* 各维长度 */
+    uint16_t headlen;       /* head 总字节数；body 起于偏移 headlen */
+    uint8_t  ref;           /* 存储位置：见 KVSPACE_REF_* */
+    uint8_t  storetype;     /* 物理布局：见 KVSPACE_STORETYPE_* */
     uint8_t  ro;            /* 1=只读，0=可写 */
     uint32_t vid;           /* vthread id（默认 0） */
     int32_t  body_len;      /* body 字节数 */
-    int32_t  body_offset;   /* body 在 data 内的起始偏移（= head 长度） */
+    int32_t  ndim;          /* ARRAYND：维数；index/extindex：3（[len,cap,M]）；NONE/ATOM：0 */
+    int32_t  dims[8];       /* ARRAYND：各维长度；index/extindex：[len,cap,M] */
+    char     langtype[256]; /* 语义类型 kindexpr 串，NUL 终止（含 [dims]、无 ptr/ext 前缀） */
+    int32_t  langtype_len;  /* langtype 内容长度（去 padding） */
+    int32_t  body_offset;   /* body 在 data 内的起始偏移（= headlen） */
 } kvspaceHead_t;
 
 /* ── 生命周期 ─────────────────────────────────────────────────── */
@@ -59,10 +74,12 @@ int kvspaceGet(void *h, const char *key, int resolve, uint8_t **out, uint32_t *o
 int kvspaceWriteInPlace(void *h, const char *key, int resolve, uint32_t body_len,
                         uint8_t **body, char *err, uint32_t err_cap);
 
-/* 新位置写：按 (xkind, kindexpr, body_len) 分配新 box、写好 head，返回 body 偏移指针供直接写。
- * 用于新建 key 或 kind/尺寸变化。写即持久。 */
-int kvspaceWriteNewPlace(void *h, const char *key, uint8_t xkind, const char *kindexpr,
-                         uint32_t body_len, uint8_t **body, char *err, uint32_t err_cap);
+/* 新位置写：按 (ref, storetype, ro, vid, langtype, body_len) 分配新 box、写好 head，返回 body
+ * 偏移指针供直接写。ARRAYND 的 dims 由 codec 从 langtype 串内的 [dims] 解析落入物理字段。
+ * 用于新建 key 或 storetype/尺寸变化。写即持久。 */
+int kvspaceWriteNewPlace(void *h, const char *key, uint8_t ref, uint8_t storetype,
+                         uint8_t ro, uint32_t vid, const char *langtype, uint32_t body_len,
+                         uint8_t **body, char *err, uint32_t err_cap);
 
 /* 只返回前缀下子项计数，无缓冲、无需释放。resolve=1 穿透 link。 */
 int kvspaceListLen(void *h, const char *prefix, int expand_ext, int resolve, int32_t *out_count);

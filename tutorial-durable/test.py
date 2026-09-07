@@ -38,7 +38,7 @@ def run_script(script):
     """先 clear，再执行脚本，返回 stdout 行列表。"""
     kvbin = os.path.expanduser('~/.local/bin/kvspace')
     env = os.environ.copy()
-    env.setdefault('KVLANG_KVSPACE', 'redis://127.0.0.1:6379')
+    env.setdefault('KVSPACE', 'redis://127.0.0.1:6379')
     subprocess.run([kvbin, 'clear'], capture_output=True, timeout=10, env=env)
     r = subprocess.run(['bash', script], capture_output=True, text=True, timeout=30, env=env)
     return r.stdout.rstrip('\n').split('\n') if r.stdout.strip() else []
@@ -58,11 +58,18 @@ def test_script(script):
 # ── kvspace-c ↔ kvspace-durable 交叉校验（ctypes，字节级对齐） ──────────────
 
 class HeadV(ctypes.Structure):
+    # 三正交轴 kvspaceHead_t（对齐 kvspace/include/kvspace/kvspace.h）。
     _fields_ = [
-        ("kindexpr", ctypes.c_uint8 * 256),
+        ("headlen", ctypes.c_uint16),
+        ("ref", ctypes.c_uint8),
+        ("storetype", ctypes.c_uint8),
         ("ro", ctypes.c_uint8),
         ("vid", ctypes.c_uint32),
         ("body_len", ctypes.c_int32),
+        ("ndim", ctypes.c_int32),
+        ("dims", ctypes.c_int32 * 8),
+        ("langtype", ctypes.c_uint8 * 256),
+        ("langtype_len", ctypes.c_int32),
         ("body_offset", ctypes.c_int32),
     ]
 
@@ -104,7 +111,9 @@ def decode(lib, data):
     rc = lib.kvspaceDecodeHead(buf, len(data), ctypes.byref(h))
     assert rc == 0, f"decode rc={rc}"
     return {
-        "kindexpr": bytes(h.kindexpr).split(b"\0", 1)[0].decode(),
+        "headlen": h.headlen, "ref": h.ref, "storetype": h.storetype,
+        "langtype": bytes(h.langtype).split(b"\0", 1)[0].decode(),
+        "ndim": h.ndim, "dims": list(h.dims)[:h.ndim],
         "ro": h.ro, "vid": h.vid,
         "body_len": h.body_len, "body_offset": h.body_offset,
     }

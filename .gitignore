@@ -4,3 +4,6 @@ target/
 *.so.*
 __pycache__/
 *.pyc
+
+# durable 测试产物
+kvtest*

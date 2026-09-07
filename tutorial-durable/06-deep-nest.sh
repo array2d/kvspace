@@ -5,8 +5,8 @@
 # a/	index	(1)
 # /deep/a/b/c	int64:3
 # d/	index	(1)
+# c	int64	3
 # c/	index	(1)
-# c/
 # === deltree mid ===
 # /deep/a/b/c/d/e/f	(nil)
 # /deep/a/b/c/d/e	(nil)

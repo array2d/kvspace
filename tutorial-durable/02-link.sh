@@ -9,15 +9,15 @@
 # z	char/utf8	hello
 # === write through ===
 # /tgt/w	int64:99
+# w	int64	99
 # x	int64	42
 # y	int64	7
 # z	char/utf8	hello
-# w	int64	99
 # === del through link ===
 # /tgt/y	(nil)
+# w	int64	99
 # x	int64	42
 # z	char/utf8	hello
-# w	int64	99
 # === del link body ===
 # /lnk	(nil)
 # /tgt/x	int64:42
