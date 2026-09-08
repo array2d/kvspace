@@ -24,6 +24,12 @@ typedef struct {
     void (*free)(void *h);
     int  (*disconnect)(void *h, char *err, uint32_t err_cap);
     int  (*get)(void *h, const char *key, int resolve, uint8_t **out, uint32_t *out_len);
+    void (*readreset)(void *h);
+    int  (*getpart)(void *h, const char *key, uint32_t offset, uint32_t len,
+                     uint8_t **out, uint32_t *out_len);
+    int  (*setpart)(void *h, const char *key, uint32_t offset, const uint8_t *buf,
+                     uint32_t buf_len, char *err, uint32_t err_cap);
+    int  (*gethead)(void *h, const char *key, kvspaceHead_t *out);
     int  (*writeinplace)(void *h, const char *key, int resolve, uint32_t body_len,
                          uint8_t **body, char *err, uint32_t err_cap);
     int  (*writenewplace)(void *h, const char *key, uint8_t ref, uint8_t storetype,
@@ -105,6 +111,10 @@ void *kvspaceConnect(const char *dsn) {
     LOAD(free, "kvspaceClose");
     LOAD(disconnect, "kvspaceDisconnect");
     LOAD(get, "kvspaceGet");
+    LOAD(readreset, "kvspaceReadReset");
+    LOAD(getpart, "kvspaceGetPart");
+    LOAD(setpart, "kvspaceSetPart");
+    LOAD(gethead, "kvspaceGetHead");
     LOAD(writeinplace, "kvspaceWriteInPlace");
     LOAD(writenewplace, "kvspaceWriteNewPlace");
     LOAD(listlen, "kvspaceListLen");
@@ -151,6 +161,28 @@ int kvspaceDisconnect(void *h, char *err, uint32_t err_cap) {
 int kvspaceGet(void *h, const char *key, int resolve, uint8_t **out, uint32_t *out_len) {
     kvspace_handle *x = H(h);
     return x->vt->get(x->backend, key, resolve, out, out_len);
+}
+
+void kvspaceReadReset(void *h) {
+    kvspace_handle *x = H(h);
+    if (x->vt->readreset) x->vt->readreset(x->backend);
+}
+
+int kvspaceGetPart(void *h, const char *key, uint32_t offset, uint32_t len,
+                    uint8_t **out, uint32_t *out_len) {
+    kvspace_handle *x = H(h);
+    return x->vt->getpart(x->backend, key, offset, len, out, out_len);
+}
+
+int kvspaceSetPart(void *h, const char *key, uint32_t offset, const uint8_t *buf,
+                    uint32_t buf_len, char *err, uint32_t err_cap) {
+    kvspace_handle *x = H(h);
+    return x->vt->setpart(x->backend, key, offset, buf, buf_len, err, err_cap);
+}
+
+int kvspaceGetHead(void *h, const char *key, kvspaceHead_t *out) {
+    kvspace_handle *x = H(h);
+    return x->vt->gethead(x->backend, key, out);
 }
 
 int kvspaceWriteInPlace(void *h, const char *key, int resolve, uint32_t body_len,

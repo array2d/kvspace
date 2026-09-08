@@ -65,9 +65,27 @@ int   kvspaceDisconnect(void *h, char *err, uint32_t err_cap);
 
 /* ── 单点读写 / 目录 ──────────────────────────────────────────── */
 
-/* 借用读：*out 指向后端常驻空间（shm mmap / durable 常驻映射），生命周期同该槽，
+/* 借用读：*out 指向后端常驻空间（shm mmap / durable 借用池），生命周期同该槽，
  * 调用方不得 free。resolve=1 穿透 link。key 不存在/空值 → *out=NULL、*out_len=0、返回 0。 */
 int kvspaceGet(void *h, const char *key, int resolve, uint8_t **out, uint32_t *out_len);
+
+/* 指令边界回收读借用池：VM 每条指令执行完调用一次。此后本指令内 Get/GetPart 借出的
+ * 指针一律失效。shm 常驻映射侧为 no-op；durable 惰性写不清池，全靠本调用回收。 */
+void kvspaceReadReset(void *h);
+
+/* 定位读：借用读 key 值的 [offset, offset+len) 字节，*out 指向后端常驻空间（借用，不得 free，
+ * 生命周期至下次 ReadReset）。恒穿透 link。越界/空/不存在 → *out=NULL、*out_len=0、返回 0。 */
+int kvspaceGetPart(void *h, const char *key, uint32_t offset, uint32_t len,
+                    uint8_t **out, uint32_t *out_len);
+
+/* 定位写：就地写 buf 到 key 值的 [offset, offset+buf_len)（key 须已存在、不改结构/尺寸）。
+ * 写即持久。越界/不存在 → 非 0 + err。用于 ndarray 元素/head 的分片就地更新。 */
+int kvspaceSetPart(void *h, const char *key, uint32_t offset, const uint8_t *buf,
+                    uint32_t buf_len, char *err, uint32_t err_cap);
+
+/* 读 head：只读值前缀并解码三正交轴 head（不取 body），供 xv 系列不借整块即得元数据。
+ * 空/不存在 → 返回非 0。 */
+int kvspaceGetHead(void *h, const char *key, kvspaceHead_t *out);
 
 /* 就地写：key 必须已存在、kind 不变、body_len 必须等于原 body_len——返回原 box 的 body
  * 偏移指针供调用方直接写。违反前置条件 → 非 0 + err（绝不静默重分配、绝不回落）。写即持久。 */
