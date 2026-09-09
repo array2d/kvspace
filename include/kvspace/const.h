@@ -30,7 +30,6 @@
 #define KVSPACE_KIND_CHAR       "char/utf32"
 #define KVSPACE_KIND_CHAR_UTF8  "char/utf8"
 #define KVSPACE_KIND_CHAR_ASCII "char/ascii"
-#define KVSPACE_KIND_OBJ        "object"
 #define KVSPACE_KIND_MAP        "stringkeymap"
 #define KVSPACE_KIND_INDEX      "index"
 #define KVSPACE_KIND_EXT_INDEX  "extindex"
@@ -66,7 +65,6 @@
     X(KVSPACE_KIND_CHAR) \
     X(KVSPACE_KIND_CHAR_UTF8) \
     X(KVSPACE_KIND_CHAR_ASCII) \
-    X(KVSPACE_KIND_OBJ) \
     X(KVSPACE_KIND_MAP) \
     X(KVSPACE_KIND_INDEX) \
     X(KVSPACE_KIND_EXT_INDEX) \
@@ -79,7 +77,7 @@
     X(KVSPACE_ERR_DIR_MUST_END_WITH_SLASH) \
     X(KVSPACE_ERR_INVALID_PATH)
 
-/* 运行期查询：kvspaceConst("KVSPACE_KIND_OBJ") -> "object"。
+/* 运行期查询：kvspaceConst("KVSPACE_KIND_MAP") -> "stringkeymap"。
  * 供 Go/Python/Rust 扩展经 C ABI 取常量，避免硬编码。 */
 const char *kvspaceConst(const char *name);
 

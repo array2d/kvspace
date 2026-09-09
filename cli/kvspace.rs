@@ -271,14 +271,6 @@ fn plain(v: &Value) -> String {
                 .collect::<Vec<_>>()
                 .join(",")
         ),
-        "object" => {
-            let n = v.dims.first().copied().unwrap_or(0);
-            if n == 0 {
-                "object".to_string()
-            } else {
-                format!("{{{}}}", n)
-            }
-        }
         "index" => format!("({})", v.dims.first().copied().unwrap_or(0)),
         "extindex" => String::from_utf8_lossy(&v.body).into_owned(),
         _ => String::from_utf8_lossy(&v.body).into_owned(),
@@ -387,20 +379,6 @@ fn parse_value(raw: &str) -> Vec<u8> {
                         cs("index"),
                         zero.as_ptr(),
                         4,
-                        std::ptr::null(),
-                        0,
-                        &mut out,
-                        &mut len,
-                    ) == 0
-                }
-            }
-            "object" => {
-                let empty = [0u8; 0];
-                unsafe {
-                    kvspaceTlvEncode(
-                        cs("object"),
-                        empty.as_ptr(),
-                        0,
                         std::ptr::null(),
                         0,
                         &mut out,

@@ -17,7 +17,7 @@ head 格式 byte-identical，两个后端与前端三者共用同一份契约。
 ## 常量 ABI
 
 `include/kvspace/const.h` 是分隔符与 kind 串的唯一定义处（`#define KVSPACE_*`），
-并导出 `kvspaceConst("KVSPACE_KIND_OBJ")` → `"objindex"` 供 Go/Python/Rust 扩展运行期取常量，
+并导出 `kvspaceConst("KVSPACE_KIND_MAP")` → `"stringkeymap"` 供 Go/Python/Rust 扩展运行期取常量，
 免去硬编码裸字面量。C/C++ 直接 `#include <kvspace/const.h>` 用宏；Rust 用 build.rs 解析同一文件的
 `#define KVSPACE_* "…"` 行生成常量，不引入 bindgen。
 
