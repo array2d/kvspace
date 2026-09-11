@@ -22,7 +22,6 @@
 
 typedef struct {
     void (*free)(void *h);
-    int  (*disconnect)(void *h, char *err, uint32_t err_cap);
     int  (*get)(void *h, const char *key, int resolve, uint8_t **out, uint32_t *out_len);
     void (*readreset)(void *h);
     int  (*getpart)(void *h, const char *key, uint32_t offset, uint32_t len,
@@ -109,7 +108,6 @@ void *kvspaceConnect(const char *dsn) {
     } while (0)
 
     LOAD(free, "kvspaceClose");
-    LOAD(disconnect, "kvspaceDisconnect");
     LOAD(get, "kvspaceGet");
     LOAD(readreset, "kvspaceReadReset");
     LOAD(getpart, "kvspaceGetPart");
@@ -149,11 +147,6 @@ void kvspaceClose(void *h) {
     if (x->dl) dlclose(x->dl);
     free(x->vt);
     free(x);
-}
-
-int kvspaceDisconnect(void *h, char *err, uint32_t err_cap) {
-    kvspace_handle *x = H(h);
-    return x->vt->disconnect ? x->vt->disconnect(x->backend, err, err_cap) : 0;
 }
 
 /* ── 单点读写 / 目录（trampoline） ─────────────────────────────────── */

@@ -7,6 +7,11 @@ set(CMAKE_C_EXTENSIONS ON)
 
 include(GNUInstallDirs)
 
+# 默认 prefix=/usr（与 kvspace-c 对齐），前端与后端同装 <prefix>/lib/kvspace。
+if(CMAKE_INSTALL_PREFIX_INITIALIZED_TO_DEFAULT)
+    set(CMAKE_INSTALL_PREFIX "/usr" CACHE PATH "" FORCE)
+endif()
+
 add_library(kvspace SHARED src/frontend.c)
 
 # 前端 SONAME：libkvspace.so.1
@@ -26,7 +31,7 @@ target_link_libraries(kvspace PRIVATE dl)
 target_compile_definitions(kvspace PRIVATE _GNU_SOURCE)
 
 install(TARGETS kvspace
-    LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
+    LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}/kvspace
 )
 install(DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/include/ DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
 
