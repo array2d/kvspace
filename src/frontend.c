@@ -313,6 +313,12 @@ static int build_langtype(char *buf, size_t cap, const char *kind, uint8_t store
 }
 
 /* 由 base 种类名（+ndim）推 storetype——便利编码函数用；WriteNewPlace 直接收 storetype。 */
+/* map langtype：`{memitemkeylangtype}·{memitemvaluelangtype}`（见 spec [[map容器]]）。值容器物理
+ * 布局恒 index（成员名索引落兄弟槽 `{key}·`）——`·` 之前的方括号是键类型，绝非维度。 */
+static int is_map_langtype(const char *kind) {
+    return kind && strstr(kind, KVSPACE_MEMBER_SEP) != NULL;
+}
+
 static int is_index_kind(const char *kind) {
     return strcmp(kind, KVSPACE_KIND_INDEX) == 0
         || strcmp(kind, KVSPACE_KIND_EXT_INDEX) == 0
@@ -322,7 +328,7 @@ static int is_index_kind(const char *kind) {
 static uint8_t storetype_of(const char *kind, int ndim) {
     if (!kind || !kind[0]) return KVSPACE_STORETYPE_NONE;
     if (strcmp(kind, KVSPACE_KIND_EXT_INDEX) == 0) return KVSPACE_STORETYPE_EXTINDEX;
-    if (is_index_kind(kind)) return KVSPACE_STORETYPE_INDEX;
+    if (is_index_kind(kind) || is_map_langtype(kind)) return KVSPACE_STORETYPE_INDEX;
     if (ndim > 0) return KVSPACE_STORETYPE_ARRAYND;
     return KVSPACE_STORETYPE_ATOM;
 }
