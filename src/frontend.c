@@ -48,6 +48,12 @@ typedef struct {
     int  (*clear)(void *h, char *err, uint32_t err_cap);
     int  (*watch)(void *h, const char *key, const uint8_t *target, uint32_t target_len,
                   uint64_t tick_ns, uint8_t **out, uint32_t *out_len);
+    int  (*resolveref)(void *h, const char *key, kvspaceRef_t *ref);
+    int  (*getbyref)(void *h, kvspaceRef_t *ref, const char *key_fallback,
+                     uint8_t **out, uint32_t *out_len);
+    int  (*setpartbyref)(void *h, kvspaceRef_t *ref, const char *key_fallback,
+                         uint32_t offset, const uint8_t *buf, uint32_t buf_len,
+                         char *err, uint32_t err_cap);
 } kvspace_vt;
 
 typedef struct {
@@ -128,6 +134,9 @@ void *kvspaceConnect(const char *dsn) {
     LOAD(clear, "kvspaceClear");
     LOAD(watch, "kvspaceWatch");
     #undef LOAD
+    *(void **)&vt->resolveref = dlsym(dl, "kvspaceResolveRef");
+    *(void **)&vt->getbyref = dlsym(dl, "kvspaceGetByRef");
+    *(void **)&vt->setpartbyref = dlsym(dl, "kvspaceSetPartByRef");
 
     void *(*connect)(const char *) = dlsym(dl, "kvspaceConnect");
     if (!connect) { free(vt); dlclose(dl); return NULL; }
@@ -154,6 +163,33 @@ void kvspaceClose(void *h) {
 int kvspaceGet(void *h, const char *key, int resolve, uint8_t **out, uint32_t *out_len) {
     kvspace_handle *x = H(h);
     return x->vt->get(x->backend, key, resolve, out, out_len);
+}
+
+int kvspaceResolveRef(void *h, const char *key, kvspaceRef_t *ref) {
+    kvspace_handle *x = H(h);
+    if (!x->vt->resolveref) return 1;
+    return x->vt->resolveref(x->backend, key, ref);
+}
+
+int kvspaceGetByRef(void *h, kvspaceRef_t *ref, const char *key_fallback,
+                    uint8_t **out, uint32_t *out_len) {
+    kvspace_handle *x = H(h);
+    if (x->vt->getbyref)
+        return x->vt->getbyref(x->backend, ref, key_fallback, out, out_len);
+    if (!key_fallback) { *out = NULL; *out_len = 0; return 0; }
+    return x->vt->get(x->backend, key_fallback, 0, out, out_len);
+}
+
+int kvspaceSetPartByRef(void *h, kvspaceRef_t *ref, const char *key_fallback,
+                        uint32_t offset, const uint8_t *buf, uint32_t buf_len,
+                        char *err, uint32_t err_cap) {
+    kvspace_handle *x = H(h);
+    if (x->vt->setpartbyref)
+        return x->vt->setpartbyref(x->backend, ref, key_fallback, offset, buf,
+                                   buf_len, err, err_cap);
+    if (err && err_cap)
+        snprintf(err, err_cap, "kvspace: set-part-by-ref unsupported");
+    return 1;
 }
 
 void kvspaceReadReset(void *h) {
