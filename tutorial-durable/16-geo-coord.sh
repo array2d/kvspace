@@ -14,6 +14,7 @@ KV="$HOME/.local/bin/kvspace"
 $KV deltree /geo/
 
 echo "=== geo list ==="
+$KV set /geo· 'map[0]:'   # 先声明容器（memhead），否则成员写被拒
 $KV set '/geo·[39.9,116.4]' 'string:Beijing'
 $KV set '/geo·[31.23,121.47]' 'string:Shanghai'
 $KV list /geo· --kind --showext=false

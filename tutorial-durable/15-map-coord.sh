@@ -9,7 +9,7 @@
 # === get ===
 # /m·[1,2]	float32:6.28000020980835
 # /m·[9,9]	(nil)
-# === obj vs coord ===
+# === 命名成员 vs 坐标成员 ===
 # [0]	2
 # x	1
 # /end
@@ -32,8 +32,8 @@ $KV list /m· --kind --showext=false
 echo "=== get ==="
 $KV get '/m·[1,2]' '/m·[9,9]'
 
-echo "=== obj vs coord ==="
-$KV set /h· 'object:'
+echo "=== 命名成员 vs 坐标成员 ==="
+$KV set /h· 'map[0]:'   # 显式声明容器（memhead），并建 memindex；object kind 已移除
 $KV set /h·x 'int:1'
 $KV set '/h·[0]' 'int:2'
 $KV list /h· --kind=false --showext=false
