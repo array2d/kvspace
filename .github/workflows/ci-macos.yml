@@ -1,0 +1,13 @@
+name: ci-macos
+on: [push, pull_request]
+jobs:
+  build:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: 构建
+        run: |
+          cmake -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/usr/local
+          cmake --build build
+      - name: 安装（验证安装规则）
+        run: sudo cmake --install build
