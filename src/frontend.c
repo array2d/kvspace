@@ -4,10 +4,10 @@
  * （RTLD_NOW | RTLD_LOCAL）装载后端，把 handle 包一层 {vtable, dl, backend}。
  * codec（TlvEncode、DecodeHead、New 等）无 handle，由前端静态实现，byte-identical。
  *
- * 后端装载名：
- *   shm://...           → libkvspace-c.so.1
- *   其余（redis/fs/s3） → libkvspace_durable.so.1
- * 目录由 KVSPACE_BACKEND_PATH 覆盖（默认走动态链接器搜索路径）。
+ * 后端装载名（后缀随平台）：
+ *   shm://...           → libkvspace-c.so.1       / macOS: libkvspace-c.dylib
+ *   其余（redis/fs/s3） → libkvspace_durable.so.1 / macOS: libkvspace_durable.dylib
+ * 目录由 KVSPACE_BACKEND_PATH 覆盖，默认 Linux /usr/lib/kvspace、macOS /usr/local/lib/kvspace。
  */
 
 #include "kvspace/kvspace.h"
@@ -60,15 +60,27 @@ static kvspace_handle *H(void *h) { return (kvspace_handle *)h; }
 
 /* ── 后端选择 ───────────────────────────────────────────────────────── */
 
+/* 后端库名：Linux 为 .so.1，macOS 为 .dylib。 */
 static const char *backend_soname(const char *dsn) {
-    return (dsn && strncmp(dsn, "shm://", 6) == 0)
-        ? "libkvspace-c.so.1"
-        : "libkvspace_durable.so.1";
+    int is_shm = dsn && strncmp(dsn, "shm://", 6) == 0;
+#if defined(__APPLE__)
+    return is_shm ? "libkvspace-c.dylib" : "libkvspace_durable.dylib";
+#else
+    return is_shm ? "libkvspace-c.so.1" : "libkvspace_durable.so.1";
+#endif
 }
 
+/* 后端目录默认值：Linux /usr/lib/kvspace；macOS /usr/local/lib/kvspace（/usr 受 SIP 保护）。
+ * KVSPACE_BACKEND_PATH 可覆盖。 */
 static char *backend_path(const char *soname, char *buf, size_t cap) {
     const char *dir = getenv("KVSPACE_BACKEND_PATH");
-    if (!dir || !dir[0]) dir = "/usr/lib/kvspace";
+    if (!dir || !dir[0]) {
+#if defined(__APPLE__)
+        dir = "/usr/local/lib/kvspace";
+#else
+        dir = "/usr/lib/kvspace";
+#endif
+    }
     snprintf(buf, cap, "%s/%s", dir, soname);
     return buf;
 }
