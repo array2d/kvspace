@@ -13,16 +13,20 @@ jobs:
       - uses: actions/checkout@v4
       - name: 构建
         run: cmake -B build && cmake --build build
+      - name: 构建 CLI（cli/ 独立 Cargo 项目，走 dispatch 前端 C ABI）
+        run: cargo build --release --manifest-path cli/Cargo.toml
       - name: 打包 ABI 产物
         run: |
           set -euo pipefail
           v="${GITHUB_REF_NAME}"
           d="kvspace-abi-$v-linux-x86_64"
-          mkdir -p "$d/include" "$d/lib"
+          mkdir -p "$d/include" "$d/lib" "$d/bin"
           cp -r include/kvspace "$d/include/"
           cp build/libkvspace.so* "$d/lib/"
+          cp cli/target/release/kvspace "$d/bin/"
           printf '{"abi":"%s"}\n' "$v" > "$d/abi-manifest.json"
           tar czf "$d.tar.gz" "$d"
+          tar tzf "$d.tar.gz"
           sha256sum "$d.tar.gz" > SHA256SUMS
       - name: 发布 release
         run: gh release create "${GITHUB_REF_NAME}" kvspace-abi-*.tar.gz SHA256SUMS --generate-notes
