@@ -68,9 +68,15 @@ void  kvspaceClose(void *h);
  * 调用方不得 free。resolve=1 穿透 link。key 不存在/空值 → *out=NULL、*out_len=0、返回 0。 */
 int kvspaceGet(void *h, const char *key, int resolve, uint8_t **out, uint32_t *out_len);
 
+/* ResolveRef：block_id=叶子、gen=0；parent_id=目录祖先 ART 节点，
+ * depth=进入该节点时 key 已消费字节数。GetByRef：gen==0 直取叶子；
+ * gen>0 则 block_id 为父节点、gen 为 depth，从该处续走剩余字节。
+ * 后端未实现父节点时 parent_id 保持 0。 */
 typedef struct {
     uint32_t block_id;
     uint32_t gen;
+    uint32_t parent_id;
+    uint32_t depth;
 } kvspaceRef_t;
 int kvspaceResolveRef(void *h, const char *key, kvspaceRef_t *ref);
 int kvspaceGetByRef(void *h, kvspaceRef_t *ref, const char *key_fallback,
