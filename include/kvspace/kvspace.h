@@ -61,7 +61,6 @@ typedef struct {
 /* ── 生命周期 ─────────────────────────────────────────────────── */
 void *kvspaceConnect(const char *dsn);
 void  kvspaceClose(void *h);
-int   kvspaceDisconnect(void *h, char *err, uint32_t err_cap);
 
 /* ── 单点读写 / 目录 ──────────────────────────────────────────── */
 

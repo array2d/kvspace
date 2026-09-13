@@ -4,10 +4,10 @@
  * （RTLD_NOW | RTLD_LOCAL）装载后端，把 handle 包一层 {vtable, dl, backend}。
  * codec（TlvEncode、DecodeHead、New 等）无 handle，由前端静态实现，byte-identical。
  *
- * 后端装载名：
- *   shm://...           → libkvspace-c.so.1
- *   其余（redis/fs/s3） → libkvspace_durable.so.1
- * 目录由 KVSPACE_BACKEND_PATH 覆盖（默认走动态链接器搜索路径）。
+ * 后端装载名（后缀随平台）：
+ *   shm://...           → libkvspace-c.so.1       / macOS: libkvspace-c.dylib
+ *   其余（redis/fs/s3） → libkvspace_durable.so.1 / macOS: libkvspace_durable.dylib
+ * 目录由 KVSPACE_BACKEND_PATH 覆盖，默认 Linux /usr/lib/kvspace、macOS /usr/local/lib/kvspace。
  */
 
 #include "kvspace/kvspace.h"
@@ -22,7 +22,6 @@
 
 typedef struct {
     void (*free)(void *h);
-    int  (*disconnect)(void *h, char *err, uint32_t err_cap);
     int  (*get)(void *h, const char *key, int resolve, uint8_t **out, uint32_t *out_len);
     void (*readreset)(void *h);
     int  (*getpart)(void *h, const char *key, uint32_t offset, uint32_t len,
@@ -67,15 +66,27 @@ static kvspace_handle *H(void *h) { return (kvspace_handle *)h; }
 
 /* ── 后端选择 ───────────────────────────────────────────────────────── */
 
+/* 后端库名：Linux 为 .so.1，macOS 为 .dylib。 */
 static const char *backend_soname(const char *dsn) {
-    return (dsn && strncmp(dsn, "shm://", 6) == 0)
-        ? "libkvspace-c.so.1"
-        : "libkvspace_durable.so.1";
+    int is_shm = dsn && strncmp(dsn, "shm://", 6) == 0;
+#if defined(__APPLE__)
+    return is_shm ? "libkvspace-c.dylib" : "libkvspace_durable.dylib";
+#else
+    return is_shm ? "libkvspace-c.so.1" : "libkvspace_durable.so.1";
+#endif
 }
 
+/* 后端目录默认值：Linux /usr/lib/kvspace；macOS /usr/local/lib/kvspace（/usr 受 SIP 保护）。
+ * KVSPACE_BACKEND_PATH 可覆盖。 */
 static char *backend_path(const char *soname, char *buf, size_t cap) {
     const char *dir = getenv("KVSPACE_BACKEND_PATH");
-    if (!dir || !dir[0]) dir = "/usr/lib/kvspace";
+    if (!dir || !dir[0]) {
+#if defined(__APPLE__)
+        dir = "/usr/local/lib/kvspace";
+#else
+        dir = "/usr/lib/kvspace";
+#endif
+    }
     snprintf(buf, cap, "%s/%s", dir, soname);
     return buf;
 }
@@ -115,7 +126,6 @@ void *kvspaceConnect(const char *dsn) {
     } while (0)
 
     LOAD(free, "kvspaceClose");
-    LOAD(disconnect, "kvspaceDisconnect");
     LOAD(get, "kvspaceGet");
     LOAD(readreset, "kvspaceReadReset");
     LOAD(getpart, "kvspaceGetPart");
@@ -158,11 +168,6 @@ void kvspaceClose(void *h) {
     if (x->dl) dlclose(x->dl);
     free(x->vt);
     free(x);
-}
-
-int kvspaceDisconnect(void *h, char *err, uint32_t err_cap) {
-    kvspace_handle *x = H(h);
-    return x->vt->disconnect ? x->vt->disconnect(x->backend, err, err_cap) : 0;
 }
 
 /* ── 单点读写 / 目录（trampoline） ─────────────────────────────────── */
@@ -349,6 +354,12 @@ static int build_langtype(char *buf, size_t cap, const char *kind, uint8_t store
 }
 
 /* 由 base 种类名（+ndim）推 storetype——便利编码函数用；WriteNewPlace 直接收 storetype。 */
+/* map langtype：`{memitemkeylangtype}·{memitemvaluelangtype}`（见 spec [[map容器]]）。值容器物理
+ * 布局恒 index（成员名索引落兄弟槽 `{key}·`）——`·` 之前的方括号是键类型，绝非维度。 */
+static int is_map_langtype(const char *kind) {
+    return kind && strstr(kind, KVSPACE_MEMBER_SEP) != NULL;
+}
+
 static int is_index_kind(const char *kind) {
     return strcmp(kind, KVSPACE_KIND_INDEX) == 0
         || strcmp(kind, KVSPACE_KIND_EXT_INDEX) == 0
@@ -358,7 +369,7 @@ static int is_index_kind(const char *kind) {
 static uint8_t storetype_of(const char *kind, int ndim) {
     if (!kind || !kind[0]) return KVSPACE_STORETYPE_NONE;
     if (strcmp(kind, KVSPACE_KIND_EXT_INDEX) == 0) return KVSPACE_STORETYPE_EXTINDEX;
-    if (is_index_kind(kind)) return KVSPACE_STORETYPE_INDEX;
+    if (is_index_kind(kind) || is_map_langtype(kind)) return KVSPACE_STORETYPE_INDEX;
     if (ndim > 0) return KVSPACE_STORETYPE_ARRAYND;
     return KVSPACE_STORETYPE_ATOM;
 }

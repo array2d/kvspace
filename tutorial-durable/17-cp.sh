@@ -33,7 +33,7 @@ $KV get /dst/one
 
 # cpdir 复制 · 成员容器（base + memindex + 成员）
 echo "=== cpdir memindex container ==="
-$KV set /p· index:
+$KV set /p· 'map[0]:'   # 容器值（memhead）+ memindex；index: 只建 memindex，成员写会被拒
 $KV set /p·x float:3.14
 $KV set /p·y int:42
 $KV cpdir /p /q
