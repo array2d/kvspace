@@ -60,6 +60,10 @@ typedef struct {
 
 /* ── 生命周期 ─────────────────────────────────────────────────── */
 void *kvspaceConnect(const char *dsn);
+
+/* 关闭：关闭前落盘未决写（失败写 stderr，绝不静默）。
+ * 进程正常退出（exit / main 返回）时，前端对所有未 Close 句柄兜底关闭即落盘——
+ * 漏调 Close 不丢数据，真丢也绝不静默。 */
 void  kvspaceClose(void *h);
 
 /* ── 单点读写 / 目录 ──────────────────────────────────────────── */
@@ -104,13 +108,16 @@ int kvspaceSetPart(void *h, const char *key, uint32_t offset, const uint8_t *buf
 int kvspaceGetHead(void *h, const char *key, kvspaceHead_t *out);
 
 /* 就地写：key 必须已存在、kind 不变、body_len 必须等于原 body_len——返回原 box 的 body
- * 偏移指针供调用方直接写。违反前置条件 → 非 0 + err（绝不静默重分配、绝不回落）。写即持久。 */
+ * 偏移指针供调用方直接写。违反前置条件 → 非 0 + err（绝不静默重分配、绝不回落）。
+ * 落盘时机：body 由调用方在返回后填，故本笔在下一次 kvspace* 调用（读也算）或 kvspaceClose
+ * 时落盘；前者失败以返回码 + err 报出，后者失败写 stderr。 */
 int kvspaceWriteInPlace(void *h, const char *key, int resolve, uint32_t body_len,
                         uint8_t **body, char *err, uint32_t err_cap);
 
 /* 新位置写：按 (ref, storetype, ro, vid, langtype, body_len) 分配新 box、写好 head，返回 body
  * 偏移指针供直接写。ARRAYND 的 dims 由 codec 从 langtype 串内的 [dims] 解析落入物理字段。
- * 用于新建 key 或 storetype/尺寸变化。写即持久。 */
+ * 用于新建 key 或 storetype/尺寸变化。落盘时机同 WriteInPlace：本笔在下一次 kvspace* 调用
+ * 或 kvspaceClose 时落盘。 */
 int kvspaceWriteNewPlace(void *h, const char *key, uint8_t ref, uint8_t storetype,
                          uint8_t ro, uint32_t vid, const char *langtype, uint32_t body_len,
                          uint8_t **body, char *err, uint32_t err_cap);

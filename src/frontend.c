@@ -1,8 +1,8 @@
 /* frontend.c — KVSpace dispatch 前端。
  *
- * 导出与两个后端完全相同的 27 个 kvspace* 符号。运行期按 DSN scheme 用 dlopen
+ * 导出 kvspace* C ABI（与两个后端同名同签名）。运行期按 DSN scheme 用 dlopen
  * （RTLD_NOW | RTLD_LOCAL）装载后端，把 handle 包一层 {vtable, dl, backend}。
- * codec（TlvEncode、DecodeHead、New 等）无 handle，由前端静态实现，byte-identical。
+ * codec（TlvEncode、DecodeHead、New 等）与 kvspaceConst 无 handle，由前端静态实现，byte-identical。
  *
  * 后端装载名（后缀随平台）：
  *   shm://...           → libkvspace-c.so.1       / macOS: libkvspace-c.dylib
@@ -13,6 +13,7 @@
 #include "kvspace/kvspace.h"
 
 #include <dlfcn.h>
+#include <pthread.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -56,13 +57,47 @@ typedef struct {
                          char *err, uint32_t err_cap);
 } kvspace_vt;
 
-typedef struct {
+typedef struct kvspace_handle {
     kvspace_vt *vt;
     void       *dl;
     void       *backend;
+    struct kvspace_handle *next;
 } kvspace_handle;
 
 static kvspace_handle *H(void *h) { return (kvspace_handle *)h; }
+
+/* 活跃句柄表：durable 的写侧惰性（body 由调用方在返回后填，落盘延到下一次 op），故漏调
+ * Close 就退出会丢最后一笔写。进程正常退出时前端兜底落盘再关闭，兑现 kvspace.h 的退出保证。 */
+static kvspace_handle  *live;
+static int              live_hooked;
+static pthread_mutex_t  live_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static void handle_free(kvspace_handle *x) {
+    x->vt->free(x->backend);
+    dlclose(x->dl);
+    free(x->vt);
+    free(x);
+}
+
+static void live_unlink(kvspace_handle *x) {
+    pthread_mutex_lock(&live_lock);
+    for (kvspace_handle **p = &live; *p; p = &(*p)->next)
+        if (*p == x) { *p = x->next; break; }
+    pthread_mutex_unlock(&live_lock);
+}
+
+/* 退出兜底：未 Close 句柄逐个关闭——durable 的 Close 落盘未决写，落盘失败由后端自己写
+ * stderr。数据可以丢（后端故障），但绝不静默。 */
+static void exit_close(void) {
+    for (;;) {
+        pthread_mutex_lock(&live_lock);
+        kvspace_handle *x = live;
+        if (x) live = x->next;
+        pthread_mutex_unlock(&live_lock);
+        if (!x) return;
+        handle_free(x);
+    }
+}
 
 /* ── 后端选择 ───────────────────────────────────────────────────────── */
 
@@ -158,16 +193,20 @@ void *kvspaceConnect(const char *dsn) {
     kvspace_handle *h = malloc(sizeof(*h));
     if (!h) { free(vt); dlclose(dl); return NULL; }
     h->vt = vt; h->dl = dl; h->backend = backend;
+
+    pthread_mutex_lock(&live_lock);
+    h->next = live;
+    live = h;
+    if (!live_hooked) { live_hooked = 1; atexit(exit_close); }
+    pthread_mutex_unlock(&live_lock);
     return h;
 }
 
 void kvspaceClose(void *h) {
     if (!h) return;
     kvspace_handle *x = H(h);
-    if (x->vt->free) x->vt->free(x->backend);
-    if (x->dl) dlclose(x->dl);
-    free(x->vt);
-    free(x);
+    live_unlink(x);
+    handle_free(x);
 }
 
 /* ── 单点读写 / 目录（trampoline） ─────────────────────────────────── */
