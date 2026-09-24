@@ -26,8 +26,10 @@ target_include_directories(kvspace
         $<INSTALL_INTERFACE:include>
 )
 
-# dlopen/dlsym 的宿主库：Linux 为 libdl，macOS 在 libSystem 内（CMAKE_DL_LIBS 两者皆正确）
-target_link_libraries(kvspace PRIVATE ${CMAKE_DL_LIBS})
+# 活跃句柄表（退出兜底落盘）用 pthread 互斥；dlopen/dlsym 的宿主库 Linux 为 libdl，
+# macOS 在 libSystem 内（CMAKE_DL_LIBS 两者皆正确）。
+find_package(Threads REQUIRED)
+target_link_libraries(kvspace PRIVATE ${CMAKE_DL_LIBS} Threads::Threads)
 
 target_compile_definitions(kvspace PRIVATE _GNU_SOURCE)
 

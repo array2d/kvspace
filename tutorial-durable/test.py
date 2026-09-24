@@ -1,13 +1,15 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """运行 tutorial/*.sh，对比脚本头部注释中的 expected 输出；
-并交叉校验 kvspace-c 与 kvspace-durable 的 head 编解码（rw/vid）字节一致。"""
+交叉校验 kvspace-c 与 kvspace-durable 的 head 编解码（rw/vid）字节一致；
+并回归写侧落盘时机：下一次 op 落盘与退出兜底（issue #23）。"""
 
 import ctypes
 import os
 import struct
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent  # kvspace/
@@ -15,6 +17,7 @@ WS = ROOT.parent  # array2d/
 DURABLE_SO = WS / "kvspace-durable" / "target" / "release" / "libkvspace_durable.so"
 KVSPACE_C_DIR = WS / "kvspace-c"
 KVSPACE_C_SO = KVSPACE_C_DIR / "build" / "libkvspace-c.so"
+FRONTEND_SO = os.environ.get("KVSPACE_SO", "/usr/lib/kvspace/libkvspace.so.1")
 
 def extract_expected(script):
     """从脚本头部 # expected: ... # /end 提取预期输出行。"""
@@ -161,6 +164,85 @@ def test_kvspace_c_alignment():
     return ok
 
 
+# ── 写侧落盘时机（issue #23）─────────────────────────────────────────
+#
+# 写把 TLV 攒在句柄内（body 由调用方在返回后填，返回前无法落盘）：下一次 op 落盘上一笔
+# （读也是 op），另一个句柄随即可见；漏调 Close 而正常退出时由前端退出兜底落盘。子进程必须
+# 独立——它正是「不 Close 就退出」的那一个。
+
+CHILD = r'''
+import ctypes, sys
+U8P = ctypes.POINTER(ctypes.c_uint8)
+lib = ctypes.CDLL(sys.argv[1])
+lib.kvspaceConnect.restype = ctypes.c_void_p
+lib.kvspaceConnect.argtypes = [ctypes.c_char_p]
+lib.kvspaceDelTree.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_char_p, ctypes.c_uint32]
+lib.kvspaceWriteNewPlace.argtypes = [
+    ctypes.c_void_p, ctypes.c_char_p, ctypes.c_uint8, ctypes.c_uint8, ctypes.c_uint8,
+    ctypes.c_uint32, ctypes.c_char_p, ctypes.c_uint32,
+    ctypes.POINTER(U8P), ctypes.c_char_p, ctypes.c_uint32]
+lib.kvspaceGet.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_int,
+    ctypes.POINTER(U8P), ctypes.POINTER(ctypes.c_uint32)]
+err = ctypes.create_string_buffer(256)
+
+def put(h, key, val):
+    body = U8P()
+    lt = ("[%d]char/utf8" % len(val)).encode()
+    assert lib.kvspaceWriteNewPlace(h, key, 0, 2, 0, 0, lt, len(val),
+                                    ctypes.byref(body), err, 256) == 0, err.value
+    ctypes.memmove(body, val, len(val))
+
+def get(h, key):
+    out, n = U8P(), ctypes.c_uint32()
+    lib.kvspaceGet(h, key, 0, ctypes.byref(out), ctypes.byref(n))
+    return None if not out else ctypes.string_at(out, n.value)
+
+h1 = lib.kvspaceConnect(sys.argv[2].encode())
+lib.kvspaceDelTree(h1, b"/flushprobe/", err, 256)
+put(h1, b"/flushprobe/a", b"va")
+put(h1, b"/flushprobe/b", b"vb")
+put(h1, b"/flushprobe/c", b"vc")
+get(h1, b"/flushprobe/a")          # 任意一次 op 先把上一笔（c）落盘
+h2 = lib.kvspaceConnect(sys.argv[2].encode())
+print("next-op-visible", get(h2, b"/flushprobe/c") is not None)
+put(h1, b"/flushprobe/d", b"vd")   # 留作未决写：不再发 op、不 Close，直接正常退出
+sys.exit(0)
+'''
+
+
+def test_exit_flush():
+    """写侧落盘时机：下一次 op 即落盘上一笔；漏调 Close 正常退出不丢最后一笔。"""
+    if not Path(FRONTEND_SO).exists():
+        print(f'FAIL  exit-flush (缺前端 {FRONTEND_SO})')
+        return False
+    kvbin = os.path.expanduser('~/.local/bin/kvspace')
+    env = os.environ.copy()
+    keys = ['/flushprobe/a', '/flushprobe/b', '/flushprobe/c', '/flushprobe/d']
+    with tempfile.TemporaryDirectory() as tmp:
+        cases = [
+            ('redis', env.get('KVSPACE', 'redis://127.0.0.1:6379')),
+            ('fs', f'fs://{tmp}/fs'),
+            ('shm', f'shm://{tmp}/probe.shm'),
+        ]
+        ok = True
+        for label, dsn in cases:
+            child = subprocess.run([sys.executable, '-c', CHILD, FRONTEND_SO, dsn],
+                                   capture_output=True, text=True, timeout=30)
+            seen = 'next-op-visible True' in child.stdout
+            # 子进程已退出（未 Close）：经 CLI 复核四笔全在，最后一笔由退出兜底落盘。
+            got = subprocess.run([kvbin, 'get', *keys], capture_output=True, text=True,
+                                 timeout=10, env={**env, 'KVSPACE': dsn})
+            kept = [l for l in got.stdout.splitlines() if 'char/utf8:v' in l]
+            if seen and len(kept) == len(keys):
+                print(f'PASS  exit-flush {label}')
+            else:
+                print(f'FAIL  exit-flush {label} (next-op-visible={seen}, 落地 {len(kept)}/{len(keys)})')
+                if child.stderr:
+                    print(f'  child stderr: {child.stderr.strip()}')
+                ok = False
+        return ok
+
+
 def main():
     here = os.path.dirname(os.path.abspath(__file__))
     scripts = sorted(
@@ -173,6 +255,7 @@ def main():
 
     results = [test_script(s) for s in scripts]
     results.append(test_kvspace_c_alignment())
+    results.append(test_exit_flush())
     passed = sum(results)
     print(f'\n{passed}/{len(results)} passed')
     sys.exit(0 if passed == len(results) else 1)
