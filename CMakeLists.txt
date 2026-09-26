@@ -12,7 +12,19 @@ if(CMAKE_INSTALL_PREFIX_INITIALIZED_TO_DEFAULT)
     set(CMAKE_INSTALL_PREFIX "/usr" CACHE PATH "" FORCE)
 endif()
 
-add_library(kvspace SHARED src/frontend.c)
+add_library(kvspace SHARED src/frontend.c src/codec_abi.c src/xvalue_head.c src/xvalue_meta.c)
+
+include(CTest)
+if(BUILD_TESTING)
+    add_executable(test_xvalue_head tests/test_xvalue_head.c)
+    target_include_directories(test_xvalue_head PRIVATE src)
+    target_link_libraries(test_xvalue_head PRIVATE kvspace)
+    add_test(NAME xvalue_head COMMAND test_xvalue_head)
+    add_executable(test_codec_abi tests/test_codec_abi.c)
+    target_include_directories(test_codec_abi PRIVATE src)
+    target_link_libraries(test_codec_abi PRIVATE kvspace)
+    add_test(NAME codec_abi COMMAND test_codec_abi)
+endif()
 
 # 前端 SONAME：libkvspace.so.1
 set_target_properties(kvspace PROPERTIES
@@ -37,6 +49,9 @@ install(TARGETS kvspace
     LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}/kvspace
 )
 install(DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/include/ DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
+install(FILES ${CMAKE_CURRENT_SOURCE_DIR}/src/xvalue_head.h
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/xvalue_meta.h
+    DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/kvspace)
 
 configure_file(kvspace.pc.in ${CMAKE_CURRENT_BINARY_DIR}/kvspace.pc @ONLY)
 install(FILES ${CMAKE_CURRENT_BINARY_DIR}/kvspace.pc DESTINATION ${CMAKE_INSTALL_LIBDIR}/pkgconfig)

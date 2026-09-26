@@ -6,18 +6,9 @@
  *   shm://...      → libkvspace-c.so.1
  *   其余（redis/fs/s3）→ libkvspace_durable.so.1
  *
- * 头格式（byte-identical，两边一致，由前端静态实现 codec）：
- *   head = [headlen u16 LE][ref u8][storetype u8][ro u8][vid u32 LE][body_len u32 LE]
- *          [storetype 物理字段（变长，按 storetype）][langtype kindexpr 串（占至 headlen）]
- *   body = [body_len B raw]
- *
- *   三正交轴：
- *     ref       存储位置：0=inline（body=值本体）/1=ptr（body=目标 key）/2=@ext（body=扩展定位符）
- *     storetype 物理布局（codec 唯一分派）：NONE / ATOM / ARRAYND / index / extindex
- *     langtype  语义类型真相：完整 kindexpr 串（含 [dims]、map key·value、struct 原型路径、def 族名），
- *               恒为 head 最后一段，无独立长度字段（长度 = headlen − 当前偏移），不含 ptr/ext 前缀。
- *   物理字段：ARRAYND = ndim u8 + dims[ndim] u32 LE；index/extindex = 成员名矩阵 dims=[len,cap,M]。
- *   body 起始偏移 = headlen。None：storetype=NONE、langtype=""、body 空。
+ * Wire: [pow:u8][flags:u8][a:u64le][b:u64le][langtype][padding][body].
+ * Head length is 1 << pow; flags hold the storage class and pointer bit.
+ * ro/vid are stored under /.kvspace-meta/, outside the XValue.
  */
 
 #ifndef KVSPACE_H
@@ -31,31 +22,31 @@
 extern "C" {
 #endif
 
-/* ref：存储位置维（head 第 2 字节）。只决定 body 语义与是否间接寻址。 */
-#define KVSPACE_REF_INLINE 0  /* body = 值本体 raw */
-#define KVSPACE_REF_PTR    1  /* body = 目标 key 路径（软链接，单跳同型） */
-#define KVSPACE_REF_EXT    2  /* body = 扩展世界定位符（fs 文件 / gpu tensordata） */
+/* Decoded location kind. */
+#define KVSPACE_REF_INLINE 0
+#define KVSPACE_REF_PTR    1
+#define KVSPACE_REF_EXT    2
 
-/* storetype：物理布局维（head 第 3 字节，codec 唯一分派）。 */
-#define KVSPACE_STORETYPE_NONE     0  /* 无物理字段，body 空 */
-#define KVSPACE_STORETYPE_ATOM     1  /* 无物理字段，body 定宽 raw */
-#define KVSPACE_STORETYPE_ARRAYND  2  /* 物理字段 ndim u8 + dims[ndim] u32 LE，body 稠密等宽数组 */
-#define KVSPACE_STORETYPE_INDEX    3  /* 成员名矩阵 dims=[len,cap,M]（静态目录/值容器） */
-#define KVSPACE_STORETYPE_EXTINDEX 4  /* 同 index，cap 可增长（运行栈等） */
+/* Storage classes are the low two wire flag bits. */
+#define KVSPACE_STORETYPE_FIXED_SMALL 0
+#define KVSPACE_STORETYPE_SLACK       1
+#define KVSPACE_STORETYPE_FIXED_LARGE 2
+#define KVSPACE_STORETYPE_EXT         3
 
-/* XValue 头（repr C）。三正交轴 ref/storetype/langtype；body 靠 headlen 定位。 */
+/* Decoded XValue metadata. ro/vid come from the sidecar key on GetHead. */
 typedef struct {
     uint16_t headlen;       /* head 总字节数；body 起于偏移 headlen */
     uint8_t  ref;           /* 存储位置：见 KVSPACE_REF_* */
-    uint8_t  storetype;     /* 物理布局：见 KVSPACE_STORETYPE_* */
+    uint8_t  storetype;     /* Storage class. */
     uint8_t  ro;            /* 1=只读，0=可写 */
     uint32_t vid;           /* vthread id（默认 0） */
     int32_t  body_len;      /* body 字节数 */
-    int32_t  ndim;          /* ARRAYND：维数；index/extindex：3（[len,cap,M]）；NONE/ATOM：0 */
-    int32_t  dims[8];       /* ARRAYND：各维长度；index/extindex：[len,cap,M] */
+    int32_t  ndim;          /* Tensor dimensions; zero for other values. */
+    int32_t  dims[8];       /* Tensor shape. */
     char     langtype[256]; /* 语义类型 kindexpr 串，NUL 终止（含 [dims]、无 ptr/ext 前缀） */
     int32_t  langtype_len;  /* langtype 内容长度（去 padding） */
     int32_t  body_offset;   /* body 在 data 内的起始偏移（= headlen） */
+    uint64_t body_cap;
 } kvspaceHead_t;
 
 /* ── 生命周期 ─────────────────────────────────────────────────── */
@@ -71,6 +62,9 @@ void  kvspaceClose(void *h);
 /* 借用读：*out 指向后端常驻空间（shm mmap / durable 借用池），生命周期同该槽，
  * 调用方不得 free。resolve=1 穿透 link。key 不存在/空值 → *out=NULL、*out_len=0、返回 0。 */
 int kvspaceGet(void *h, const char *key, int resolve, uint8_t **out, uint32_t *out_len);
+/* Store a complete XValue before returning. */
+int kvspaceSetValue(void *h, const char *key, const uint8_t *value, uint32_t value_len,
+                    uint8_t ro, uint32_t vid, char *err, uint32_t err_cap);
 
 /* ResolveRef：block_id=叶子、gen=0；parent_id=目录祖先 ART 节点，
  * depth=进入该节点时 key 已消费字节数。GetByRef：gen==0 直取叶子；
@@ -103,8 +97,7 @@ int kvspaceGetPart(void *h, const char *key, uint32_t offset, uint32_t len,
 int kvspaceSetPart(void *h, const char *key, uint32_t offset, const uint8_t *buf,
                     uint32_t buf_len, char *err, uint32_t err_cap);
 
-/* 读 head：只读值前缀并解码三正交轴 head（不取 body），供 xv 系列不借整块即得元数据。
- * 空/不存在 → 返回非 0。 */
+/* Read the wire head and ro/vid sidecar. Missing keys return nonzero. */
 int kvspaceGetHead(void *h, const char *key, kvspaceHead_t *out);
 
 /* 就地写：key 必须已存在、kind 不变、body_len 必须等于原 body_len——返回原 box 的 body
@@ -114,12 +107,10 @@ int kvspaceGetHead(void *h, const char *key, kvspaceHead_t *out);
 int kvspaceWriteInPlace(void *h, const char *key, int resolve, uint32_t body_len,
                         uint8_t **body, char *err, uint32_t err_cap);
 
-/* 新位置写：按 (ref, storetype, ro, vid, langtype, body_len) 分配新 box、写好 head，返回 body
- * 偏移指针供直接写。ARRAYND 的 dims 由 codec 从 langtype 串内的 [dims] 解析落入物理字段。
- * 用于新建 key 或 storetype/尺寸变化。落盘时机同 WriteInPlace：本笔在下一次 kvspace* 调用
- * 或 kvspaceClose 时落盘。 */
+/* Reserve a new XValue and return its body pointer; fill it before another KVSpace call. */
 int kvspaceWriteNewPlace(void *h, const char *key, uint8_t ref, uint8_t storetype,
                          uint8_t ro, uint32_t vid, const char *langtype, uint32_t body_len,
+                         uint64_t body_cap,
                          uint8_t **body, char *err, uint32_t err_cap);
 
 /* 只返回前缀下子项计数，无缓冲、无需释放。resolve=1 穿透 link。 */

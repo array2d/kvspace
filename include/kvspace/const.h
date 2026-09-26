@@ -11,11 +11,10 @@
 #define KVSPACE_PATH_SEP           "/"
 #define KVSPACE_DIR_INDEX_SUF       "/"
 #define KVSPACE_MEMBER_SEP          "·"
-#define KVSPACE_INDEX_VALUE_SEP     "\n"
 #define KVSPACE_RUNTIME_MEMBER_SEP  "\xE2\x80\xA5"
-#define KVSPACE_EXT_INDEX_HEAD      "\xE2\x80\xA6"
 
 #define KVSPACE_KIND_NONE       "None"
+#define KVSPACE_KIND_BYTE       "byte"
 #define KVSPACE_KIND_BOOL       "bool"
 #define KVSPACE_KIND_INT8       "int8"
 #define KVSPACE_KIND_INT16      "int16"
@@ -31,8 +30,6 @@
 #define KVSPACE_KIND_CHAR_UTF8  "char/utf8"
 #define KVSPACE_KIND_CHAR_ASCII "char/ascii"
 #define KVSPACE_KIND_MAP        "stringkeymap"
-#define KVSPACE_KIND_INDEX      "index"
-#define KVSPACE_KIND_EXT_INDEX  "extindex"
 #define KVSPACE_KIND_RWIR       "rwir"
 #define KVSPACE_KIND_RWFUNC     "rwfunc"
 #define KVSPACE_KIND_DEF_RWIR   "def rwir"
@@ -47,10 +44,9 @@
     X(KVSPACE_PATH_SEP) \
     X(KVSPACE_DIR_INDEX_SUF) \
     X(KVSPACE_MEMBER_SEP) \
-    X(KVSPACE_INDEX_VALUE_SEP) \
     X(KVSPACE_RUNTIME_MEMBER_SEP) \
-    X(KVSPACE_EXT_INDEX_HEAD) \
     X(KVSPACE_KIND_NONE) \
+    X(KVSPACE_KIND_BYTE) \
     X(KVSPACE_KIND_BOOL) \
     X(KVSPACE_KIND_INT8) \
     X(KVSPACE_KIND_INT16) \
@@ -66,8 +62,6 @@
     X(KVSPACE_KIND_CHAR_UTF8) \
     X(KVSPACE_KIND_CHAR_ASCII) \
     X(KVSPACE_KIND_MAP) \
-    X(KVSPACE_KIND_INDEX) \
-    X(KVSPACE_KIND_EXT_INDEX) \
     X(KVSPACE_KIND_RWIR) \
     X(KVSPACE_KIND_RWFUNC) \
     X(KVSPACE_KIND_DEF_RWIR) \
