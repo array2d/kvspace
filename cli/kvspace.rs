@@ -18,6 +18,7 @@ struct Head {
     langtype: [u8; 256],
     langtype_len: i32,
     body_offset: i32,
+    body_cap: u64,
 }
 
 fn zero_head() -> Head {
@@ -46,26 +47,13 @@ extern "C" {
         out: *mut *mut u8,
         out_len: *mut u32,
     ) -> c_int;
-    // 写即构造：key 已存在且 body_len 相等 → 返回原 box body 偏移指针（就地改）；否则新位置写。
-    fn kvspaceWriteInPlace(
+    fn kvspaceSetValue(
         h: *mut c_void,
         key: *const c_char,
-        resolve: c_int,
-        body_len: u32,
-        body: *mut *mut u8,
-        err: *mut c_char,
-        err_cap: u32,
-    ) -> c_int;
-    fn kvspaceWriteNewPlace(
-        h: *mut c_void,
-        key: *const c_char,
-        r#ref: u8,
-        storetype: u8,
+        value: *const u8,
+        value_len: u32,
         ro: u8,
         vid: u32,
-        langtype: *const c_char,
-        body_len: u32,
-        body: *mut *mut u8,
         err: *mut c_char,
         err_cap: u32,
     ) -> c_int;
@@ -155,6 +143,7 @@ extern "C" {
     fn kvspaceNewInt64(v: i64, out: *mut *mut u8, out_len: *mut u32) -> c_int;
     fn kvspaceNewFloat64(v: f64, out: *mut *mut u8, out_len: *mut u32) -> c_int;
     fn kvspaceDecodeHead(data: *const u8, data_len: u32, out: *mut Head) -> c_int;
+    fn kvspaceGetHead(h: *mut c_void, key: *const c_char, out: *mut Head) -> c_int;
 }
 
 fn cs(s: &str) -> *const c_char {
@@ -205,6 +194,9 @@ fn decode(data: &[u8]) -> Value {
 
 /// langtype 无 ref 前缀（ref 是独立字段）：只剥前导 [dims]，其余为基 kind。
 fn parse_langtype(lt: &str) -> (Vec<i32>, String) {
+    if lt.contains('·') {
+        return (Vec::new(), lt.to_string());
+    }
     if let Some(rest) = lt.strip_prefix('[') {
         if let Some(end) = rest.find(']') {
             let dims: Vec<i32> = rest[..end]
@@ -307,27 +299,18 @@ fn parse_value(raw: &str) -> Vec<u8> {
             Some(i) => (&rest[..i], &rest[i + 1..]),
             None => ("", rest),
         };
-        unsafe { kvspaceNewPtr(cs(k), cs(t), &mut out, &mut len) == 0 }
-    } else if raw.starts_with("map") {
-        let dims: Vec<i32> = raw
-            .trim_start_matches("map")
-            .trim_matches([':', '[', ']'])
-            .split(',')
-            .filter(|s| !s.is_empty())
-            .map(|s| s.parse().unwrap_or(0))
-            .collect();
-        if dims.is_empty() {
-            fatalf("map 需要 dims，如 map[2,3]:");
+        unsafe { kvspaceNewPtr(cs(t), cs(k), &mut out, &mut len) == 0 }
+    } else if let Some(langtype) = raw.strip_prefix("map:") {
+        if !langtype.contains('·') {
+            fatalf("map requires key·value langtype");
         }
-        let empty = [0u8; 0];
-        let ndim = dims.len() as i32;
         unsafe {
             kvspaceTlvEncode(
-                cs("stringkeymap"),
-                empty.as_ptr(),
+                cs(langtype),
+                std::ptr::null(),
                 0,
-                dims.as_ptr(),
-                ndim,
+                std::ptr::null(),
+                0,
                 &mut out,
                 &mut len,
             ) == 0
@@ -372,20 +355,7 @@ fn parse_value(raw: &str) -> Vec<u8> {
             "nil" => {
                 return vec![];
             }
-            "index" => {
-                let zero = [0u8; 4];
-                unsafe {
-                    kvspaceTlvEncode(
-                        cs("index"),
-                        zero.as_ptr(),
-                        4,
-                        std::ptr::null(),
-                        0,
-                        &mut out,
-                        &mut len,
-                    ) == 0
-                }
-            }
+            "index" => fatalf("use mkindex for directories"),
             _ => {
                 fatalf(&format!("unknown kind: {:?}", kind));
             }
@@ -401,61 +371,34 @@ fn parse_value(raw: &str) -> Vec<u8> {
     }
 }
 
-// 写即构造：解 val 的 TLV 头取 (kindexpr, body)，向后端要可写 body 偏移指针后直接写字节——
-// key 已存在且 body 尺寸不变 → WriteInPlace（原 box 就地）；否则 WriteNewPlace（分配新 box + 写 head）。
 fn set_one(kv: *mut c_void, key: &str, val: &[u8], ro: u8, vid: u32) {
     if val.is_empty() {
-        return; // nil：不写
+        let key_ptr = cs(key);
+        let mut err = [0u8; 256];
+        unsafe { kvspaceDel(kv, &key_ptr, 1, err.as_mut_ptr() as *mut c_char, 256) };
+        return;
     }
-    let mut h = zero_head();
-    unsafe {
-        kvspaceDecodeHead(val.as_ptr(), val.len() as u32, &mut h);
-    }
-    let langtype = std::ffi::CString::new(langtype_bytes(&h)).unwrap();
-    let off = h.body_offset as usize;
-    let blen = h.body_len.max(0) as usize;
-    let body = &val[off..off + blen];
     let ck = cs(key);
-    let mut bp: *mut u8 = std::ptr::null_mut();
     let mut err = [0u8; 256];
-    unsafe {
-        // ro/vid 属 head，就地写不改 head——显式给定时直接走新位置写。
-        let rc = if ro != 0 || vid != 0 {
-            1
-        } else {
-            kvspaceWriteInPlace(
-                kv,
-                ck,
-                1,
-                blen as u32,
-                &mut bp,
-                err.as_mut_ptr() as *mut c_char,
-                256,
-            )
-        };
-        if rc != 0 {
-            let rc2 = kvspaceWriteNewPlace(
-                kv,
-                ck,
-                h.r#ref,
-                h.storetype,
-                ro,
-                vid,
-                langtype.as_ptr(),
-                blen as u32,
-                &mut bp,
-                err.as_mut_ptr() as *mut c_char,
-                256,
-            );
-            if rc2 != 0 {
-                let n = err.iter().position(|&b| b == 0).unwrap_or(err.len());
-                eprintln!("set {}: {}", key, String::from_utf8_lossy(&err[..n]));
-                std::process::exit(1);
-            }
-        }
-        if !body.is_empty() && !bp.is_null() {
-            std::ptr::copy_nonoverlapping(body.as_ptr(), bp, body.len());
-        }
+    let rc = unsafe {
+        kvspaceSetValue(
+            kv,
+            ck,
+            val.as_ptr(),
+            val.len() as u32,
+            ro,
+            vid,
+            err.as_mut_ptr() as *mut c_char,
+            256,
+        )
+    };
+    if rc != 0 {
+        let n = err.iter().position(|&b| b == 0).unwrap_or(err.len());
+        fatalf(&format!(
+            "set {}: {}",
+            key,
+            String::from_utf8_lossy(&err[..n])
+        ));
     }
 }
 
@@ -566,14 +509,10 @@ fn main() {
         }
         "head" => {
             for k in tail {
-                let v = get(kv, k);
-                if v.is_empty() {
+                let mut h = zero_head();
+                if unsafe { kvspaceGetHead(kv, cs(k), &mut h) } != 0 {
                     println!("{}\t(nil)", k);
                 } else {
-                    let mut h = zero_head();
-                    unsafe {
-                        kvspaceDecodeHead(v.as_ptr(), v.len() as u32, &mut h);
-                    }
                     let lt = String::from_utf8_lossy(langtype_bytes(&h)).into_owned();
                     let (_, kind) = parse_langtype(&lt);
                     let dims = &h.dims[..(h.ndim.max(0) as usize).min(8)];
