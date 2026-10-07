@@ -14,7 +14,6 @@
 #define KVSPACE_RUNTIME_MEMBER_SEP  "\xE2\x80\xA5"
 
 #define KVSPACE_KIND_NONE       "None"
-#define KVSPACE_KIND_BYTE       "byte"
 #define KVSPACE_KIND_BOOL       "bool"
 #define KVSPACE_KIND_INT8       "int8"
 #define KVSPACE_KIND_INT16      "int16"
@@ -46,7 +45,6 @@
     X(KVSPACE_MEMBER_SEP) \
     X(KVSPACE_RUNTIME_MEMBER_SEP) \
     X(KVSPACE_KIND_NONE) \
-    X(KVSPACE_KIND_BYTE) \
     X(KVSPACE_KIND_BOOL) \
     X(KVSPACE_KIND_INT8) \
     X(KVSPACE_KIND_INT16) \

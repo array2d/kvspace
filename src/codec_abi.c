@@ -57,12 +57,10 @@ int kvspaceTlvEncodeMode(const char *kind, const uint8_t *raw, uint32_t raw_len,
         rc = kvspaceXhNewNone(&value, &total);
     } else if (strcmp(kind, KVSPACE_KIND_CHAR_UTF8) == 0 ||
                strcmp(kind, KVSPACE_KIND_CHAR_ASCII) == 0 ||
-               strcmp(kind, KVSPACE_KIND_CHAR) == 0 ||
-               strcmp(kind, KVSPACE_KIND_BYTE) == 0) {
+               strcmp(kind, KVSPACE_KIND_CHAR) == 0) {
         int elem = strcmp(kind, KVSPACE_KIND_CHAR_UTF8) == 0 ? KVSPACE_XH_UTF8 :
                    strcmp(kind, KVSPACE_KIND_CHAR_ASCII) == 0 ? KVSPACE_XH_ASCII :
-                   strcmp(kind, KVSPACE_KIND_CHAR) == 0 ? KVSPACE_XH_UTF32 :
-                   KVSPACE_XH_BYTE;
+                   KVSPACE_XH_UTF32;
         rc = kvspaceXhNewSlack(elem, raw, raw_len, raw_len, &value, &total);
     } else if (ndim > 0) {
         uint64_t shape[8];
