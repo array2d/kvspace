@@ -7,3 +7,4 @@ __pycache__/
 
 # durable 测试产物
 kvtest*
+.omc/
