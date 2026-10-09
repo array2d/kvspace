@@ -61,7 +61,9 @@ def test_script(script):
 # ── kvspace-c ↔ kvspace-durable 交叉校验（ctypes，字节级对齐） ──────────────
 
 class HeadV(ctypes.Structure):
-    # 三正交轴 kvspaceHead_t（对齐 kvspace/include/kvspace/kvspace.h）。
+    # kvspaceHead_t 的**解码视图**（对齐 kvspace/include/kvspace/kvspace.h）。
+    # 注意：wire 上没有独立的 ref / storetype 字节——它们是 flags 字节解码后的派生视图
+    #（低 2 位 storage class、bit 2 指针位），此处字段仅为跨边界读取元数据方便。
     _fields_ = [
         ("headlen", ctypes.c_uint16),
         ("ref", ctypes.c_uint8),
