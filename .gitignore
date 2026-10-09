@@ -8,3 +8,6 @@ __pycache__/
 # durable 测试产物
 kvtest*
 .omc/
+
+# CodeGraph 索引（本地知识图，不入库）
+.codegraph/
