@@ -79,6 +79,11 @@ typedef struct {
 int kvspaceResolveRef(void *h, const char *key, kvspaceRef_t *ref);
 int kvspaceGetByRef(void *h, kvspaceRef_t *ref, const char *key_fallback,
                     uint8_t **out, uint32_t *out_len);
+/* Same semantics as SetValue. ref must belong to key; unsupported backends
+ * use SetValue. The reference stores an address, never a value snapshot. */
+int kvspaceSetValueByRef(void *h, kvspaceRef_t *ref, const char *key,
+                         const uint8_t *value, uint32_t value_len,
+                         uint8_t ro, uint32_t vid, char *err, uint32_t err_cap);
 int kvspaceSetPartByRef(void *h, kvspaceRef_t *ref, const char *key_fallback,
                         uint32_t offset, const uint8_t *buf, uint32_t buf_len,
                         char *err, uint32_t err_cap);

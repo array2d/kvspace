@@ -55,6 +55,9 @@ typedef struct {
     int  (*resolveref)(void *h, const char *key, kvspaceRef_t *ref);
     int  (*getbyref)(void *h, kvspaceRef_t *ref, const char *key_fallback,
                      uint8_t **out, uint32_t *out_len);
+    int  (*setvaluebyref)(void *h, kvspaceRef_t *ref, const char *key,
+                         const uint8_t *value, uint32_t value_len,
+                         uint8_t ro, uint32_t vid, char *err, uint32_t err_cap);
     int  (*setpartbyref)(void *h, kvspaceRef_t *ref, const char *key_fallback,
                          uint32_t offset, const uint8_t *buf, uint32_t buf_len,
                          char *err, uint32_t err_cap);
@@ -186,6 +189,7 @@ void *kvspaceConnect(const char *dsn) {
     LOAD(watch, "kvspaceWatch");
     #undef LOAD
     *(void **)&vt->resolveref = dlsym(dl, "kvspaceResolveRef");
+    *(void **)&vt->setvaluebyref = dlsym(dl, "kvspaceSetValueByRef");
     *(void **)&vt->getbyref = dlsym(dl, "kvspaceGetByRef");
     *(void **)&vt->setpartbyref = dlsym(dl, "kvspaceSetPartByRef");
 
@@ -239,6 +243,17 @@ int kvspaceGetByRef(void *h, kvspaceRef_t *ref, const char *key_fallback,
         return x->vt->getbyref(x->backend, ref, key_fallback, out, out_len);
     if (!key_fallback) { *out = NULL; *out_len = 0; return 0; }
     return x->vt->get(x->backend, key_fallback, 0, out, out_len);
+}
+
+int kvspaceSetValueByRef(void *h, kvspaceRef_t *ref, const char *key,
+                         const uint8_t *value, uint32_t value_len,
+                         uint8_t ro, uint32_t vid, char *err, uint32_t err_cap) {
+    kvspace_handle *x = H(h);
+    if (x->vt->setvaluebyref)
+        return x->vt->setvaluebyref(x->backend, ref, key, value, value_len,
+                                   ro, vid, err, err_cap);
+    return x->vt->setvalue(x->backend, key, value, value_len, ro, vid,
+                          err, err_cap);
 }
 
 int kvspaceSetPartByRef(void *h, kvspaceRef_t *ref, const char *key_fallback,
