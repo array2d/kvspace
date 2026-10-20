@@ -82,6 +82,11 @@ int kvspaceGetByRef(void *h, kvspaceRef_t *ref, const char *key_fallback,
 int kvspaceSetPartByRef(void *h, kvspaceRef_t *ref, const char *key_fallback,
                         uint32_t offset, const uint8_t *buf, uint32_t buf_len,
                         char *err, uint32_t err_cap);
+/* 整值写 by cached ref：与 kvspaceSetValue 同语义；ref 失效时后端退回 key 的完整写
+ * 并重解析。后端未实现该符号时，前端退回按 key 的 SetValue。 */
+int kvspaceSetValueByRef(void *h, kvspaceRef_t *ref, const char *key_fallback,
+                         const uint8_t *value, uint32_t value_len, uint8_t ro,
+                         uint32_t vid, char *err, uint32_t err_cap);
 
 /* 指令边界回收读借用池：VM 每条指令执行完调用一次。此后本指令内 Get/GetPart 借出的
  * 指针一律失效。shm 常驻映射侧为 no-op；durable 惰性写不清池，全靠本调用回收。 */
