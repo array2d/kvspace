@@ -59,8 +59,11 @@ void  kvspaceClose(void *h);
 
 /* ── 单点读写 / 目录 ──────────────────────────────────────────── */
 
-/* 借用读：*out 指向后端常驻空间（shm mmap / durable 借用池），生命周期同该槽，
- * 调用方不得 free。resolve=1 穿透 link。key 不存在/空值 → *out=NULL、*out_len=0、返回 0。 */
+/* 借用读：*out 指向后端常驻空间（shm mmap / durable 读缓存），生命周期到该 key 被写/删
+ * 或 handle close，调用方不得 free。resolve=1 穿透 link。key 不存在/空值 → *out=NULL、
+ * *out_len=0、返回 0。
+ * 例外（volatile keys）：`/vthread/*‥status` 每次读都重读后端，上一视图只保活到该 key
+ * 下一次读（见 spec CABI「volatile keys」）。 */
 int kvspaceGet(void *h, const char *key, int resolve, uint8_t **out, uint32_t *out_len);
 /* Store a complete XValue before returning. */
 int kvspaceSetValue(void *h, const char *key, const uint8_t *value, uint32_t value_len,
@@ -88,12 +91,9 @@ int kvspaceSetValueByRef(void *h, kvspaceRef_t *ref, const char *key_fallback,
                          const uint8_t *value, uint32_t value_len, uint8_t ro,
                          uint32_t vid, char *err, uint32_t err_cap);
 
-/* 指令边界回收读借用池：VM 每条指令执行完调用一次。此后本指令内 Get/GetPart 借出的
- * 指针一律失效。shm 常驻映射侧为 no-op；durable 惰性写不清池，全靠本调用回收。 */
-void kvspaceReadReset(void *h);
-
 /* 定位读：借用读 key 值的 [offset, offset+len) 字节，*out 指向后端常驻空间（借用，不得 free，
- * 生命周期至下次 ReadReset）。恒穿透 link。越界/空/不存在 → *out=NULL、*out_len=0、返回 0。 */
+ * 生命周期到该 key 被写/删或 handle close；volatile 键例外，见上）。恒穿透 link。
+ * 越界/空/不存在 → *out=NULL、*out_len=0、返回 0。 */
 int kvspaceGetPart(void *h, const char *key, uint32_t offset, uint32_t len,
                     uint8_t **out, uint32_t *out_len);
 

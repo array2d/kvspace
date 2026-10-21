@@ -26,7 +26,6 @@ typedef struct {
     int  (*get)(void *h, const char *key, int resolve, uint8_t **out, uint32_t *out_len);
     int  (*setvalue)(void *h, const char *key, const uint8_t *value, uint32_t value_len,
                      uint8_t ro, uint32_t vid, char *err, uint32_t err_cap);
-    void (*readreset)(void *h);
     int  (*getpart)(void *h, const char *key, uint32_t offset, uint32_t len,
                      uint8_t **out, uint32_t *out_len);
     int  (*setpart)(void *h, const char *key, uint32_t offset, const uint8_t *buf,
@@ -169,7 +168,6 @@ void *kvspaceConnect(const char *dsn) {
     LOAD(free, "kvspaceClose");
     LOAD(get, "kvspaceGet");
     LOAD(setvalue, "kvspaceSetValue");
-    LOAD(readreset, "kvspaceReadReset");
     LOAD(getpart, "kvspaceGetPart");
     LOAD(setpart, "kvspaceSetPart");
     LOAD(gethead, "kvspaceGetHead");
@@ -268,11 +266,6 @@ int kvspaceSetValueByRef(void *h, kvspaceRef_t *ref, const char *key_fallback,
         return 1;
     return x->vt->setvalue(x->backend, key_fallback, value, value_len, ro, vid,
                            err, err_cap);
-}
-
-void kvspaceReadReset(void *h) {
-    kvspace_handle *x = H(h);
-    if (x->vt->readreset) x->vt->readreset(x->backend);
 }
 
 int kvspaceGetPart(void *h, const char *key, uint32_t offset, uint32_t len,
