@@ -46,6 +46,13 @@ int main(void) {
     CHECK(kvspaceDecodeHead(value, len, &head) == 0 &&
           head.ref == KVSPACE_REF_PTR && head.body_len == 2);
     free(value);
+    /* 空 kindexpr = 不约束：Ptr 目标允许为空；`any` 不是类型名，创建即拒。 */
+    CHECK(kvspaceNewPtr("", "/x", &value, &len) == 0);
+    CHECK(kvspaceDecodeHead(value, len, &head) == 0 &&
+          head.ref == KVSPACE_REF_PTR && head.langtype_len == 0 &&
+          head.body_len == 2);
+    free(value);
+    CHECK(kvspaceNewPtr("any", "/x", &value, &len) != 0);
     CHECK(kvspaceTlvEncodeMode("int64", (const uint8_t *)"s3://", 5,
                                 NULL, 0, KVSPACE_REF_EXT, 0, 0,
                                 &value, &len) == 0);
