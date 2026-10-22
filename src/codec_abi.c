@@ -134,6 +134,9 @@ int kvspaceNewPtr(const char *target_kindexpr, const char *target,
                   uint8_t **out, uint32_t *out_len) {
     if (!target_kindexpr || !target || !out || !out_len)
         return 1;
+    /* `any` 不是类型名（空 kindexpr = 不约束，见 spec [[文法与合法性]]）。 */
+    if (strcmp(target_kindexpr, "any") == 0)
+        return 1;
     uint8_t *value = NULL;
     uint64_t total = 0;
     if (kvspaceXhNewPtr(target_kindexpr, target, strlen(target), &value, &total) != 0)
