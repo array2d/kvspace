@@ -142,11 +142,13 @@ int kvspaceWatch(void *h, const char *key, const uint8_t *target, uint32_t targe
                  uint64_t tick_ns, uint8_t **out, uint32_t *out_len);
 
 /* ── codec（无 handle，由前端静态实现，byte-identical） ─────────── */
-int kvspaceTlvEncode(const char *kind, const uint8_t *raw, uint32_t raw_len,
-                     const int32_t *dims, int32_t ndim, uint8_t **out, uint32_t *out_len);
-int kvspaceTlvEncodeMode(const char *kind, const uint8_t *raw, uint32_t raw_len,
-                         const int32_t *dims, int32_t ndim, int32_t ref, uint8_t ro, uint32_t vid,
-                         uint8_t **out, uint32_t *out_len);
+int kvspaceXvalueEncode(const char *kind, const uint8_t *raw, uint32_t raw_len,
+                        const int32_t *dims, int32_t ndim, uint8_t **out,
+                        uint32_t *out_len);
+int kvspaceXvalueEncodeMode(const char *kind, const uint8_t *raw,
+                            uint32_t raw_len, const int32_t *dims, int32_t ndim,
+                            int32_t ref, uint8_t ro, uint32_t vid, uint8_t **out,
+                            uint32_t *out_len);
 int kvspaceDecodeHead(const uint8_t *data, uint32_t data_len, kvspaceHead_t *out);
 
 int kvspaceNewPtr(const char *target_kindexpr, const char *target,

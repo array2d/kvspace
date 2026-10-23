@@ -2,7 +2,7 @@
  *
  * 导出 kvspace* C ABI（与两个后端同名同签名）。运行期按 DSN scheme 用 dlopen
  * （RTLD_NOW | RTLD_LOCAL）装载后端，把 handle 包一层 {vtable, dl, backend}。
- * codec（TlvEncode、DecodeHead、New 等）与 kvspaceConst 无 handle，由前端静态实现，byte-identical。
+ * codec（XvalueEncode、DecodeHead、New 等）与 kvspaceConst 无 handle，由前端静态实现，byte-identical。
  *
  * 后端装载名（后缀随平台）：
  *   shm://...           → libkvspace-c.so.1       / macOS: libkvspace-c.dylib

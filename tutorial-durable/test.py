@@ -89,9 +89,9 @@ _libc = ctypes.CDLL(None); _libc.free.argtypes = [ctypes.c_void_p]
 
 
 def setup_lib(lib):
-    lib.kvspaceTlvEncodeMode.argtypes = [ctypes.c_char_p, U8P, ctypes.c_uint32, I32P, ctypes.c_int32,
+    lib.kvspaceXvalueEncodeMode.argtypes = [ctypes.c_char_p, U8P, ctypes.c_uint32, I32P, ctypes.c_int32,
                                          ctypes.c_int, ctypes.c_uint8, ctypes.c_uint32, U8PP, U32P]
-    lib.kvspaceTlvEncodeMode.restype = ctypes.c_int
+    lib.kvspaceXvalueEncodeMode.restype = ctypes.c_int
     lib.kvspaceDecodeHead.argtypes = [U8P, ctypes.c_uint32, ctypes.POINTER(HeadV)]
     lib.kvspaceDecodeHead.restype = ctypes.c_int
 
@@ -102,7 +102,7 @@ def encode(lib, kind, raw, dims=(), ref=0, ro=0, vid=0):
     dims_arr = (ctypes.c_int32 * ndim)(*dims) if ndim > 0 else None
     out = U8P()
     out_len = ctypes.c_uint32()
-    rc = lib.kvspaceTlvEncodeMode(kind.encode(), raw_arr, len(raw), dims_arr, ndim,
+    rc = lib.kvspaceXvalueEncodeMode(kind.encode(), raw_arr, len(raw), dims_arr, ndim,
                                   ref, ro, vid, ctypes.byref(out), ctypes.byref(out_len))
     assert rc == 0, f"encode({kind}) rc={rc}"
     data = ctypes.string_at(out, out_len.value)
@@ -168,7 +168,7 @@ def test_kvspace_c_alignment():
 
 # ── 写侧落盘时机（issue #23）─────────────────────────────────────────
 #
-# 写把 TLV 攒在句柄内（body 由调用方在返回后填，返回前无法落盘）：下一次 op 落盘上一笔
+# 写把 XValue 字节攒在句柄内（body 由调用方在返回后填，返回前无法落盘）：下一次 op 落盘上一笔
 # （读也是 op），另一个句柄随即可见；漏调 Close 而正常退出时由前端退出兜底落盘。子进程必须
 # 独立——它正是「不 Close 就退出」的那一个。
 

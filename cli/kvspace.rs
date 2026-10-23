@@ -123,7 +123,7 @@ extern "C" {
         err_cap: u32,
     ) -> c_int;
     fn kvspaceClear(h: *mut c_void, err: *mut c_char, err_cap: u32) -> c_int;
-    fn kvspaceTlvEncode(
+    fn kvspaceXvalueEncode(
         kind: *const c_char,
         raw: *const u8,
         raw_len: u32,
@@ -305,7 +305,7 @@ fn parse_value(raw: &str) -> Vec<u8> {
             fatalf("map requires key·value langtype");
         }
         unsafe {
-            kvspaceTlvEncode(
+            kvspaceXvalueEncode(
                 cs(langtype),
                 std::ptr::null(),
                 0,
@@ -333,7 +333,7 @@ fn parse_value(raw: &str) -> Vec<u8> {
             "float32" => unsafe {
                 repr.parse::<f32>()
                     .map(|f| {
-                        kvspaceTlvEncode(
+                        kvspaceXvalueEncode(
                             cs("float32"),
                             &f as *const f32 as *const u8,
                             4,

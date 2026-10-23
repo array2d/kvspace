@@ -9,7 +9,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-// ── 编码：返回 malloc 的 TLV 字节，长度写入 *len，调用方 free ──
+// ── 编码：返回 malloc 的 XValue 字节，长度写入 *len，调用方 free ──
 
 static inline uint8_t *enc_int64(int64_t v, uint32_t *len) {
     uint8_t *out = NULL; uint32_t n = 0;
@@ -26,7 +26,7 @@ static inline uint8_t *enc_str(const char *s, uint32_t *len) {
 static inline uint8_t *enc_bytes(const uint8_t *raw, uint32_t rl, uint32_t *len) {
     uint8_t *out = NULL; uint32_t n = 0;
     int32_t dims[1] = { (int32_t)rl };
-    kvspaceTlvEncode("uint8", raw, rl, dims, 1, &out, &n);
+    kvspaceXvalueEncode("uint8", raw, rl, dims, 1, &out, &n);
     *len = n; return out;
 }
 
@@ -48,7 +48,7 @@ static inline const char *dec(const uint8_t *data, uint32_t len, char *kind, siz
     return kind;
 }
 
-// ── 单键读写封装（写即构造：解预编码 TLV 取 kindexpr+body，就地/新位置二选一原语） ──
+// ── 单键读写封装（写即构造：解预编码 XValue 取 kindexpr+body，就地/新位置二选一原语） ──
 
 static inline int kv_set(void *h, const char *key, const uint8_t *val, uint32_t len) {
     kvspaceHead_t hd;
