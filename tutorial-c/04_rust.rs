@@ -81,7 +81,7 @@ impl KV {
         assert!(!ptr.is_null());
         KV { ptr, path: path.to_string() }
     }
-    // 写即构造：解预编码 TLV 取 kindexpr+body，就地/新位置二选一原语，往返回指针写 body。
+    // 写即构造：解预编码 XValue 取 kindexpr+body，就地/新位置二选一原语，往返回指针写 body。
     fn set(&self, key: &str, val: &[u8]) {
         let ck = CString::new(key).unwrap();
         let mut h = Head { kindexpr: [0; 256], ro: 0, vid: 0, body_len: 0, body_offset: 0 };

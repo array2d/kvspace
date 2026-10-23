@@ -28,7 +28,7 @@ struct KV {
     }
     ~KV() { kvspaceClose(kv); ::unlink(path.c_str()); }
 
-    // 写即构造：解预编码 TLV 取 kindexpr+body，就地/新位置二选一原语，往返回指针写 body。
+    // 写即构造：解预编码 XValue 取 kindexpr+body，就地/新位置二选一原语，往返回指针写 body。
     void set(const char *key, const uint8_t *val, uint32_t len) {
         kvspaceHead_t h;
         if (kvspaceDecodeHead(val, len, &h) != 0) return;
