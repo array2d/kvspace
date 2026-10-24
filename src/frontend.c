@@ -60,6 +60,8 @@ typedef struct {
     int  (*setvaluebyref)(void *h, kvspaceRef_t *ref, const char *key_fallback,
                           const uint8_t *value, uint32_t value_len, uint8_t ro,
                           uint32_t vid, char *err, uint32_t err_cap);
+    int  (*slotview)(void *h, const kvspaceRef_t *ref, const char *key_fallback,
+                     kvspaceSlotView_t *out);
 } kvspace_vt;
 
 typedef struct kvspace_handle {
@@ -185,6 +187,7 @@ void *kvspaceConnect(const char *dsn) {
     LOAD(rmindexext, "kvspaceRmindexExt");
     LOAD(clear, "kvspaceClear");
     LOAD(watch, "kvspaceWatch");
+    LOAD(slotview, "kvspaceSlotView");
     #undef LOAD
     *(void **)&vt->resolveref = dlsym(dl, "kvspaceResolveRef");
     *(void **)&vt->getbyref = dlsym(dl, "kvspaceGetByRef");
@@ -253,6 +256,12 @@ int kvspaceSetPartByRef(void *h, kvspaceRef_t *ref, const char *key_fallback,
     if (err && err_cap)
         snprintf(err, err_cap, "kvspace: set-part-by-ref unsupported");
     return 1;
+}
+
+int kvspaceSlotView(void *h, const kvspaceRef_t *ref, const char *key_fallback,
+                    kvspaceSlotView_t *out) {
+    kvspace_handle *x = H(h);
+    return x->vt->slotview(x->backend, ref, key_fallback, out);
 }
 
 int kvspaceSetValueByRef(void *h, kvspaceRef_t *ref, const char *key_fallback,
