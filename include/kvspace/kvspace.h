@@ -91,6 +91,22 @@ int kvspaceSetValueByRef(void *h, kvspaceRef_t *ref, const char *key_fallback,
                          const uint8_t *value, uint32_t value_len, uint8_t ro,
                          uint32_t vid, char *err, uint32_t err_cap);
 
+/* shm-only slot view：把已绑定槽的映射内地址一次性交给调用方，供每步直读/直写。
+ * `head` 指向 XValue 起点，`body = head + headlen`；`cap` 是整 box 物理容量
+ * （allocator 实际值，不是请求值），`body_cap = cap - headlen`。借用模型：
+ * 寿命到该 key 被写/删、view 失效或 handle close。
+ * 返回 0=成功；-1=不存在/ref 失效/不可视槽；-2=后端不支持（调用方回退既有 API，
+ * 每句柄只判定一次）。 */
+typedef struct {
+    uint8_t *head;
+    uint32_t headlen;
+    uint8_t *body;
+    uint64_t body_cap;
+    uint64_t cap;
+} kvspaceSlotView_t;
+int kvspaceSlotView(void *h, const kvspaceRef_t *ref,
+                    const char *key_fallback, kvspaceSlotView_t *out);
+
 /* 定位读：借用读 key 值的 [offset, offset+len) 字节，*out 指向后端常驻空间（借用，不得 free，
  * 生命周期到该 key 被写/删或 handle close；volatile 键例外，见上）。恒穿透 link。
  * 越界/空/不存在 → *out=NULL、*out_len=0、返回 0。 */
