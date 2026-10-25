@@ -12,7 +12,10 @@ KVSpace 的 dispatch 前端。消费者只链接 `libkvspace`，运行期按 DSN
 codec（`kvspaceXvalueEncode*`/`kvspaceDecodeHead`/`kvspaceNew*`）无 handle，由前端静态实现，
 head 格式 byte-identical，两个后端与前端三者共用同一份契约。
 
-后端查找目录由环境变量 `KVSPACE_BACKEND_PATH` 覆盖，默认走动态链接器搜索路径。
+后端一律按固定目录查找（Linux `/usr/lib/kvspace`，macOS `/usr/local/lib/kvspace`）；
+若宿主已按 SONAME 加载过后端（单二进制 `memfd` 场景），前端用
+`dlopen(soname, RTLD_NOW | RTLD_NOLOAD)` 直接复用该对象，不重复映射、不 dlclose。
+运行期没有任何目录/后端类环境变量——`KVSPACE` 是唯一的运行时变量（DSN 选后端）。
 
 ## 常量 ABI
 
