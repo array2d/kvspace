@@ -11,6 +11,7 @@
  */
 
 #include "kvspace/kvspace.h"
+#include "kvspace/kvspace_static.h"
 
 #include <dlfcn.h>
 #include <pthread.h>
@@ -94,7 +95,8 @@ static pthread_mutex_t  live_lock = PTHREAD_MUTEX_INITIALIZER;
 
 static void handle_free(kvspace_handle *x) {
     x->vt->free(x->backend);
-    dlclose(x->dl);
+    if (x->dl)
+        dlclose(x->dl);
     free(x->vt);
     free(x);
 }
@@ -117,6 +119,66 @@ static void exit_close(void) {
         if (!x) return;
         handle_free(x);
     }
+}
+
+/* ── 静态后端注册（单二进制）──────────────────────────────────────────
+ * 静态链接时没有 .so 可 dlopen：后端 constructor 把 {scheme, connect, 符号表}
+ * 注册进来，kvspaceConnect 先查表（scheme 精确匹配，再做 "*" 兜底）。
+ * 注册发生在 main 之前；此后只读，无需加锁。 */
+
+typedef struct {
+    const char *scheme;
+    void *(*connect)(const char *dsn);
+    const kvspace_static_sym_t *syms;
+    uint32_t nsyms;
+} kvspace_static_backend_t;
+
+#define KVSPACE_STATIC_MAX 4
+static kvspace_static_backend_t g_static_be[KVSPACE_STATIC_MAX];
+static uint32_t g_static_n;
+static pthread_mutex_t g_static_lock = PTHREAD_MUTEX_INITIALIZER;
+
+void kvspaceStaticRegisterBackend(const char *scheme,
+                                  void *(*connect)(const char *dsn),
+                                  const kvspace_static_sym_t *syms,
+                                  uint32_t nsyms) {
+    if (!scheme || !connect || !syms || !nsyms)
+        return;
+    pthread_mutex_lock(&g_static_lock);
+    if (g_static_n < KVSPACE_STATIC_MAX) {
+        g_static_be[g_static_n].scheme = scheme;
+        g_static_be[g_static_n].connect = connect;
+        g_static_be[g_static_n].syms = syms;
+        g_static_be[g_static_n].nsyms = nsyms;
+        g_static_n++;
+    }
+    pthread_mutex_unlock(&g_static_lock);
+}
+
+static const kvspace_static_backend_t *static_match(const char *dsn) {
+    const char *sep = strstr(dsn, "://");
+    size_t n = sep ? (size_t)(sep - dsn) : strlen(dsn);
+    const kvspace_static_backend_t *fallback = NULL;
+    for (uint32_t i = 0; i < g_static_n; i++) {
+        const kvspace_static_backend_t *b = &g_static_be[i];
+        if (strcmp(b->scheme, "*") == 0) {
+            fallback = b;
+            continue;
+        }
+        if (strlen(b->scheme) == n && strncmp(b->scheme, dsn, n) == 0)
+            return b;
+    }
+    return fallback;
+}
+
+static void *sym_get(const kvspace_static_backend_t *sb, void *dl,
+                     const char *name) {
+    if (dl)
+        return dlsym(dl, name);
+    for (uint32_t i = 0; i < sb->nsyms; i++)
+        if (strcmp(sb->syms[i].name, name) == 0)
+            return sb->syms[i].fn;
+    return NULL;
 }
 
 /* ── 后端选择 ───────────────────────────────────────────────────────── */
@@ -166,18 +228,23 @@ const char *kvspaceConst(const char *name) {
 
 void *kvspaceConnect(const char *dsn) {
     if (!dsn) return NULL;
-    char path[4096];
-    backend_path(backend_soname(dsn), path, sizeof path);
 
-    void *dl = dlopen(path, RTLD_NOW | RTLD_LOCAL);
-    if (!dl) return NULL;
+    const kvspace_static_backend_t *sb = static_match(dsn);
+    void *dl = NULL;
+    if (!sb) {
+        char path[4096];
+        backend_path(backend_soname(dsn), path, sizeof path);
+        dl = dlopen(path, RTLD_NOW | RTLD_LOCAL);
+        if (!dl) return NULL;
+    }
 
     kvspace_vt *vt = calloc(1, sizeof(*vt));
-    if (!vt) { dlclose(dl); return NULL; }
+    if (!vt) { if (dl) dlclose(dl); return NULL; }
 
+    #define SYM(name) sym_get(sb, dl, name)
     #define LOAD(field, name) do {                                  \
-        *(void **)&(vt)->field = dlsym(dl, name);                   \
-        if (!(vt)->field) { free(vt); dlclose(dl); return NULL; }   \
+        *(void **)&(vt)->field = SYM(name);                         \
+        if (!(vt)->field) { free(vt); if (dl) dlclose(dl); return NULL; } \
     } while (0)
 
     LOAD(free, "kvspaceClose");
@@ -202,31 +269,35 @@ void *kvspaceConnect(const char *dsn) {
     LOAD(watch, "kvspaceWatch");
     LOAD(slotview, "kvspaceSlotView");
     #undef LOAD
-    *(void **)&vt->resolveref = dlsym(dl, "kvspaceResolveRef");
-    *(void **)&vt->getbyref = dlsym(dl, "kvspaceGetByRef");
-    *(void **)&vt->setpartbyref = dlsym(dl, "kvspaceSetPartByRef");
-    *(void **)&vt->setvaluebyref = dlsym(dl, "kvspaceSetValueByRef");
+    *(void **)&vt->resolveref = SYM("kvspaceResolveRef");
+    *(void **)&vt->getbyref = SYM("kvspaceGetByRef");
+    *(void **)&vt->setpartbyref = SYM("kvspaceSetPartByRef");
+    *(void **)&vt->setvaluebyref = SYM("kvspaceSetValueByRef");
     /* P2 可选符号：缺失时 trampoline 返回 -2 */
-    *(void **)&vt->viewsweep = dlsym(dl, "kvspaceViewSweep");
-    *(void **)&vt->viewresolveprefix = dlsym(dl, "kvspaceViewResolvePrefix");
-    *(void **)&vt->viewresolve = dlsym(dl, "kvspaceViewResolve");
-    *(void **)&vt->viewfromref = dlsym(dl, "kvspaceViewFromRef");
-    *(void **)&vt->viewresolvefrom = dlsym(dl, "kvspaceViewResolveFrom");
-    *(void **)&vt->viewcheck = dlsym(dl, "kvspaceViewCheck");
-    *(void **)&vt->viewwrite = dlsym(dl, "kvspaceViewWrite");
-    *(void **)&vt->viewdel = dlsym(dl, "kvspaceViewDel");
-    *(void **)&vt->viewrefresh = dlsym(dl, "kvspaceViewRefresh");
-    *(void **)&vt->viewack = dlsym(dl, "kvspaceViewAck");
-    *(void **)&vt->viewquiesce = dlsym(dl, "kvspaceViewQuiesce");
+    *(void **)&vt->viewsweep = SYM("kvspaceViewSweep");
+    *(void **)&vt->viewresolveprefix = SYM("kvspaceViewResolvePrefix");
+    *(void **)&vt->viewresolve = SYM("kvspaceViewResolve");
+    *(void **)&vt->viewfromref = SYM("kvspaceViewFromRef");
+    *(void **)&vt->viewresolvefrom = SYM("kvspaceViewResolveFrom");
+    *(void **)&vt->viewcheck = SYM("kvspaceViewCheck");
+    *(void **)&vt->viewwrite = SYM("kvspaceViewWrite");
+    *(void **)&vt->viewdel = SYM("kvspaceViewDel");
+    *(void **)&vt->viewrefresh = SYM("kvspaceViewRefresh");
+    *(void **)&vt->viewack = SYM("kvspaceViewAck");
+    *(void **)&vt->viewquiesce = SYM("kvspaceViewQuiesce");
+    #undef SYM
 
-    void *(*connect)(const char *) = dlsym(dl, "kvspaceConnect");
-    if (!connect) { free(vt); dlclose(dl); return NULL; }
+    void *(*connect)(const char *) =
+        sb ? sb->connect : (void *(*)(const char *))dlsym(dl, "kvspaceConnect");
+    if (!connect) { free(vt); if (dl) dlclose(dl); return NULL; }
     void *backend = connect(dsn);
-    if (!backend) { free(vt); dlclose(dl); return NULL; }
+    if (!backend) { free(vt); if (dl) dlclose(dl); return NULL; }
 
     kvspace_handle *h = malloc(sizeof(*h));
-    if (!h) { vt->free(backend); free(vt); dlclose(dl); return NULL; }
-    h->vt = vt; h->dl = dl; h->backend = backend;
+    if (!h) { vt->free(backend); free(vt); if (dl) dlclose(dl); return NULL; }
+    h->vt = vt;
+    h->dl = dl;
+    h->backend = backend;
 
     pthread_mutex_lock(&live_lock);
     h->next = live;

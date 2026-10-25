@@ -12,7 +12,24 @@ if(CMAKE_INSTALL_PREFIX_INITIALIZED_TO_DEFAULT)
     set(CMAKE_INSTALL_PREFIX "/usr" CACHE PATH "" FORCE)
 endif()
 
-add_library(kvspace SHARED src/frontend.c src/codec_abi.c src/xvalue_head.c src/xvalue_meta.c)
+set(KVSPACE_SRC src/frontend.c src/codec_abi.c src/xvalue_head.c src/xvalue_meta.c)
+add_library(kvspace SHARED ${KVSPACE_SRC})
+
+# 静态库（单二进制）：同一份源码；后端通过 kvspaceStaticRegisterBackend 注册，
+# 命中静态表时不 dlopen。共享库构建里注册符号是 hidden，公共 ABI 不变。
+# 默认关：普通安装/CI 不产出 .a，只有单二进制构建显式开启。
+option(KVSPACE_BUILD_STATIC "Build libkvspace-static.a for single-binary" OFF)
+if(KVSPACE_BUILD_STATIC)
+    add_library(kvspace-static STATIC ${KVSPACE_SRC})
+    target_include_directories(kvspace-static
+        PUBLIC
+            $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+            $<INSTALL_INTERFACE:include>
+    )
+    target_compile_definitions(kvspace-static PRIVATE _GNU_SOURCE KVSPACE_STATIC_BUILD)
+    target_link_libraries(kvspace-static PUBLIC ${CMAKE_DL_LIBS} Threads::Threads)
+    install(TARGETS kvspace-static ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}/kvspace)
+endif()
 
 include(CTest)
 if(BUILD_TESTING)
