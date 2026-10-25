@@ -7,9 +7,13 @@
  * 后端装载名（后缀随平台）：
  *   shm://...           → libkvspace-c.so.1       / macOS: libkvspace-c.dylib
  *   其余（redis/fs/s3） → libkvspace_durable.so.1 / macOS: libkvspace_durable.dylib
- * 目录由 KVSPACE_BACKEND_PATH 覆盖，默认 Linux /usr/lib/kvspace、macOS /usr/local/lib/kvspace。
+ * 先按 SONAME 用 RTLD_NOLOAD 复用宿主已加载的后端（单二进制 memfd 场景），
+ * 未命中再按固定目录 dlopen：Linux /usr/lib/kvspace、macOS /usr/local/lib/kvspace。
  */
 
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE /* RTLD_NOLOAD */
+#endif
 #include "kvspace/kvspace.h"
 
 #include <dlfcn.h>
@@ -80,6 +84,7 @@ typedef struct {
 typedef struct kvspace_handle {
     kvspace_vt *vt;
     void       *dl;
+    int         borrowed; /* NOLOAD 命中的已加载后端：借用，前端不 dlclose */
     void       *backend;
     struct kvspace_handle *next;
 } kvspace_handle;
@@ -94,7 +99,8 @@ static pthread_mutex_t  live_lock = PTHREAD_MUTEX_INITIALIZER;
 
 static void handle_free(kvspace_handle *x) {
     x->vt->free(x->backend);
-    dlclose(x->dl);
+    if (!x->borrowed)
+        dlclose(x->dl);
     free(x->vt);
     free(x);
 }
@@ -119,6 +125,11 @@ static void exit_close(void) {
     }
 }
 
+/* 单二进制能力标记（无导出符号；构建期守卫据此拒绝旧前端）：
+ * 本版本前端支持 RTLD_NOLOAD 复用宿主已加载的后端。 */
+__attribute__((used)) static const char kvspace_embed_marker[] =
+    "kvspace:embed-noload";
+
 /* ── 后端选择 ───────────────────────────────────────────────────────── */
 
 /* 后端库名：Linux 为 .so.1，macOS 为 .dylib。 */
@@ -131,17 +142,15 @@ static const char *backend_soname(const char *dsn) {
 #endif
 }
 
-/* 后端目录默认值：Linux /usr/lib/kvspace；macOS /usr/local/lib/kvspace（/usr 受 SIP 保护）。
- * KVSPACE_BACKEND_PATH 可覆盖。 */
+/* 后端目录固定（运行期没有目录类环境变量）：Linux /usr/lib/kvspace；
+ * macOS /usr/local/lib/kvspace（/usr 受 SIP 保护）。 */
 static char *backend_path(const char *soname, char *buf, size_t cap) {
-    const char *dir = getenv("KVSPACE_BACKEND_PATH");
-    if (!dir || !dir[0]) {
+    const char *dir;
 #if defined(__APPLE__)
-        dir = "/usr/local/lib/kvspace";
+    dir = "/usr/local/lib/kvspace";
 #else
-        dir = "/usr/lib/kvspace";
+    dir = "/usr/lib/kvspace";
 #endif
-    }
     snprintf(buf, cap, "%s/%s", dir, soname);
     return buf;
 }
@@ -166,18 +175,27 @@ const char *kvspaceConst(const char *name) {
 
 void *kvspaceConnect(const char *dsn) {
     if (!dsn) return NULL;
-    char path[4096];
-    backend_path(backend_soname(dsn), path, sizeof path);
 
-    void *dl = dlopen(path, RTLD_NOW | RTLD_LOCAL);
-    if (!dl) return NULL;
+    /* 单二进制：后端已由宿主 memfd 加载。按 SONAME + RTLD_NOLOAD 复用同一个
+     * 已加载对象（返回引用但不再映射）；命中即为借用，前端不 dlclose。 */
+    const char *soname = backend_soname(dsn);
+    int borrowed = 0;
+    void *dl = dlopen(soname, RTLD_NOW | RTLD_NOLOAD);
+    if (dl) {
+        borrowed = 1;
+    } else {
+        char path[4096];
+        backend_path(soname, path, sizeof path);
+        dl = dlopen(path, RTLD_NOW | RTLD_LOCAL);
+        if (!dl) return NULL;
+    }
 
     kvspace_vt *vt = calloc(1, sizeof(*vt));
-    if (!vt) { dlclose(dl); return NULL; }
+    if (!vt) { if (!borrowed) dlclose(dl); return NULL; }
 
     #define LOAD(field, name) do {                                  \
         *(void **)&(vt)->field = dlsym(dl, name);                   \
-        if (!(vt)->field) { free(vt); dlclose(dl); return NULL; }   \
+        if (!(vt)->field) { free(vt); if (!borrowed) dlclose(dl); return NULL; } \
     } while (0)
 
     LOAD(free, "kvspaceClose");
@@ -220,13 +238,16 @@ void *kvspaceConnect(const char *dsn) {
     *(void **)&vt->viewquiesce = dlsym(dl, "kvspaceViewQuiesce");
 
     void *(*connect)(const char *) = dlsym(dl, "kvspaceConnect");
-    if (!connect) { free(vt); dlclose(dl); return NULL; }
+    if (!connect) { free(vt); if (!borrowed) dlclose(dl); return NULL; }
     void *backend = connect(dsn);
-    if (!backend) { free(vt); dlclose(dl); return NULL; }
+    if (!backend) { free(vt); if (!borrowed) dlclose(dl); return NULL; }
 
     kvspace_handle *h = malloc(sizeof(*h));
-    if (!h) { vt->free(backend); free(vt); dlclose(dl); return NULL; }
-    h->vt = vt; h->dl = dl; h->backend = backend;
+    if (!h) { vt->free(backend); free(vt); if (!borrowed) dlclose(dl); return NULL; }
+    h->vt = vt;
+    h->dl = dl;
+    h->borrowed = borrowed; /* malloc 未初始化：漏赋值会让借用句柄被 dlclose */
+    h->backend = backend;
 
     pthread_mutex_lock(&live_lock);
     h->next = live;
