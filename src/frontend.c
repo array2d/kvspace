@@ -62,6 +62,19 @@ typedef struct {
                           uint32_t vid, char *err, uint32_t err_cap);
     int  (*slotview)(void *h, const kvspaceRef_t *ref, const char *key_fallback,
                      kvspaceSlotView_t *out);
+    int  (*viewsweep)(void *h);
+    int  (*viewresolveprefix)(void *h, const char *path, kvspaceRef_t *ref);
+    int  (*viewresolve)(void *h, const char *key, kvspaceViewToken_t *tok);
+    int  (*viewfromref)(void *h, const kvspaceRef_t *ref, const char *key_fallback,
+                        kvspaceViewToken_t *tok);
+    int  (*viewresolvefrom)(void *h, const kvspaceRef_t *parent, const char *rel,
+                            kvspaceViewToken_t *tok);
+    int  (*viewcheck)(void *h, const kvspaceViewToken_t *tok);
+    int  (*viewwrite)(void *h, kvspaceViewToken_t *tok, const uint8_t *data, uint32_t len);
+    int  (*viewdel)(void *h, kvspaceViewToken_t *tok, const char *key);
+    int  (*viewrefresh)(void *h, kvspaceViewToken_t *tok, const char *key);
+    int  (*viewack)(void *h, uint32_t *epoch);
+    int  (*viewquiesce)(void *h, int on);
 } kvspace_vt;
 
 typedef struct kvspace_handle {
@@ -193,6 +206,18 @@ void *kvspaceConnect(const char *dsn) {
     *(void **)&vt->getbyref = dlsym(dl, "kvspaceGetByRef");
     *(void **)&vt->setpartbyref = dlsym(dl, "kvspaceSetPartByRef");
     *(void **)&vt->setvaluebyref = dlsym(dl, "kvspaceSetValueByRef");
+    /* P2 可选符号：缺失时 trampoline 返回 -2 */
+    *(void **)&vt->viewsweep = dlsym(dl, "kvspaceViewSweep");
+    *(void **)&vt->viewresolveprefix = dlsym(dl, "kvspaceViewResolvePrefix");
+    *(void **)&vt->viewresolve = dlsym(dl, "kvspaceViewResolve");
+    *(void **)&vt->viewfromref = dlsym(dl, "kvspaceViewFromRef");
+    *(void **)&vt->viewresolvefrom = dlsym(dl, "kvspaceViewResolveFrom");
+    *(void **)&vt->viewcheck = dlsym(dl, "kvspaceViewCheck");
+    *(void **)&vt->viewwrite = dlsym(dl, "kvspaceViewWrite");
+    *(void **)&vt->viewdel = dlsym(dl, "kvspaceViewDel");
+    *(void **)&vt->viewrefresh = dlsym(dl, "kvspaceViewRefresh");
+    *(void **)&vt->viewack = dlsym(dl, "kvspaceViewAck");
+    *(void **)&vt->viewquiesce = dlsym(dl, "kvspaceViewQuiesce");
 
     void *(*connect)(const char *) = dlsym(dl, "kvspaceConnect");
     if (!connect) { free(vt); dlclose(dl); return NULL; }
@@ -369,4 +394,53 @@ int kvspaceWatch(void *h, const char *key, const uint8_t *target, uint32_t targe
                  uint64_t tick_ns, uint8_t **out, uint32_t *out_len) {
     kvspace_handle *x = H(h);
     return x->vt->watch(x->backend, key, target, target_len, tick_ns, out, out_len);
+}
+
+/* ── P2 token（后端缺符号 → -2，调用方回退）────────────────────── */
+#define P2VT(field) (H(h)->vt->field)
+int kvspaceViewSweep(void *h) {
+    if (!P2VT(viewsweep)) return -2;
+    return P2VT(viewsweep)(H(h)->backend);
+}
+int kvspaceViewResolvePrefix(void *h, const char *path, kvspaceRef_t *ref) {
+    if (!P2VT(viewresolveprefix)) return -2;
+    return P2VT(viewresolveprefix)(H(h)->backend, path, ref);
+}
+int kvspaceViewResolve(void *h, const char *key, kvspaceViewToken_t *tok) {
+    if (!P2VT(viewresolve)) return -2;
+    return P2VT(viewresolve)(H(h)->backend, key, tok);
+}
+int kvspaceViewFromRef(void *h, const kvspaceRef_t *ref, const char *k,
+                       kvspaceViewToken_t *tok) {
+    if (!P2VT(viewfromref)) return -2;
+    return P2VT(viewfromref)(H(h)->backend, ref, k, tok);
+}
+int kvspaceViewResolveFrom(void *h, const kvspaceRef_t *parent, const char *rel,
+                           kvspaceViewToken_t *tok) {
+    if (!P2VT(viewresolvefrom)) return -2;
+    return P2VT(viewresolvefrom)(H(h)->backend, parent, rel, tok);
+}
+int kvspaceViewCheck(void *h, const kvspaceViewToken_t *tok) {
+    if (!P2VT(viewcheck)) return -2;
+    return P2VT(viewcheck)(H(h)->backend, tok);
+}
+int kvspaceViewWrite(void *h, kvspaceViewToken_t *tok, const uint8_t *d, uint32_t n) {
+    if (!P2VT(viewwrite)) return -2;
+    return P2VT(viewwrite)(H(h)->backend, tok, d, n);
+}
+int kvspaceViewDel(void *h, kvspaceViewToken_t *tok, const char *key) {
+    if (!P2VT(viewdel)) return -2;
+    return P2VT(viewdel)(H(h)->backend, tok, key);
+}
+int kvspaceViewRefresh(void *h, kvspaceViewToken_t *tok, const char *key) {
+    if (!P2VT(viewrefresh)) return -2;
+    return P2VT(viewrefresh)(H(h)->backend, tok, key);
+}
+int kvspaceViewAck(void *h, uint32_t *epoch) {
+    if (!P2VT(viewack)) return -2;
+    return P2VT(viewack)(H(h)->backend, epoch);
+}
+int kvspaceViewQuiesce(void *h, int on) {
+    if (!P2VT(viewquiesce)) return -2;
+    return P2VT(viewquiesce)(H(h)->backend, on);
 }
