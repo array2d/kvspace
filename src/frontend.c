@@ -131,25 +131,9 @@ static const char *backend_soname(const char *dsn) {
 #endif
 }
 
-/* 后端完整路径覆盖（单二进制/嵌入加载用）：KVSPACE_BACKEND_SHM / _DURABLE
- * 直接给 .so 的完整路径（例如 /proc/self/fd/N）。设了就用它，跳过目录拼接。 */
-static const char *backend_path_override(const char *soname) {
-    const char *full = NULL;
-    if (strstr(soname, "kvspace-c"))
-        full = getenv("KVSPACE_BACKEND_SHM");
-    else
-        full = getenv("KVSPACE_BACKEND_DURABLE");
-    return (full && full[0]) ? full : NULL;
-}
-
 /* 后端目录默认值：Linux /usr/lib/kvspace；macOS /usr/local/lib/kvspace（/usr 受 SIP 保护）。
  * KVSPACE_BACKEND_PATH 可覆盖。 */
 static char *backend_path(const char *soname, char *buf, size_t cap) {
-    const char *full = backend_path_override(soname);
-    if (full) {
-        snprintf(buf, cap, "%s", full);
-        return buf;
-    }
     const char *dir = getenv("KVSPACE_BACKEND_PATH");
     if (!dir || !dir[0]) {
 #if defined(__APPLE__)
