@@ -107,6 +107,36 @@ typedef struct {
 int kvspaceSlotView(void *h, const kvspaceRef_t *ref,
                     const char *key_fallback, kvspaceSlotView_t *out);
 
+/* ── P2: 版本化 view token（前缀/leaf 缓存载体）─────────────────── */
+typedef struct {
+    uint8_t *head;        /* XValue 起点（shm 映射内，借用） */
+    uint8_t *body;        /* head + headlen */
+    uint32_t headlen;
+    uint32_t value_len;
+    uint64_t cap;         /* 整 box 物理容量 */
+    uint64_t body_cap;
+    uint32_t struct_gen;  /* 结构版本：子集变化/搬迁/重分配才变 */
+    uint32_t value_gen;   /* 值版本：每次值写/删递增（seqlock） */
+    uint64_t store_id;    /* 句柄身份：close/重开后旧 token 失效 */
+    uint32_t node_id;
+    uint32_t _pad;
+} kvspaceViewToken_t;
+
+int kvspaceViewSweep(void *h);
+int kvspaceViewAck(void *h, uint32_t *epoch);
+int kvspaceViewQuiesce(void *h, int on);
+int kvspaceViewResolvePrefix(void *h, const char *path, kvspaceRef_t *ref);
+int kvspaceViewResolve(void *h, const char *key, kvspaceViewToken_t *tok);
+int kvspaceViewFromRef(void *h, const kvspaceRef_t *ref, const char *key_fallback,
+                       kvspaceViewToken_t *tok);
+int kvspaceViewResolveFrom(void *h, const kvspaceRef_t *parent, const char *rel,
+                           kvspaceViewToken_t *tok);
+int kvspaceViewCheck(void *h, const kvspaceViewToken_t *tok);
+int kvspaceViewWrite(void *h, kvspaceViewToken_t *tok, const uint8_t *data, uint32_t len);
+int kvspaceViewDel(void *h, kvspaceViewToken_t *tok, const char *key);
+int kvspaceViewRefresh(void *h, kvspaceViewToken_t *tok, const char *key);
+
+
 /* 定位读：借用读 key 值的 [offset, offset+len) 字节，*out 指向后端常驻空间（借用，不得 free，
  * 生命周期到该 key 被写/删或 handle close；volatile 键例外，见上）。恒穿透 link。
  * 越界/空/不存在 → *out=NULL、*out_len=0、返回 0。 */
