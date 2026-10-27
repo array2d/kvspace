@@ -64,8 +64,8 @@ typedef struct {
     int  (*setvaluebyref)(void *h, kvspaceRef_t *ref, const char *key_fallback,
                           const uint8_t *value, uint32_t value_len, uint8_t ro,
                           uint32_t vid, char *err, uint32_t err_cap);
-    int  (*slotview)(void *h, const kvspaceRef_t *ref, const char *key_fallback,
-                     kvspaceSlotView_t *out);
+    int  (*xvalue_body_view)(void *h, const kvspaceRef_t *ref, const char *key_fallback,
+                     kvspaceXvalueBodyView_t *out);
     int  (*viewsweep)(void *h);
     int  (*viewresolveprefix)(void *h, const char *path, kvspaceRef_t *ref);
     int  (*viewresolve)(void *h, const char *key, kvspaceViewToken_t *tok);
@@ -218,7 +218,7 @@ void *kvspaceConnect(const char *dsn) {
     LOAD(rmindexext, "kvspaceRmindexExt");
     LOAD(clear, "kvspaceClear");
     LOAD(watch, "kvspaceWatch");
-    LOAD(slotview, "kvspaceSlotView");
+    LOAD(xvalue_body_view, "kvspaceXvalueBodyView");
     #undef LOAD
     *(void **)&vt->resolveref = dlsym(dl, "kvspaceResolveRef");
     *(void **)&vt->getbyref = dlsym(dl, "kvspaceGetByRef");
@@ -304,10 +304,10 @@ int kvspaceSetPartByRef(void *h, kvspaceRef_t *ref, const char *key_fallback,
     return 1;
 }
 
-int kvspaceSlotView(void *h, const kvspaceRef_t *ref, const char *key_fallback,
-                    kvspaceSlotView_t *out) {
+int kvspaceXvalueBodyView(void *h, const kvspaceRef_t *ref, const char *key_fallback,
+                    kvspaceXvalueBodyView_t *out) {
     kvspace_handle *x = H(h);
-    return x->vt->slotview(x->backend, ref, key_fallback, out);
+    return x->vt->xvalue_body_view(x->backend, ref, key_fallback, out);
 }
 
 int kvspaceSetValueByRef(void *h, kvspaceRef_t *ref, const char *key_fallback,

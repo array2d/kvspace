@@ -103,9 +103,9 @@ typedef struct {
     uint8_t *body;
     uint64_t body_cap;
     uint64_t cap;
-} kvspaceSlotView_t;
-int kvspaceSlotView(void *h, const kvspaceRef_t *ref,
-                    const char *key_fallback, kvspaceSlotView_t *out);
+} kvspaceXvalueBodyView_t;
+int kvspaceXvalueBodyView(void *h, const kvspaceRef_t *ref,
+                    const char *key_fallback, kvspaceXvalueBodyView_t *out);
 
 /* ── P2: 版本化 view token（前缀/leaf 缓存载体）─────────────────── */
 typedef struct {
