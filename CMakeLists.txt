@@ -63,7 +63,7 @@ if(CARGO_EXECUTABLE)
   set(KVSPACE_CLI_BIN "${CMAKE_CURRENT_SOURCE_DIR}/cli/target/release/kvspace")
   add_custom_target(kvspace-cli ALL
     COMMAND ${CMAKE_COMMAND} -E env
-            "RUSTFLAGS=-L native=$<TARGET_FILE_DIR:kvspace>"
+            "RUSTFLAGS=-L native=$<TARGET_FILE_DIR:kvspace> -C link-arg=-Wl,-rpath,${CMAKE_INSTALL_FULL_LIBDIR}/kvspace"
             "${CARGO_EXECUTABLE}" build --release
             --manifest-path "${CMAKE_CURRENT_SOURCE_DIR}/cli/Cargo.toml"
     BYPRODUCTS "${KVSPACE_CLI_BIN}"
