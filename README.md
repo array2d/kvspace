@@ -9,7 +9,7 @@ KVSpace 的 dispatch 前端。消费者只链接 `libkvspace`，运行期按 DSN
 
 两个后端导出同一套 `kvspace*` C ABI（见 `include/kvspace/kvspace.h`）。
 前端用 `dlopen(RTLD_NOW | RTLD_LOCAL)` 装载后端，handle 包一层 vtable；
-codec（`kvspaceXvalueEncode*`/`kvspaceDecodeHead`/`kvspaceNew*`）无 handle，由前端静态实现，
+XValue 构造（`kvspaceNew*`/`kvspaceXvalueHeadNew*`）无 handle，由前端静态实现，
 head 格式 byte-identical，两个后端与前端三者共用同一份契约。
 
 后端一律按固定目录查找（Linux `/usr/lib/kvspace`，macOS `/usr/local/lib/kvspace`）；

@@ -18,14 +18,14 @@ static int writer(const char *path, int64_t seed) {
     int errors = 0;
     void *kv = kv_open_shm(path);
     if (!kv) { printf("FAIL: writer open\n"); return 1; }
-    kvspaceMkindex(kv, "/mp/", NULL, 0);
+    kvspaceMkindex(kv, "/mp/", 0, NULL, 0);
 
     printf("[writer] round 1: write %d ints\n", N_KEYS);
     for (int i = 0; i < N_KEYS; i++) {
         char k[64]; snprintf(k, sizeof(k), "/mp/k%d", i);
         int64_t v = ((int64_t)rand() << 32) | rand();
-        uint32_t l; uint8_t *b = enc_int64(v, &l);
-        if (kv_set(kv, k, b, l) != 0) { printf("[writer] FAIL set %s\n", k); errors++; }
+        uint32_t l; uint8_t *b = new_int64(v, &l);
+        if (kv_set(kv, k, "int64", b, l) != 0) { printf("[writer] FAIL set %s\n", k); errors++; }
         free(b);
     }
 
@@ -39,8 +39,8 @@ static int writer(const char *path, int64_t seed) {
     for (int i = 0; i < 100; i++) {
         char k[64], s[64]; snprintf(k, sizeof(k), "/mp/s%d", i);
         snprintf(s, sizeof(s), "str_val_%d_%d", i, rand() % 1000);
-        uint32_t l; uint8_t *b = enc_str(s, &l);
-        if (kv_set(kv, k, b, l) != 0) { printf("[writer] FAIL set %s\n", k); errors++; }
+        uint32_t l; uint8_t *b = new_str(s, &l);
+        if (kv_set(kv, k, "char/utf8", b, l) != 0) { printf("[writer] FAIL set %s\n", k); errors++; }
         free(b);
     }
 
@@ -49,14 +49,14 @@ static int writer(const char *path, int64_t seed) {
     for (int j = 0; j < 1024; j++) big[j] = (uint8_t)(rand() & 0xFF);
     for (int i = 0; i < 20; i++) {
         char k[64]; snprintf(k, sizeof(k), "/mp/big%d", i);
-        uint32_t l; uint8_t *b = enc_bytes(big, 1024, &l);
-        kv_set(kv, k, b, l); free(b);
+        uint32_t l; uint8_t *b = new_bytes(big, 1024, &l);
+        kv_set(kv, k, "", b, l); free(b);
     }
     for (int j = 0; j < 50; j++) {
         char k[64]; snprintf(k, sizeof(k), "/mp/extra%d", j);
         int64_t v = ((int64_t)rand() << 32) | rand();
-        uint32_t l; uint8_t *b = enc_int64(v, &l);
-        kv_set(kv, k, b, l); free(b);
+        uint32_t l; uint8_t *b = new_int64(v, &l);
+        kv_set(kv, k, "int64", b, l); free(b);
     }
 
     printf("[writer] done, errors=%d\n", errors);
@@ -88,7 +88,7 @@ static int reader(const char *path, int64_t seed) {
         uint32_t l; uint8_t *v = kv_get(kv, k, &l);
         if (v && l > 0) {
             char kind[32]; const uint8_t *body; uint32_t bl;
-            dec(v, l, kind, sizeof(kind), &body, &bl);
+            read_kind(kv, k, v, l, kind, sizeof(kind), &body, &bl);
             if (bl >= 8 && strcmp(kind, "int64") == 0) {
                 int64_t got = *(const int64_t *)body;
                 if (got != expected) {
@@ -108,7 +108,7 @@ static int reader(const char *path, int64_t seed) {
         uint32_t l; uint8_t *v = kv_get(kv, k, &l);
         if (!v || l == 0) continue;
         char kind[32]; const uint8_t *body; uint32_t bl;
-        dec(v, l, kind, sizeof(kind), &body, &bl);
+        read_kind(kv, k, v, l, kind, sizeof(kind), &body, &bl);
         if (strcmp(kind, "char/utf8") != 0) {
             printf("[reader] BADKIND %s: %s\n", k, kind); errors++;
         }
@@ -123,7 +123,7 @@ static int reader(const char *path, int64_t seed) {
         uint32_t l; uint8_t *v = kv_get(kv, k, &l);
         if (v && l > 0) {
             char kind[32]; const uint8_t *body; uint32_t bl;
-            dec(v, l, kind, sizeof(kind), &body, &bl);
+            read_kind(kv, k, v, l, kind, sizeof(kind), &body, &bl);
             if (bl == 1024) big_ok++;
             free(v);
         }

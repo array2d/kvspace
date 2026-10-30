@@ -2,7 +2,8 @@
  *
  * 导出 kvspace* C ABI（与两个后端同名同签名）。运行期按 DSN scheme 用 dlopen
  * （RTLD_NOW | RTLD_LOCAL）装载后端，把 handle 包一层 {vtable, dl, backend}。
- * codec（XvalueEncode、DecodeHead、New 等）与 kvspaceConst 无 handle，由前端静态实现，byte-identical。
+ * XValue 构造（kvspaceNew*，head 固定 8 字节 memcpy + body）与 kvspaceConst
+ * 无 handle，由前端静态实现，byte-identical。
  *
  * 后端装载名（后缀随平台）：
  *   shm://...           → libkvspace-c.so.1       / macOS: libkvspace-c.dylib
@@ -29,7 +30,7 @@ typedef struct {
     void (*free)(void *h);
     int  (*get)(void *h, const char *key, int resolve, uint8_t **out, uint32_t *out_len);
     int  (*setvalue)(void *h, const char *key, const uint8_t *value, uint32_t value_len,
-                     uint8_t ro, uint32_t vid, char *err, uint32_t err_cap);
+                     char *err, uint32_t err_cap);
     int  (*getpart)(void *h, const char *key, uint32_t offset, uint32_t len,
                      uint8_t **out, uint32_t *out_len);
     int  (*setpart)(void *h, const char *key, uint32_t offset, const uint8_t *buf,
@@ -38,8 +39,7 @@ typedef struct {
     int  (*writeinplace)(void *h, const char *key, int resolve, uint32_t body_len,
                          uint8_t **body, char *err, uint32_t err_cap);
     int  (*writenewplace)(void *h, const char *key, uint8_t ref, uint8_t storetype,
-                          uint8_t ro, uint32_t vid, const char *langtype, uint32_t body_len,
-                          uint64_t body_cap,
+                          uint32_t body_len, uint64_t body_cap,
                           uint8_t **body, char *err, uint32_t err_cap);
     int  (*listlen)(void *h, const char *prefix, int expand_ext, int resolve, int32_t *out_count);
     int  (*listat)(void *h, const char *prefix, int expand_ext, int resolve, int32_t idx,
@@ -62,8 +62,8 @@ typedef struct {
                          uint32_t offset, const uint8_t *buf, uint32_t buf_len,
                          char *err, uint32_t err_cap);
     int  (*setvaluebyref)(void *h, kvspaceRef_t *ref, const char *key_fallback,
-                          const uint8_t *value, uint32_t value_len, uint8_t ro,
-                          uint32_t vid, char *err, uint32_t err_cap);
+                          const uint8_t *value, uint32_t value_len,
+                          char *err, uint32_t err_cap);
     int  (*xvalue_body_view)(void *h, const kvspaceRef_t *ref, const char *key_fallback,
                      kvspaceXvalueBodyView_t *out);
     int  (*viewsweep)(void *h);
@@ -272,9 +272,9 @@ int kvspaceGet(void *h, const char *key, int resolve, uint8_t **out, uint32_t *o
 }
 
 int kvspaceSetValue(void *h, const char *key, const uint8_t *value, uint32_t value_len,
-                    uint8_t ro, uint32_t vid, char *err, uint32_t err_cap) {
+                    char *err, uint32_t err_cap) {
     kvspace_handle *x = H(h);
-    return x->vt->setvalue(x->backend, key, value, value_len, ro, vid, err, err_cap);
+    return x->vt->setvalue(x->backend, key, value, value_len, err, err_cap);
 }
 
 int kvspaceResolveRef(void *h, const char *key, kvspaceRef_t *ref) {
@@ -311,15 +311,15 @@ int kvspaceXvalueBodyView(void *h, const kvspaceRef_t *ref, const char *key_fall
 }
 
 int kvspaceSetValueByRef(void *h, kvspaceRef_t *ref, const char *key_fallback,
-                         const uint8_t *value, uint32_t value_len, uint8_t ro,
-                         uint32_t vid, char *err, uint32_t err_cap) {
+                         const uint8_t *value, uint32_t value_len,
+                         char *err, uint32_t err_cap) {
     kvspace_handle *x = H(h);
     if (x->vt->setvaluebyref)
         return x->vt->setvaluebyref(x->backend, ref, key_fallback, value,
-                                    value_len, ro, vid, err, err_cap);
+                                    value_len, err, err_cap);
     if (!key_fallback)
         return 1;
-    return x->vt->setvalue(x->backend, key_fallback, value, value_len, ro, vid,
+    return x->vt->setvalue(x->backend, key_fallback, value, value_len,
                            err, err_cap);
 }
 
@@ -347,11 +347,10 @@ int kvspaceWriteInPlace(void *h, const char *key, int resolve, uint32_t body_len
 }
 
 int kvspaceWriteNewPlace(void *h, const char *key, uint8_t ref, uint8_t storetype,
-                         uint8_t ro, uint32_t vid, const char *langtype, uint32_t body_len,
-                         uint64_t body_cap,
+                         uint32_t body_len, uint64_t body_cap,
                          uint8_t **body, char *err, uint32_t err_cap) {
     kvspace_handle *x = H(h);
-    return x->vt->writenewplace(x->backend, key, ref, storetype, ro, vid, langtype,
+    return x->vt->writenewplace(x->backend, key, ref, storetype,
                                 body_len, body_cap, body, err, err_cap);
 }
 

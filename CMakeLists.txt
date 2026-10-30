@@ -12,7 +12,7 @@ if(CMAKE_INSTALL_PREFIX_INITIALIZED_TO_DEFAULT)
     set(CMAKE_INSTALL_PREFIX "/usr" CACHE PATH "" FORCE)
 endif()
 
-add_library(kvspace SHARED src/frontend.c src/codec_abi.c src/xvalue_head.c src/xvalue_meta.c)
+add_library(kvspace SHARED src/frontend.c src/codec_abi.c src/xvalue_head.c)
 
 include(CTest)
 if(BUILD_TESTING)
@@ -49,8 +49,6 @@ install(TARGETS kvspace
     LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}/kvspace
 )
 install(DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/include/ DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
-install(FILES ${CMAKE_CURRENT_SOURCE_DIR}/src/xvalue_meta.h
-    DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/kvspace)
 
 configure_file(kvspace.pc.in ${CMAKE_CURRENT_BINARY_DIR}/kvspace.pc @ONLY)
 install(FILES ${CMAKE_CURRENT_BINARY_DIR}/kvspace.pc DESTINATION ${CMAKE_INSTALL_LIBDIR}/pkgconfig)

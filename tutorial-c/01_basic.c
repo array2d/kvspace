@@ -27,7 +27,7 @@ static void get(void *kv, const char *key) {
     uint32_t len; uint8_t *v = kv_get(kv, key, &len);
     if (!v || len == 0) { printf("%s\t(nil)\n", key); return; }
     char kind[32]; const uint8_t *body; uint32_t bl;
-    dec(v, len, kind, sizeof(kind), &body, &bl);
+    read_kind(kv, key, v, len, kind, sizeof(kind), &body, &bl);
     printf("%s\t%s:", key, kind);
     if (strcmp(kind, "int64") == 0 && bl >= 8) printf("%ld", *(const int64_t *)body);
     else if (strcmp(kind, "char/utf8") == 0) printf("%.*s", (int)bl, body);
@@ -37,10 +37,10 @@ static void get(void *kv, const char *key) {
 }
 
 static void set_int(void *kv, const char *key, int64_t v) {
-    uint32_t l; uint8_t *b = enc_int64(v, &l); kv_set(kv, key, b, l); free(b);
+    uint32_t l; uint8_t *b = new_int64(v, &l); kv_set(kv, key, "int64", b, l); free(b);
 }
 static void set_str(void *kv, const char *key, const char *s) {
-    uint32_t l; uint8_t *b = enc_str(s, &l); kv_set(kv, key, b, l); free(b);
+    uint32_t l; uint8_t *b = new_str(s, &l); kv_set(kv, key, "char/utf8", b, l); free(b);
 }
 static void list(void *kv, const char *dir, int show_kind) {
     uint32_t len; uint8_t *out = NULL;
@@ -58,7 +58,7 @@ static void list(void *kv, const char *dir, int show_kind) {
             char full[512]; snprintf(full, sizeof(full), "%s%s", dir, name);
             uint32_t vl; uint8_t *v = kv_get(kv, full, &vl);
             if (v) { char kind[32]; const uint8_t *body; uint32_t bl;
-                dec(v, vl, kind, sizeof(kind), &body, &bl);
+                read_kind(kv, full, v, vl, kind, sizeof(kind), &body, &bl);
                 printf("%s\t%s", name, kind);
                 if (strcmp(kind, "int64") == 0 && bl >= 8) printf("\t%ld", *(const int64_t *)body);
                 printf("\n");
@@ -77,7 +77,7 @@ int main(void) {
     remove(path);
     void *kv = kv_open_shm(path);
     if (!kv) return 1;
-    kvspaceMkindex(kv, "/t01/", NULL, 0);
+    kvspaceMkindex(kv, "/t01/", 0, NULL, 0);
 
     printf("=== Set & Get ===\n");
     set_int(kv, "/t01/a", 42);
