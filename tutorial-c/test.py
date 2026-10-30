@@ -7,7 +7,8 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
 BUILD = ROOT.parent / "build" / "tutorial-c"
-INC = "/usr/include"
+# #566：用仓库 include（固定 8 字节 head + New* 构造器）；系统 /usr/include 仍是旧 wire 头。
+INC = str(ROOT.parent / "include")
 LIB = "/usr/lib"
 
 passed = 0

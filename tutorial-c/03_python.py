@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""03_python — ctypes 直调 libkvspace（dispatch 前端），shm:// 后端"""
+"""03_python — ctypes 直调 libkvspace（dispatch 前端），shm:// 后端
+#566：head 固定 8 字节（body 偏移恒 8），类型走 x‥langtype attr key。"""
 
 import ctypes
 import os
@@ -10,17 +11,42 @@ lib = ctypes.CDLL(SO)
 
 U8P = ctypes.POINTER(ctypes.c_uint8)
 U32P = ctypes.POINTER(ctypes.c_uint32)
+U64P = ctypes.POINTER(ctypes.c_uint64)
 CCHARPP = ctypes.POINTER(ctypes.c_char_p)
 
+KVSPACE_XVALUE_HEAD_LEN = 8
 
+
+# 与 kvspaceHead_t 对齐（langtype 由 kvspaceGetHead 从 attr key 填）。
 class Head(ctypes.Structure):
     _fields_ = [
-        ("kindexpr", ctypes.c_uint8 * 256),
-        ("ro", ctypes.c_uint8),
-        ("vid", ctypes.c_uint32),
+        ("headlen", ctypes.c_uint16),
+        ("ref", ctypes.c_uint8),
+        ("storetype", ctypes.c_uint8),
         ("body_len", ctypes.c_int32),
+        ("ndim", ctypes.c_int32),
+        ("dims", ctypes.c_int32 * 8),
+        ("langtype", ctypes.c_char * 256),
+        ("langtype_len", ctypes.c_int32),
         ("body_offset", ctypes.c_int32),
+        ("body_cap", ctypes.c_uint64),
     ]
+
+
+# 固定 8 字节 head：[len:u48 LE@0-5][storetype@6][ptr@7]。
+class XvalueHead(ctypes.Structure):
+    _fields_ = [
+        ("len", ctypes.c_uint8 * 6),
+        ("storetype", ctypes.c_uint8),
+        ("ptr", ctypes.c_uint8),
+    ]
+
+
+def xvalue_head_len(h):
+    v = 0
+    for i in reversed(range(6)):
+        v = (v << 8) | h.len[i]
+    return v
 
 
 def bind(fn, args, restype):
@@ -32,18 +58,21 @@ bind(lib.kvspaceConnect, [ctypes.c_char_p], ctypes.c_void_p)
 bind(lib.kvspaceClose, [ctypes.c_void_p], None)
 # 借用读：out 指向 kvspace 常驻空间，string_at 拷出后不 free。resolve 穿透 link。
 bind(lib.kvspaceGet, [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_int, ctypes.POINTER(U8P), U32P], ctypes.c_int)
+bind(lib.kvspaceGetHead, [ctypes.c_void_p, ctypes.c_char_p, ctypes.POINTER(Head)], ctypes.c_int)
 # 写即构造：就地/新位置二选一原语，往返回的 body 偏移指针写字节。
 bind(lib.kvspaceWriteInPlace, [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_int, ctypes.c_uint32, ctypes.POINTER(U8P), ctypes.c_char_p, ctypes.c_uint32], ctypes.c_int)
-bind(lib.kvspaceWriteNewPlace, [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_char_p, ctypes.c_uint32, ctypes.POINTER(U8P), ctypes.c_char_p, ctypes.c_uint32], ctypes.c_int)
+bind(lib.kvspaceWriteNewPlace, [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_uint8, ctypes.c_uint8,
+                                ctypes.c_char_p, ctypes.c_uint32, ctypes.c_uint64,
+                                ctypes.POINTER(U8P), ctypes.c_char_p, ctypes.c_uint32], ctypes.c_int)
 # 前缀枚举：ListLen 定计数 + 逐 idx ListAt 借用取名。
 bind(lib.kvspaceListLen, [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_int, ctypes.c_int, ctypes.POINTER(ctypes.c_int32)], ctypes.c_int)
-bind(lib.kvspaceListAt, [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_int, ctypes.c_int, ctypes.c_int32, ctypes.POINTER(U8P), U32P], ctypes.c_int)
+bind(lib.kvspaceListAt, [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_int, ctypes.c_int, ctypes.c_int32,
+                         U8P, ctypes.c_uint32, U32P], ctypes.c_int)
 bind(lib.kvspaceDel, [ctypes.c_void_p, CCHARPP, ctypes.c_uint32, ctypes.c_char_p, ctypes.c_uint32], ctypes.c_int)
 bind(lib.kvspaceDelTree, [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_char_p, ctypes.c_uint32], ctypes.c_int)
-bind(lib.kvspaceMkindex, [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_char_p, ctypes.c_uint32], ctypes.c_int)
+bind(lib.kvspaceMkindex, [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_uint32, ctypes.c_char_p, ctypes.c_uint32], ctypes.c_int)
 bind(lib.kvspaceNewInt64, [ctypes.c_int64, ctypes.POINTER(U8P), U32P], ctypes.c_int)
 bind(lib.kvspaceNewChar, [U8P, ctypes.c_uint32, ctypes.POINTER(U8P), U32P], ctypes.c_int)
-bind(lib.kvspaceDecodeHead, [U8P, ctypes.c_uint32, ctypes.POINTER(Head)], ctypes.c_int)
 
 
 def enc_int(v):
@@ -52,7 +81,7 @@ def enc_int(v):
     return ctypes.string_at(out, n.value)
 
 
-def enc_str(s):
+def new_str(s):
     b = s.encode()
     buf = (ctypes.c_uint8 * len(b)).from_buffer_copy(b)
     out, n = U8P(), ctypes.c_uint32()
@@ -60,16 +89,18 @@ def enc_str(s):
     return ctypes.string_at(out, n.value)
 
 
-def decode(data):
-    buf = (ctypes.c_uint8 * len(data)).from_buffer_copy(data)
+# 读 kind：kvspaceGetHead 从 x‥langtype attr key 填 h.langtype，body 从偏移 8 起。
+def read_kind(kv, key, data):
     h = Head()
-    lib.kvspaceDecodeHead(buf, len(data), ctypes.byref(h))
-    kx = bytes(h.kindexpr).split(b"\0", 1)[0].decode()
+    if lib.kvspaceGetHead(kv, key.encode(), ctypes.byref(h)) != 0:
+        return "", b""
+    kx = bytes(h.langtype).split(b"\0", 1)[0].decode()
     if kx.startswith(("*", "@")):
         kx = kx[1:]
     if kx.startswith("["):
         kx = kx[kx.index("]") + 1:]
-    return kx, data[h.body_offset:h.body_offset + h.body_len]
+    bl = h.body_len if h.body_len > 0 else 0
+    return kx, data[KVSPACE_XVALUE_HEAD_LEN:KVSPACE_XVALUE_HEAD_LEN + bl]
 
 
 class KV:
@@ -96,18 +127,22 @@ class KV:
     def __exit__(self, *a):
         self.close()
 
-    def set(self, key, val):
+    # 写即构造：memcpy 固定头取 body_len/storetype/ptr，就地/新位置二选一原语，
+    # 往返回指针写 body。langtype 由调用方显式给（写 x‥langtype attr key）。
+    def set(self, key, langtype, val):
+        if len(val) < KVSPACE_XVALUE_HEAD_LEN:
+            return
         buf = (ctypes.c_uint8 * len(val)).from_buffer_copy(val)
-        h = Head()
-        lib.kvspaceDecodeHead(buf, len(val), ctypes.byref(h))
-        bl = h.body_len if h.body_len > 0 else 0
-        kindexpr = bytes(h.kindexpr).split(b"\0", 1)[0]
+        hd = XvalueHead()
+        ctypes.memmove(ctypes.byref(hd), buf, ctypes.sizeof(hd))
+        bl = xvalue_head_len(hd)
         dst = U8P()
         err = ctypes.create_string_buffer(256)
         if lib.kvspaceWriteInPlace(self.kv, key.encode(), 1, bl, ctypes.byref(dst), err, 256) != 0:
-            lib.kvspaceWriteNewPlace(self.kv, key.encode(), kindexpr, bl, ctypes.byref(dst), err, 256)
+            lib.kvspaceWriteNewPlace(self.kv, key.encode(), hd.ptr, hd.storetype,
+                                     langtype.encode(), bl, bl, ctypes.byref(dst), err, 256)
         if bl > 0 and dst:
-            ctypes.memmove(dst, ctypes.byref(buf, h.body_offset), bl)
+            ctypes.memmove(dst, ctypes.byref(buf, KVSPACE_XVALUE_HEAD_LEN), bl)
 
     def get(self, key):
         out, n = U8P(), ctypes.c_uint32()
@@ -124,7 +159,7 @@ class KV:
         lib.kvspaceDelTree(self.kv, prefix.encode(), None, 0)
 
     def mkindex(self, path):
-        lib.kvspaceMkindex(self.kv, path.encode(), None, 0)
+        lib.kvspaceMkindex(self.kv, path.encode(), 0, None, 0)
 
     def list(self, prefix):
         count = ctypes.c_int32()
@@ -132,8 +167,9 @@ class KV:
             return []
         names = []
         for i in range(count.value):
-            out, n = U8P(), ctypes.c_uint32()
-            if lib.kvspaceListAt(self.kv, prefix.encode(), 0, 1, i, ctypes.byref(out), ctypes.byref(n)) == 0 and out:
+            out = (ctypes.c_uint8 * 1024)()
+            n = ctypes.c_uint32()
+            if lib.kvspaceListAt(self.kv, prefix.encode(), 0, 1, i, out, 1024, ctypes.byref(n)) == 0 and n.value > 0:
                 names.append(ctypes.string_at(out, n.value).decode())
         return names
 
@@ -141,11 +177,11 @@ class KV:
 with KV("/tmp/kvspace_py.shm") as kv:
     kv.mkindex("/py/")
 
-    kv.set("/py/a", enc_int(42))
-    kv.set("/py/b", enc_str("你好"))
+    kv.set("/py/a", "int64", enc_int(42))
+    kv.set("/py/b", "char/utf8", new_str("你好"))
 
     for k in ["/py/a", "/py/b"]:
-        kind, raw = decode(kv.get(k))
+        kind, raw = read_kind(kv.kv, k, kv.get(k))
         if kind == "int64":
             val = struct.unpack("<q", raw)[0]
         else:
