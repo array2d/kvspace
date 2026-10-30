@@ -130,14 +130,36 @@ extern "C" {
         out: *mut *mut u8,
         out_len: *mut u32,
     ) -> c_int;
-    fn kvspaceNewChar(bytes: *const u8, len: u32, out: *mut *mut u8, out_len: *mut u32) -> c_int;
-    fn kvspaceNewBool(v: u8, out: *mut *mut u8, out_len: *mut u32) -> c_int;
-    fn kvspaceNewInt64(v: i64, out: *mut *mut u8, out_len: *mut u32) -> c_int;
-    fn kvspaceNewFloat64(v: f64, out: *mut *mut u8, out_len: *mut u32) -> c_int;
+    fn kvspaceNewChar(
+        bytes: *const u8,
+        len: u32,
+        langtype: *const c_char,
+        out: *mut *mut u8,
+        out_len: *mut u32,
+    ) -> c_int;
+    fn kvspaceNewBool(
+        v: u8,
+        langtype: *const c_char,
+        out: *mut *mut u8,
+        out_len: *mut u32,
+    ) -> c_int;
+    fn kvspaceNewInt64(
+        v: i64,
+        langtype: *const c_char,
+        out: *mut *mut u8,
+        out_len: *mut u32,
+    ) -> c_int;
+    fn kvspaceNewFloat64(
+        v: f64,
+        langtype: *const c_char,
+        out: *mut *mut u8,
+        out_len: *mut u32,
+    ) -> c_int;
     fn kvspaceXvalueHeadNewScalar(
         storetype: u8,
         raw: *const u8,
         raw_len: u32,
+        langtype: *const c_char,
         out: *mut *mut u8,
         out_len: *mut u64,
     ) -> c_int;
@@ -175,30 +197,75 @@ struct Value {
     body: Vec<u8>,
 }
 
-/* head 固定 8 字节 [len:u48 LE@0-5][storetype@6][ptr@7]，body 偏移恒 8；wire 无
-   langtype——类型/形状由 kvspaceGetHead 从 x‥langtype attr key 读。 */
-fn from_wire(kv: *mut c_void, key: &str, data: &[u8]) -> Value {
-    let mut h = zero_head();
-    let ok = unsafe { kvspaceGetHead(kv, cs(key), &mut h) == 0 };
-    let lt = if ok {
-        String::from_utf8_lossy(langtype_bytes(&h)).into_owned()
-    } else {
-        String::new()
+/* head 固定 8 字节 [len:u48 LE@0-5][storetype@6][ptr@7]，body 偏移恒 8；
+   langtype 作为 attr 记录 tag=1 置于 body 之尾（值内，非独立 key，见 #571）。
+   值自描述：直接解 wire，不经 kvspaceGetHead（它对 Ptr 穿透，读不到本体）。 */
+fn from_wire(data: &[u8]) -> Value {
+    if data.len() < KVSPACE_XVALUE_HEAD_LEN {
+        return Value { kind: String::new(), r#ref: 0, dims: vec![], body: vec![] };
+    }
+    let body_len = wire_len(data) as usize;
+    let storetype = data[6];
+    let ptr = data[7];
+    let r#ref = match ptr {
+        1 => 1,
+        2 => 2,
+        _ => {
+            let _ = storetype;
+            0
+        }
     };
+    let lt = wire_langtype(data, body_len);
     let (_ltdims, kind) = parse_langtype(&lt);
-    let ndim = if ok { (h.ndim.max(0) as usize).min(8) } else { 0 };
-    let dims: Vec<i32> = if ok { h.dims[..ndim].to_vec() } else { vec![] };
-    let body = if data.len() > KVSPACE_XVALUE_HEAD_LEN {
-        data[KVSPACE_XVALUE_HEAD_LEN..].to_vec()
+    /* body 只到 head.len 为止；其后是 attr 区，不属 body。 */
+    let start = KVSPACE_XVALUE_HEAD_LEN;
+    let end = (start + body_len).min(data.len());
+    let body = if end > start {
+        data[start..end].to_vec()
     } else {
         vec![]
     };
     Value {
         kind,
-        r#ref: if ok { h.r#ref as i32 } else { 0 },
-        dims,
+        r#ref,
+        dims: vec![],
         body,
     }
+}
+
+/// u48 小端 @0-5（唯一读点，与 C 侧 kvspaceXvalueHeadLen 一致）。
+fn wire_len(data: &[u8]) -> u64 {
+    let mut v = 0u64;
+    for i in (0..6).rev() {
+        v = (v << 8) | data[i] as u64;
+    }
+    v
+}
+
+/// 扫 attr 区取 tag=1（langtype）；无记录/坏 attr → 空串。
+fn wire_langtype(data: &[u8], body_len: usize) -> String {
+    let base = KVSPACE_XVALUE_HEAD_LEN as usize + body_len;
+    if base + 2 > data.len() {
+        return String::new();
+    }
+    let alen = (data[base] as usize) | ((data[base + 1] as usize) << 8);
+    if alen < 2 || base + alen > data.len() {
+        return String::new();
+    }
+    let end = base + alen;
+    let mut p = base + 2;
+    while p + 3 <= end {
+        let tag = data[p];
+        let rlen = (data[p + 1] as usize) | ((data[p + 2] as usize) << 8);
+        if p + 3 + rlen > end {
+            return String::new();
+        }
+        if tag == 1 {
+            return String::from_utf8_lossy(&data[p + 3..p + 3 + rlen]).into_owned();
+        }
+        p += 3 + rlen;
+    }
+    String::new()
 }
 
 /// langtype 无 ref 前缀（ref 是独立字段）：只剥前导 [dims]，其余为基 kind。
@@ -302,7 +369,7 @@ fn get(kv: *mut c_void, key: &str) -> Vec<u8> {
 }
 
 // 解析 value 语法为 (wire, langtype)：langtype 是无前缀裸 kindexpr（int64/[]char/utf8/键·值），
-// 由 set_one 写 x‥langtype attr key（字符串 XValue）；空 = 无类型（不约束指针）。
+// 由 codec 写进值内 attr 区（tag=1 记录，随 head+body 单 key 整体落）；空 = 无类型。
 fn parse_value(raw: &str) -> (Vec<u8>, String) {
     let mut out: *mut u8 = std::ptr::null_mut();
     let mut len: u32 = 0;
@@ -323,13 +390,14 @@ fn parse_value(raw: &str) -> (Vec<u8>, String) {
         if !langtype.contains('·') {
             fatalf("map requires key·value langtype");
         }
-        // 空 body 的短定长头（类型在 x‥langtype attr key，由 layout/明文层写）。
+        // 空 body 的短定长头（langtype 写进值内 attr 区）。
         let mut len64: u64 = 0;
         if unsafe {
             kvspaceXvalueHeadNewScalar(
                 KVSPACE_XVALUE_ST_SHORT,
                 std::ptr::null(),
                 0,
+                cs(langtype),
                 &mut out,
                 &mut len64,
             ) != 0
@@ -342,10 +410,18 @@ fn parse_value(raw: &str) -> (Vec<u8>, String) {
     let split = raw.find(':').unwrap_or(raw.len());
     let kind = &raw[..split];
     let repr = raw[split..].trim_start_matches(':');
+    let langtype = match kind {
+        "int" => "int64",
+        "float" => "float64",
+        "float32" => "float32",
+        "bool" => "bool",
+        _ => "[]char/utf8", // string 与默认字符串
+    };
     match kind {
         "int" => unsafe {
             if kvspaceNewInt64(
                 repr.parse().unwrap_or_else(|_| fatalf(&format!("parse value failed: {:?}", raw))),
+                cs(langtype),
                 &mut out,
                 &mut len,
             ) != 0
@@ -356,6 +432,7 @@ fn parse_value(raw: &str) -> (Vec<u8>, String) {
         "float" => unsafe {
             if kvspaceNewFloat64(
                 repr.parse().unwrap_or_else(|_| fatalf(&format!("parse value failed: {:?}", raw))),
+                cs(langtype),
                 &mut out,
                 &mut len,
             ) != 0
@@ -374,6 +451,7 @@ fn parse_value(raw: &str) -> (Vec<u8>, String) {
                     KVSPACE_XVALUE_ST_SHORT,
                     &f as *const f32 as *const u8,
                     4,
+                    cs(langtype),
                     &mut out,
                     &mut len64,
                 ) != 0
@@ -389,33 +467,39 @@ fn parse_value(raw: &str) -> (Vec<u8>, String) {
                 _ => fatalf(&format!("bool 只接受 true/false: {:?}", raw)),
             };
             unsafe {
-                if kvspaceNewBool(b as u8, &mut out, &mut len) != 0 {
+                if kvspaceNewBool(b as u8, cs(langtype), &mut out, &mut len) != 0 {
                     fatalf(&format!("parse value failed: {:?}", raw));
                 }
             }
         }
         "string" => unsafe {
-            if kvspaceNewChar(repr.as_ptr(), repr.len() as u32, &mut out, &mut len) != 0 {
+            if kvspaceNewChar(
+                repr.as_ptr(),
+                repr.len() as u32,
+                cs(langtype),
+                &mut out,
+                &mut len,
+            ) != 0
+            {
                 fatalf(&format!("parse value failed: {:?}", raw));
             }
         },
-        "nil" => return (Vec::new(), String::new()), // 删除（无 attr）
+        "nil" => return (Vec::new(), String::new()), // 删除（无值）
         "index" => fatalf("use mkindex for directories"),
         // 无 kind 前缀或未识别前缀 → 默认按字符串处理（见 help 的 value 语法）。
         _ => unsafe {
-            if kvspaceNewChar(raw.as_ptr(), raw.len() as u32, &mut out, &mut len) != 0 {
+            if kvspaceNewChar(
+                raw.as_ptr(),
+                raw.len() as u32,
+                cs(langtype),
+                &mut out,
+                &mut len,
+            ) != 0
+            {
                 fatalf(&format!("parse value failed: {:?}", raw));
             }
         },
     }
-    let langtype = match kind {
-        "int" => "int64",
-        "float" => "float64",
-        "float32" => "float32",
-        "bool" => "bool",
-        "string" => "[]char/utf8",
-        _ => "[]char/utf8", // 默认字符串同 string
-    };
     (take_wire(out, len), langtype.to_string())
 }
 
@@ -428,50 +512,13 @@ fn take_wire(out: *mut u8, len: u32) -> Vec<u8> {
     }
 }
 
-// 写主值 + x‥langtype attr key（#566：创建 key 时 attr 与主 key 同时写；
-// 写序 attr 先落、x 后落——x 写=提交点）。attr 值是字符串 XValue（char/utf8，
-// body=明文类型串）。langtype 空（如不约束指针）→ 只写主值。
-fn set_one(kv: *mut c_void, key: &str, val: &[u8], langtype: &str) {
+// 单 key 写整值（head + body + attr 尾，langtype 已在 attr 区内，见 #571）。
+fn set_one(kv: *mut c_void, key: &str, val: &[u8]) {
     if val.is_empty() {
         let key_ptr = cs(key);
         let mut err = [0u8; 256];
         unsafe { kvspaceDel(kv, &key_ptr, 1, err.as_mut_ptr() as *mut c_char, 256) };
         return;
-    }
-    if !langtype.is_empty() {
-        let attr = format!("{key}\u{2025}langtype");
-        let mut out: *mut u8 = std::ptr::null_mut();
-        let mut len: u32 = 0;
-        if unsafe {
-            kvspaceNewChar(
-                langtype.as_ptr(),
-                langtype.len() as u32,
-                &mut out,
-                &mut len,
-            ) != 0
-        } {
-            fatalf("parse value failed: langtype attr key");
-        }
-        let aw = take_wire(out, len);
-        let mut err = [0u8; 256];
-        let rc = unsafe {
-            kvspaceSetValue(
-                kv,
-                cs(&attr),
-                aw.as_ptr(),
-                aw.len() as u32,
-                err.as_mut_ptr() as *mut c_char,
-                256,
-            )
-        };
-        if rc != 0 {
-            let n = err.iter().position(|&b| b == 0).unwrap_or(err.len());
-            fatalf(&format!(
-                "set {} attr key: {}",
-                attr,
-                String::from_utf8_lossy(&err[..n])
-            ));
-        }
     }
     let ck = cs(key);
     let mut err = [0u8; 256];
@@ -550,7 +597,7 @@ fn read_ext(kv: *mut c_void, prefix: &str) -> String {
     if v.is_empty() {
         return String::new();
     }
-    let d = from_wire(kv, prefix, &v);
+    let d = from_wire(&v);
     if d.kind != "extindex" || d.body.is_empty() {
         return String::new();
     }
@@ -617,7 +664,7 @@ fn main() {
                 if v.is_empty() {
                     println!("{}\t(nil)", k);
                 } else {
-                    println!("{}\t{}", k, format_value(&from_wire(kv, k, &v)));
+                    println!("{}\t{}", k, format_value(&from_wire(&v)));
                 }
             }
         }
@@ -625,27 +672,28 @@ fn main() {
             if tail.len() != 2 {
                 fatalf("usage: kvspace set <key> <value>");
             }
-            let (val, langtype) = parse_value(&tail[1]);
-            set_one(kv, &tail[0], &val, &langtype);
+            let (val, _langtype) = parse_value(&tail[1]);
+            set_one(kv, &tail[0], &val);
         }
         "head" => {
             for k in tail {
-                let mut h = zero_head();
-                if unsafe { kvspaceGetHead(kv, cs(k), &mut h) } != 0 {
+                let v = get(kv, k);
+                if v.is_empty() {
                     println!("{}\t(nil)", k);
                 } else {
-                    let lt = String::from_utf8_lossy(langtype_bytes(&h)).into_owned();
-                    let (_, kind) = parse_langtype(&lt);
-                    let dims = &h.dims[..(h.ndim.max(0) as usize).min(8)];
+                    let d = from_wire(&v);
+                    let storetype = v[6];
+                    let ptr = v[7];
+                    let dims = &d.dims[..];
                     println!(
                         "{}\t{}\tref={}\tstoretype={}\tndim={}\tdims=[{}]",
                         k,
-                        kind,
-                        h.r#ref,
-                        h.storetype,
-                        h.ndim,
+                        d.kind,
+                        ptr,
+                        storetype,
+                        dims.len(),
                         dims.iter()
-                            .map(|d| d.to_string())
+                            .map(|x| x.to_string())
                             .collect::<Vec<_>>()
                             .join(",")
                     );
@@ -851,10 +899,10 @@ fn fprint_list(kv: *mut c_void, prefix: &str, show_ext: bool, show_kind: bool) {
         if v.is_empty() {
             println!("{}", c);
         } else if show_kind {
-            let d = from_wire(kv, &full, &v);
+            let d = from_wire(&v);
             println!("{}\t{}\t{}", c, d.kind, plain(&d));
         } else {
-            let d = from_wire(kv, &full, &v);
+            let d = from_wire(&v);
             println!("{}\t{}", c, plain(&d));
         }
     }
@@ -897,10 +945,10 @@ fn fprint_tree(kv: *mut c_void, prefix: &str, indent: &str, show_ext: bool, show
             if v.is_empty() {
                 println!("{}{}{}", indent, branch, c);
             } else if show_kind {
-                let d = from_wire(kv, &full, &v);
+                let d = from_wire(&v);
                 println!("{}{}{}\t{}\t{}", indent, branch, c, d.kind, plain(&d));
             } else {
-                let d = from_wire(kv, &full, &v);
+                let d = from_wire(&v);
                 println!("{}{}{}\t{}", indent, branch, c, plain(&d));
             }
         }

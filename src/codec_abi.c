@@ -22,39 +22,42 @@ int kvspaceNewPtr(const char *target_kindexpr, const char *target,
     /* `any` 不是类型名（空 kindexpr = 不约束，见 spec [[文法与合法性]]）。 */
     if (strcmp(target_kindexpr, "any") == 0)
         return 1;
-    /* target_kindexpr 写入 x‥langtype attr key（由调用方/GetHead 层处理）；
-       head 本体固定，只存指针路径。 */
+    /* target_kindexpr 拼入 value 尾部（单 key 整体，langtype 尾部）。 */
     uint8_t *value = NULL;
     uint64_t total = 0;
     if (kvspaceXvalueHeadNewPtr((const uint8_t *)target,
-                                (uint32_t)strlen(target), &value, &total) != 0)
+                                (uint32_t)strlen(target), target_kindexpr,
+                                &value, &total) != 0)
         return 1;
     return finish(value, total, out, out_len);
 }
 
-int kvspaceNewChar(const uint8_t *bytes, uint32_t len, uint8_t **out, uint32_t *out_len) {
+int kvspaceNewChar(const uint8_t *bytes, uint32_t len, const char *langtype,
+                   uint8_t **out, uint32_t *out_len) {
     if (!out || !out_len || (len && !bytes))
         return 1;
     uint8_t *value = NULL;
     uint64_t total = 0;
-    if (kvspaceXvalueHeadNewSlack(bytes, len, len, &value, &total) != 0)
+    if (kvspaceXvalueHeadNewSlack(bytes, len, len, langtype, &value, &total) != 0)
         return 1;
     return finish(value, total, out, out_len);
 }
 
-int kvspaceNewBool(uint8_t v, uint8_t **out, uint32_t *out_len) {
+int kvspaceNewBool(uint8_t v, const char *langtype,
+                   uint8_t **out, uint32_t *out_len) {
     if (!out || !out_len)
         return 1;
     uint8_t b = v ? 1 : 0;
     uint8_t *value = NULL;
     uint64_t total = 0;
-    if (kvspaceXvalueHeadNewScalar(KVSPACE_XVALUE_ST_SHORT, &b, 1,
+    if (kvspaceXvalueHeadNewScalar(KVSPACE_XVALUE_ST_SHORT, &b, 1, langtype,
                                    &value, &total) != 0)
         return 1;
     return finish(value, total, out, out_len);
 }
 
-int kvspaceNewInt64(int64_t v, uint8_t **out, uint32_t *out_len) {
+int kvspaceNewInt64(int64_t v, const char *langtype,
+                    uint8_t **out, uint32_t *out_len) {
     if (!out || !out_len)
         return 1;
     uint8_t raw[8];
@@ -62,13 +65,14 @@ int kvspaceNewInt64(int64_t v, uint8_t **out, uint32_t *out_len) {
         raw[i] = (uint8_t)((uint64_t)v >> (8 * i));
     uint8_t *value = NULL;
     uint64_t total = 0;
-    if (kvspaceXvalueHeadNewScalar(KVSPACE_XVALUE_ST_SHORT, raw, 8,
+    if (kvspaceXvalueHeadNewScalar(KVSPACE_XVALUE_ST_SHORT, raw, 8, langtype,
                                    &value, &total) != 0)
         return 1;
     return finish(value, total, out, out_len);
 }
 
-int kvspaceNewFloat64(double v, uint8_t **out, uint32_t *out_len) {
+int kvspaceNewFloat64(double v, const char *langtype,
+                      uint8_t **out, uint32_t *out_len) {
     if (!out || !out_len)
         return 1;
     uint64_t bits;
@@ -78,7 +82,7 @@ int kvspaceNewFloat64(double v, uint8_t **out, uint32_t *out_len) {
         raw[i] = (uint8_t)(bits >> (8 * i));
     uint8_t *value = NULL;
     uint64_t total = 0;
-    if (kvspaceXvalueHeadNewScalar(KVSPACE_XVALUE_ST_SHORT, raw, 8,
+    if (kvspaceXvalueHeadNewScalar(KVSPACE_XVALUE_ST_SHORT, raw, 8, langtype,
                                    &value, &total) != 0)
         return 1;
     return finish(value, total, out, out_len);
