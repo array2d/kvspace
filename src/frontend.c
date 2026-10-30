@@ -9,8 +9,8 @@
  *   shm://...           → libkvspace-c.so.1       / macOS: libkvspace-c.dylib
  *   其余（redis/fs/s3） → libkvspace_durable.so.1 / macOS: libkvspace_durable.dylib
  * 先按 SONAME 用 RTLD_NOLOAD 复用宿主已加载的后端（单二进制 memfd 场景），
- * 未命中再 dlopen：优先本前端 .so 所在目录（dladdr，产物可整体随目录分发），
- * 回退固定目录 Linux /usr/lib/kvspace、macOS /usr/local/lib/kvspace。
+ * 未命中再 dlopen：按序试本前端 .so 所在目录、其 kvspace 子目录（dladdr，产物
+ * 可整体随目录分发），回退固定目录 Linux /usr/lib/kvspace、macOS /usr/local/lib/kvspace。
  */
 
 #ifndef _GNU_SOURCE
@@ -24,6 +24,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 
 /* ── 后端 vtable（仅 handle 相关符号；codec 由前端静态实现） ─────────── */
 
@@ -143,29 +144,33 @@ static const char *backend_soname(const char *dsn) {
 #endif
 }
 
-/* 后端目录：优先本前端 .so 所在目录（dladdr，产物可整体放在任意目录如
- * kvlang/bin，后端随同目录），未取到自身路径时回退固定目录
- * Linux /usr/lib/kvspace、macOS /usr/local/lib/kvspace（旧安装布局）。 */
-static char *backend_path(const char *soname, char *buf, size_t cap) {
+/* 候选后端路径（按序装入 cand，返回条数）。
+ *   1. 本前端 .so 所在目录 + soname（前端与后端同目录：单目录分发）
+ *   2. 本前端 .so 所在目录 + kvspace/ + soname（前端 lib/、后端 lib/kvspace/）
+ *   3. 本前端 .so 所在目录 + ../kvspace/ + soname（前端装在子目录里时同效）
+ *   4. 固定目录 Linux /usr/lib/kvspace、macOS /usr/local/lib/kvspace（系统安装）
+ * 四者按序 dlopen，第一条成功的即后端。 */
+#define BACKEND_CANDIDATES 4
+static int backend_paths(const char *soname, char cand[BACKEND_CANDIDATES][4096]) {
+    int n = 0;
     Dl_info info;
-    if (dladdr((const void *)backend_path, &info) && info.dli_fname) {
+    if (dladdr((const void *)backend_paths, &info) && info.dli_fname) {
         const char *slash = strrchr(info.dli_fname, '/');
         if (slash) {
-            size_t dlen = (size_t)(slash - info.dli_fname);
-            if (dlen < cap) {
-                snprintf(buf, cap, "%.*s/%s", (int)dlen, info.dli_fname, soname);
-                return buf;
-            }
+            const int dlen = (int)(slash - info.dli_fname);
+            snprintf(cand[n++], 4096, "%.*s/%s", dlen, info.dli_fname, soname);
+            snprintf(cand[n++], 4096, "%.*s/kvspace/%s", dlen,
+                     info.dli_fname, soname);
+            snprintf(cand[n++], 4096, "%.*s/../kvspace/%s", dlen,
+                     info.dli_fname, soname);
         }
     }
-    const char *dir;
 #if defined(__APPLE__)
-    dir = "/usr/local/lib/kvspace";
+    snprintf(cand[n++], 4096, "/usr/local/lib/kvspace/%s", soname);
 #else
-    dir = "/usr/lib/kvspace";
+    snprintf(cand[n++], 4096, "/usr/lib/kvspace/%s", soname);
 #endif
-    snprintf(buf, cap, "%s/%s", dir, soname);
-    return buf;
+    return n;
 }
 
 /* ── 常量查询（const.h 的 X 宏表生成查找表） ───────────────────────── */
@@ -197,9 +202,10 @@ void *kvspaceConnect(const char *dsn) {
     if (dl) {
         borrowed = 1;
     } else {
-        char path[4096];
-        backend_path(soname, path, sizeof path);
-        dl = dlopen(path, RTLD_NOW | RTLD_LOCAL);
+        char cand[BACKEND_CANDIDATES][4096];
+        const int ncand = backend_paths(soname, cand);
+        for (int i = 0; i < ncand && !dl; i++)
+            dl = dlopen(cand[i], RTLD_NOW | RTLD_LOCAL);
         if (!dl) return NULL;
     }
 
