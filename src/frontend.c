@@ -39,7 +39,7 @@ typedef struct {
     int  (*writeinplace)(void *h, const char *key, int resolve, uint32_t body_len,
                          uint8_t **body, char *err, uint32_t err_cap);
     int  (*writenewplace)(void *h, const char *key, uint8_t ref, uint8_t storetype,
-                          uint32_t body_len, uint64_t body_cap,
+                          uint32_t body_len, uint64_t body_cap, const char *langtype,
                           uint8_t **body, char *err, uint32_t err_cap);
     int  (*listlen)(void *h, const char *prefix, int expand_ext, int resolve, int32_t *out_count);
     int  (*listat)(void *h, const char *prefix, int expand_ext, int resolve, int32_t idx,
@@ -347,11 +347,11 @@ int kvspaceWriteInPlace(void *h, const char *key, int resolve, uint32_t body_len
 }
 
 int kvspaceWriteNewPlace(void *h, const char *key, uint8_t ref, uint8_t storetype,
-                         uint32_t body_len, uint64_t body_cap,
+                         uint32_t body_len, uint64_t body_cap, const char *langtype,
                          uint8_t **body, char *err, uint32_t err_cap) {
     kvspace_handle *x = H(h);
     return x->vt->writenewplace(x->backend, key, ref, storetype,
-                                body_len, body_cap, body, err, err_cap);
+                                body_len, body_cap, langtype, body, err, err_cap);
 }
 
 int kvspaceListLen(void *h, const char *prefix, int expand_ext, int resolve, int32_t *out_count) {

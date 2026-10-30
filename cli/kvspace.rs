@@ -127,17 +127,40 @@ extern "C" {
     fn kvspaceNewPtr(
         target_kindexpr: *const c_char,
         target: *const c_char,
+        langtype: *const c_char,
         out: *mut *mut u8,
         out_len: *mut u32,
     ) -> c_int;
-    fn kvspaceNewChar(bytes: *const u8, len: u32, out: *mut *mut u8, out_len: *mut u32) -> c_int;
-    fn kvspaceNewBool(v: u8, out: *mut *mut u8, out_len: *mut u32) -> c_int;
-    fn kvspaceNewInt64(v: i64, out: *mut *mut u8, out_len: *mut u32) -> c_int;
-    fn kvspaceNewFloat64(v: f64, out: *mut *mut u8, out_len: *mut u32) -> c_int;
+    fn kvspaceNewChar(
+        bytes: *const u8,
+        len: u32,
+        langtype: *const c_char,
+        out: *mut *mut u8,
+        out_len: *mut u32,
+    ) -> c_int;
+    fn kvspaceNewBool(
+        v: u8,
+        langtype: *const c_char,
+        out: *mut *mut u8,
+        out_len: *mut u32,
+    ) -> c_int;
+    fn kvspaceNewInt64(
+        v: i64,
+        langtype: *const c_char,
+        out: *mut *mut u8,
+        out_len: *mut u32,
+    ) -> c_int;
+    fn kvspaceNewFloat64(
+        v: f64,
+        langtype: *const c_char,
+        out: *mut *mut u8,
+        out_len: *mut u32,
+    ) -> c_int;
     fn kvspaceXvalueHeadNewScalar(
         storetype: u8,
         raw: *const u8,
         raw_len: u32,
+        langtype: *const c_char,
         out: *mut *mut u8,
         out_len: *mut u64,
     ) -> c_int;
@@ -175,8 +198,8 @@ struct Value {
     body: Vec<u8>,
 }
 
-/* head 固定 8 字节 [len:u48 LE@0-5][storetype@6][ptr@7]，body 偏移恒 8；wire 无
-   langtype——类型/形状由 kvspaceGetHead 从 x‥langtype attr key 读。 */
+/* head 固定 8 字节 [len:u48 LE@0-5][storetype@6][ptr@7]，body 偏移恒 8；
+   langtype 作为 attr 记录 tag=1 置于 body 之尾（值内，非独立 key，见 #571）。 */
 fn from_wire(kv: *mut c_void, key: &str, data: &[u8]) -> Value {
     let mut h = zero_head();
     let ok = unsafe { kvspaceGetHead(kv, cs(key), &mut h) == 0 };
@@ -188,8 +211,12 @@ fn from_wire(kv: *mut c_void, key: &str, data: &[u8]) -> Value {
     let (_ltdims, kind) = parse_langtype(&lt);
     let ndim = if ok { (h.ndim.max(0) as usize).min(8) } else { 0 };
     let dims: Vec<i32> = if ok { h.dims[..ndim].to_vec() } else { vec![] };
-    let body = if data.len() > KVSPACE_XVALUE_HEAD_LEN {
-        data[KVSPACE_XVALUE_HEAD_LEN..].to_vec()
+    /* body 只到 head.len 为止；其后是 attr 区，不属 body。 */
+    let body_len = if ok { h.body_len.max(0) as usize } else { 0 };
+    let start = KVSPACE_XVALUE_HEAD_LEN;
+    let end = (start + body_len).min(data.len());
+    let body = if end > start {
+        data[start..end].to_vec()
     } else {
         vec![]
     };
@@ -313,7 +340,7 @@ fn parse_value(raw: &str) -> (Vec<u8>, String) {
             Some(i) => (&rest[..i], &rest[i + 1..]),
             None => ("", rest),
         };
-        if unsafe { kvspaceNewPtr(cs(k), cs(t), &mut out, &mut len) != 0 } {
+        if unsafe { kvspaceNewPtr(cs(k), cs(t), cs(k), &mut out, &mut len) != 0 } {
             fatalf(&format!("parse value failed: {:?}", raw));
         }
         let v = take_wire(out, len);
@@ -323,13 +350,14 @@ fn parse_value(raw: &str) -> (Vec<u8>, String) {
         if !langtype.contains('·') {
             fatalf("map requires key·value langtype");
         }
-        // 空 body 的短定长头（类型在 x‥langtype attr key，由 layout/明文层写）。
+        // 空 body 的短定长头（langtype 写进值内 attr 区）。
         let mut len64: u64 = 0;
         if unsafe {
             kvspaceXvalueHeadNewScalar(
                 KVSPACE_XVALUE_ST_SHORT,
                 std::ptr::null(),
                 0,
+                cs(langtype),
                 &mut out,
                 &mut len64,
             ) != 0
@@ -342,10 +370,18 @@ fn parse_value(raw: &str) -> (Vec<u8>, String) {
     let split = raw.find(':').unwrap_or(raw.len());
     let kind = &raw[..split];
     let repr = raw[split..].trim_start_matches(':');
+    let langtype = match kind {
+        "int" => "int64",
+        "float" => "float64",
+        "float32" => "float32",
+        "bool" => "bool",
+        _ => "[]char/utf8", // string 与默认字符串
+    };
     match kind {
         "int" => unsafe {
             if kvspaceNewInt64(
                 repr.parse().unwrap_or_else(|_| fatalf(&format!("parse value failed: {:?}", raw))),
+                cs(langtype),
                 &mut out,
                 &mut len,
             ) != 0
@@ -356,6 +392,7 @@ fn parse_value(raw: &str) -> (Vec<u8>, String) {
         "float" => unsafe {
             if kvspaceNewFloat64(
                 repr.parse().unwrap_or_else(|_| fatalf(&format!("parse value failed: {:?}", raw))),
+                cs(langtype),
                 &mut out,
                 &mut len,
             ) != 0
@@ -374,6 +411,7 @@ fn parse_value(raw: &str) -> (Vec<u8>, String) {
                     KVSPACE_XVALUE_ST_SHORT,
                     &f as *const f32 as *const u8,
                     4,
+                    cs(langtype),
                     &mut out,
                     &mut len64,
                 ) != 0
@@ -389,33 +427,39 @@ fn parse_value(raw: &str) -> (Vec<u8>, String) {
                 _ => fatalf(&format!("bool 只接受 true/false: {:?}", raw)),
             };
             unsafe {
-                if kvspaceNewBool(b as u8, &mut out, &mut len) != 0 {
+                if kvspaceNewBool(b as u8, cs(langtype), &mut out, &mut len) != 0 {
                     fatalf(&format!("parse value failed: {:?}", raw));
                 }
             }
         }
         "string" => unsafe {
-            if kvspaceNewChar(repr.as_ptr(), repr.len() as u32, &mut out, &mut len) != 0 {
+            if kvspaceNewChar(
+                repr.as_ptr(),
+                repr.len() as u32,
+                cs(langtype),
+                &mut out,
+                &mut len,
+            ) != 0
+            {
                 fatalf(&format!("parse value failed: {:?}", raw));
             }
         },
-        "nil" => return (Vec::new(), String::new()), // 删除（无 attr）
+        "nil" => return (Vec::new(), String::new()), // 删除（无值）
         "index" => fatalf("use mkindex for directories"),
         // 无 kind 前缀或未识别前缀 → 默认按字符串处理（见 help 的 value 语法）。
         _ => unsafe {
-            if kvspaceNewChar(raw.as_ptr(), raw.len() as u32, &mut out, &mut len) != 0 {
+            if kvspaceNewChar(
+                raw.as_ptr(),
+                raw.len() as u32,
+                cs(langtype),
+                &mut out,
+                &mut len,
+            ) != 0
+            {
                 fatalf(&format!("parse value failed: {:?}", raw));
             }
         },
     }
-    let langtype = match kind {
-        "int" => "int64",
-        "float" => "float64",
-        "float32" => "float32",
-        "bool" => "bool",
-        "string" => "[]char/utf8",
-        _ => "[]char/utf8", // 默认字符串同 string
-    };
     (take_wire(out, len), langtype.to_string())
 }
 
@@ -428,50 +472,13 @@ fn take_wire(out: *mut u8, len: u32) -> Vec<u8> {
     }
 }
 
-// 写主值 + x‥langtype attr key（#566：创建 key 时 attr 与主 key 同时写；
-// 写序 attr 先落、x 后落——x 写=提交点）。attr 值是字符串 XValue（char/utf8，
-// body=明文类型串）。langtype 空（如不约束指针）→ 只写主值。
-fn set_one(kv: *mut c_void, key: &str, val: &[u8], langtype: &str) {
+// 单 key 写整值（head + body + attr 尾，langtype 已在 attr 区内，见 #571）。
+fn set_one(kv: *mut c_void, key: &str, val: &[u8]) {
     if val.is_empty() {
         let key_ptr = cs(key);
         let mut err = [0u8; 256];
         unsafe { kvspaceDel(kv, &key_ptr, 1, err.as_mut_ptr() as *mut c_char, 256) };
         return;
-    }
-    if !langtype.is_empty() {
-        let attr = format!("{key}\u{2025}langtype");
-        let mut out: *mut u8 = std::ptr::null_mut();
-        let mut len: u32 = 0;
-        if unsafe {
-            kvspaceNewChar(
-                langtype.as_ptr(),
-                langtype.len() as u32,
-                &mut out,
-                &mut len,
-            ) != 0
-        } {
-            fatalf("parse value failed: langtype attr key");
-        }
-        let aw = take_wire(out, len);
-        let mut err = [0u8; 256];
-        let rc = unsafe {
-            kvspaceSetValue(
-                kv,
-                cs(&attr),
-                aw.as_ptr(),
-                aw.len() as u32,
-                err.as_mut_ptr() as *mut c_char,
-                256,
-            )
-        };
-        if rc != 0 {
-            let n = err.iter().position(|&b| b == 0).unwrap_or(err.len());
-            fatalf(&format!(
-                "set {} attr key: {}",
-                attr,
-                String::from_utf8_lossy(&err[..n])
-            ));
-        }
     }
     let ck = cs(key);
     let mut err = [0u8; 256];
@@ -625,8 +632,8 @@ fn main() {
             if tail.len() != 2 {
                 fatalf("usage: kvspace set <key> <value>");
             }
-            let (val, langtype) = parse_value(&tail[1]);
-            set_one(kv, &tail[0], &val, &langtype);
+            let (val, _langtype) = parse_value(&tail[1]);
+            set_one(kv, &tail[0], &val);
         }
         "head" => {
             for k in tail {

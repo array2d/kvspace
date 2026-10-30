@@ -6,9 +6,9 @@
  *   shm://...      → libkvspace-c.so.1
  *   其余（redis/fs/s3）→ libkvspace_durable.so.1
  *
- * Wire: [len:u48 LE@0-5][storetype:u8@6][ptr:u8@7][body@8]. Head is fixed
- * 8 bytes; body offset is always 8. Type/shape lives in the x‥langtype
- * attr key as a plaintext langtype string.
+ * Wire: [len:u48 LE@0-5][storetype:u8@6][ptr:u8@7][body@8][langtype@8+len].
+ * Head is fixed 8 bytes; body offset is always 8; langtype (plaintext UTF-8,
+ * incl. dims) is the value tail at 8+len. Single-key write — no attr key.
  */
 
 #ifndef KVSPACE_H
@@ -33,7 +33,7 @@ extern "C" {
 #define KVSPACE_STORETYPE_FIXED_LARGE 2
 #define KVSPACE_STORETYPE_EXT         3
 
-/* XValue 元数据。ro/vid 来自 GetHead 的 attr key。 */
+/* XValue 元数据。langtype 取自 value 尾部 @8+len。 */
 typedef struct {
     uint16_t headlen;       /* head 总字节数；body 起于偏移 headlen */
     uint8_t  ref;           /* 存储位置：见 KVSPACE_REF_* */
@@ -146,7 +146,7 @@ int kvspaceGetPart(void *h, const char *key, uint32_t offset, uint32_t len,
 int kvspaceSetPart(void *h, const char *key, uint32_t offset, const uint8_t *buf,
                     uint32_t buf_len, char *err, uint32_t err_cap);
 
-/* Read the wire head and ro/vid attr key. Missing keys return nonzero. */
+/* Read the wire head + langtype tail. Missing keys return nonzero. */
 int kvspaceGetHead(void *h, const char *key, kvspaceHead_t *out);
 
 /* 就地写：key 必须已存在、kind 不变、body_len 必须等于原 body_len——返回原 box 的 body
@@ -157,9 +157,9 @@ int kvspaceWriteInPlace(void *h, const char *key, int resolve, uint32_t body_len
                         uint8_t **body, char *err, uint32_t err_cap);
 
 /* Reserve a new XValue and return its body pointer; fill it before another KVSpace call.
- * kvspace 层不写 attr key——langtype 由上层调用方写 `x‥langtype` attr key（attr 先落、x 后落）。 */
+ * langtype（可为空 = 无类型）随头/尾部整体写入——单 key 一次写。 */
 int kvspaceWriteNewPlace(void *h, const char *key, uint8_t ref, uint8_t storetype,
-                         uint32_t body_len, uint64_t body_cap,
+                         uint32_t body_len, uint64_t body_cap, const char *langtype,
                          uint8_t **body, char *err, uint32_t err_cap);
 
 /* 只返回前缀下子项计数，无缓冲、无需释放。resolve=1 穿透 link。 */
@@ -186,15 +186,19 @@ int kvspaceWatch(void *h, const char *key, const uint8_t *target, uint32_t targe
                  uint64_t tick_ns, uint8_t **out, uint32_t *out_len);
 
 /* ── XValue 构造（无 handle，由前端静态实现，byte-identical）───────────
- * head 固定 8 字节，直接 memcpy struct + body（见 kvspace/xvalue_head.h），
- * 类型/形状走 x‥langtype attr key（kvspaceGetHead 读）。 */
+ * head 固定 8 字节，直接 memcpy struct + body + langtype 尾部
+ * （见 kvspace/xvalue_head.h）。langtype 为空串 = 无类型（不追加尾部）。 */
 
 int kvspaceNewPtr(const char *target_kindexpr, const char *target,
                   uint8_t **out, uint32_t *out_len);
-int kvspaceNewChar(const uint8_t *bytes, uint32_t len, uint8_t **out, uint32_t *out_len);
-int kvspaceNewBool(uint8_t v, uint8_t **out, uint32_t *out_len);
-int kvspaceNewInt64(int64_t v, uint8_t **out, uint32_t *out_len);
-int kvspaceNewFloat64(double v, uint8_t **out, uint32_t *out_len);
+int kvspaceNewChar(const uint8_t *bytes, uint32_t len, const char *langtype,
+                   uint8_t **out, uint32_t *out_len);
+int kvspaceNewBool(uint8_t v, const char *langtype,
+                   uint8_t **out, uint32_t *out_len);
+int kvspaceNewInt64(int64_t v, const char *langtype,
+                    uint8_t **out, uint32_t *out_len);
+int kvspaceNewFloat64(double v, const char *langtype,
+                      uint8_t **out, uint32_t *out_len);
 
 #ifdef __cplusplus
 }
