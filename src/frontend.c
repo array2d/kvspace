@@ -9,7 +9,8 @@
  *   shm://...           → libkvspace-c.so.1       / macOS: libkvspace-c.dylib
  *   其余（redis/fs/s3） → libkvspace_durable.so.1 / macOS: libkvspace_durable.dylib
  * 先按 SONAME 用 RTLD_NOLOAD 复用宿主已加载的后端（单二进制 memfd 场景），
- * 未命中再按固定目录 dlopen：Linux /usr/lib/kvspace、macOS /usr/local/lib/kvspace。
+ * 未命中再 dlopen：优先本前端 .so 所在目录（dladdr，产物可整体随目录分发），
+ * 回退固定目录 Linux /usr/lib/kvspace、macOS /usr/local/lib/kvspace。
  */
 
 #ifndef _GNU_SOURCE
@@ -142,9 +143,21 @@ static const char *backend_soname(const char *dsn) {
 #endif
 }
 
-/* 后端目录固定（运行期没有目录类环境变量）：Linux /usr/lib/kvspace；
- * macOS /usr/local/lib/kvspace（/usr 受 SIP 保护）。 */
+/* 后端目录：优先本前端 .so 所在目录（dladdr，产物可整体放在任意目录如
+ * kvlang/bin，后端随同目录），未取到自身路径时回退固定目录
+ * Linux /usr/lib/kvspace、macOS /usr/local/lib/kvspace（旧安装布局）。 */
 static char *backend_path(const char *soname, char *buf, size_t cap) {
+    Dl_info info;
+    if (dladdr((const void *)backend_path, &info) && info.dli_fname) {
+        const char *slash = strrchr(info.dli_fname, '/');
+        if (slash) {
+            size_t dlen = (size_t)(slash - info.dli_fname);
+            if (dlen < cap) {
+                snprintf(buf, cap, "%.*s/%s", (int)dlen, info.dli_fname, soname);
+                return buf;
+            }
+        }
+    }
     const char *dir;
 #if defined(__APPLE__)
     dir = "/usr/local/lib/kvspace";
