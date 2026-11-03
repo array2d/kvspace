@@ -4,8 +4,9 @@
 #include <stdlib.h>
 #include <string.h>
 
-/* 固定 head 8 字节 [len:u48 LE@0-5][storetype@6][ptr@7]，body 偏移恒 8，
-   attr 区 @8+len（attr_len:u16 自描述，含 langtype 记录）。单 key 整体——无 attr key。 */
+/* 固定 head 16 字节 [bodylen:u64@0][attrslen:u32@8][storetype@12][ptr@13][pad@14]，
+   body 偏移恒 16，attr 区紧随 body 且**无**自带长度前缀（长度只在 head 里）。
+   单 key 整体——无 attr key。 */
 
 static int failures = 0;
 #define CHECK(cond, ...)                                                       \
@@ -18,34 +19,40 @@ static int failures = 0;
         }                                                                      \
     } while (0)
 
-/* 校验 attr 区：total = 8+body_len+attr_len；langtype 记录存在且与 lt 一致。 */
+/* 校验 head 与 attr 区：head 的 bodylen/attrslen/padding 正确，
+   total = 16+bodylen+attrslen；langtype 记录存在且与 lt 一致。 */
 static int attr_ok(const uint8_t *v, uint64_t total, uint64_t body_len,
                    const char *lt) {
     size_t l = strlen(lt);
-    const uint8_t *a = v + KVSPACE_XVALUE_HEAD_LEN + body_len;
-    uint64_t alen = (uint64_t)a[0] | ((uint64_t)a[1] << 8);
+    kvspaceXvalueHead h;
+    memcpy(&h, v, sizeof h);
+    if (kvspaceXvalueHeadLen(&h) != body_len || !kvspaceXvalueHeadPaddingIsZero(&h))
+        return 0;
+    const uint64_t alen = kvspaceXvalueHeadAttrsLen(&h);
     if (total != KVSPACE_XVALUE_HEAD_LEN + body_len + alen)
         return 0;
+    const uint8_t *a = v + KVSPACE_XVALUE_HEAD_LEN + body_len;
     if (l == 0)
-        return alen == 2;
-    if (alen != 2 + 3 + l)
+        return alen == 0;
+    if (alen != 3 + l)
         return 0;
-    return a[2] == KVSPACE_XVALUE_ATTR_TAG_LANGTYPE && a[3] == l && a[4] == 0 &&
-           memcmp(a + 5, lt, l) == 0;
+    return a[0] == KVSPACE_XVALUE_ATTR_TAG_LANGTYPE && a[1] == l && a[2] == 0 &&
+           memcmp(a + 3, lt, l) == 0;
 }
 
 static void test_none(void) {
     uint8_t *buf = NULL;
     uint64_t n = 0;
     CHECK(kvspaceXvalueHeadNewNone(&buf, &n) == 0, "none new");
-    CHECK(n == 10, "none len %llu", (unsigned long long)n);
+    CHECK(n == 16, "none len %llu", (unsigned long long)n);
     kvspaceXvalueHead h;
     memcpy(&h, buf, sizeof h);
     CHECK(h.storetype == KVSPACE_XVALUE_ST_SHORT &&
           h.ptr == KVSPACE_XVALUE_PTR_INLINE && kvspaceXvalueHeadLen(&h) == 0, "none head");
-    /* wire 布局：len:u48@0-5、storetype@6、ptr@7、attr_len@8 */
-    CHECK(buf[0] == 0 && buf[5] == 0 &&
-          buf[6] == KVSPACE_XVALUE_ST_SHORT && buf[7] == KVSPACE_XVALUE_PTR_INLINE,
+    /* wire 布局：bodylen:u64@0、attrslen:u32@8、storetype@12、ptr@13、pad@14 */
+    CHECK(buf[0] == 0 && buf[7] == 0 && buf[8] == 0 && buf[11] == 0 &&
+          buf[12] == KVSPACE_XVALUE_ST_SHORT &&
+          buf[13] == KVSPACE_XVALUE_PTR_INLINE && buf[14] == 0 && buf[15] == 0,
           "none wire layout");
     CHECK(attr_ok(buf, n, 0, ""), "none empty attr");
     free(buf);
@@ -57,7 +64,7 @@ static void test_scalar(void) {
     uint64_t n = 0;
     CHECK(kvspaceXvalueHeadNewScalar(KVSPACE_XVALUE_ST_SHORT, raw, 8, "int64",
                                      &buf, &n) == 0, "i64 new");
-    CHECK(n == 26, "i64 len %llu", (unsigned long long)n);
+    CHECK(n == 32, "i64 len %llu", (unsigned long long)n);
     kvspaceXvalueHead h;
     memcpy(&h, buf, sizeof h);
     CHECK(kvspaceXvalueHeadLen(&h) == 8 && h.storetype == KVSPACE_XVALUE_ST_SHORT, "i64 head");
@@ -67,7 +74,7 @@ static void test_scalar(void) {
     /* 无类型（空 langtype）：空 attr [attr_len:2]。 */
     CHECK(kvspaceXvalueHeadNewScalar(KVSPACE_XVALUE_ST_SHORT, raw, 8, "",
                                      &buf, &n) == 0, "scalar no-langtype");
-    CHECK(n == 18, "no-langtype len %llu", (unsigned long long)n);
+    CHECK(n == 24, "no-langtype len %llu", (unsigned long long)n);
     CHECK(attr_ok(buf, n, 8, ""), "no-langtype empty attr");
     free(buf);
 }
@@ -77,14 +84,15 @@ static void test_slack(void) {
     uint8_t *buf = NULL;
     uint64_t n = 0;
     CHECK(kvspaceXvalueHeadNewSlack(hi, 2, 2, "[]char/utf8", &buf, &n) == 0, "slack new");
-    CHECK(n == 26, "slack len %llu", (unsigned long long)n);
+    CHECK(n == 32, "slack len %llu", (unsigned long long)n);
     kvspaceXvalueHead h;
     memcpy(&h, buf, sizeof h);
     CHECK(h.storetype == KVSPACE_XVALUE_ST_SLACK &&
           kvspaceXvalueHeadLen(&h) == 2, "slack head");
-    /* wire：len u48 LE@0-5=2，storetype@6，ptr@7 */
-    CHECK(buf[0] == 2 && buf[1] == 0 && buf[5] == 0 &&
-          buf[6] == KVSPACE_XVALUE_ST_SLACK && buf[7] == KVSPACE_XVALUE_PTR_INLINE,
+    /* wire：bodylen u64 LE@0=2，storetype@12，ptr@13，pad@14-15 为零 */
+    CHECK(buf[0] == 2 && buf[1] == 0 && buf[7] == 0 &&
+          buf[12] == KVSPACE_XVALUE_ST_SLACK &&
+          buf[13] == KVSPACE_XVALUE_PTR_INLINE && buf[14] == 0 && buf[15] == 0,
           "slack wire layout");
     CHECK(memcmp(buf + KVSPACE_XVALUE_HEAD_LEN, hi, 2) == 0, "slack body");
     CHECK(attr_ok(buf, n, 2, "[]char/utf8"), "slack langtype attr");
@@ -100,7 +108,7 @@ static void test_tensor(void) {
     uint64_t n = 0;
     CHECK(kvspaceXvalueHeadNewTensor(dims, 2, raw, sizeof raw, "[2,3]int64",
                                      &buf, &n) == 0, "tensor new");
-    CHECK(n == 8 + 24 + 15, "tensor len %llu", (unsigned long long)n);
+    CHECK(n == 53, "tensor len %llu", (unsigned long long)n);
     kvspaceXvalueHead h;
     memcpy(&h, buf, sizeof h);
     CHECK(h.storetype == KVSPACE_XVALUE_ST_LARGE &&
@@ -117,7 +125,7 @@ static void test_ptr_ext(void) {
     uint64_t n = 0;
     CHECK(kvspaceXvalueHeadNewPtr((const uint8_t *)"/varx", 5, "int64",
                                   &buf, &n) == 0, "ptr new");
-    CHECK(n == 8 + 5 + 10, "ptr len %llu", (unsigned long long)n);
+    CHECK(n == 16 + 5 + 8, "ptr len %llu", (unsigned long long)n);
     kvspaceXvalueHead h;
     memcpy(&h, buf, sizeof h);
     CHECK(h.storetype == KVSPACE_XVALUE_ST_SLACK &&
@@ -142,7 +150,7 @@ static void test_reserve_code(void) {
     uint64_t len = 0;
     CHECK(kvspaceXvalueHeadReserve(KVSPACE_XVALUE_ST_SLACK, 7, 10, "[]u8",
                                    &value, &len) == 0, "reserve slack");
-    CHECK(len == 8 + 7 + 9, "reserve len");
+    CHECK(len == 30, "reserve len");
     kvspaceXvalueHead h;
     memcpy(&h, value, sizeof h);
     CHECK(kvspaceXvalueHeadLen(&h) == 7, "reserve head len");
@@ -290,22 +298,24 @@ static void test_bounded_and_reserve_fail(void) {
     CHECK(kvspaceXvalueHeadLangtypeBounded(bad_alen, sizeof bad_alen, &lt) == 0 && lt == NULL,
           "bounded rejects attr_len < 2");
 
-    /* Truncated record: attr_len fits in wire_len, but p + 3 + rlen > end */
-    uint8_t trunc_rec[15] = {
-        0, 0, 0, 0, 0, 0, 0, 0,             /* head: body_len=0 */
-        7, 0,                               /* attr_len = 7 (end = 15) */
+    /* Truncated record: attrslen fits in wire_len, but p + 3 + rlen > end */
+    uint8_t trunc_rec[16 + 7] = {
+        0, 0, 0, 0, 0, 0, 0, 0,             /* head: bodylen=0 */
+        7, 0, 0, 0,                         /* attrslen=7 (end = 16+7) */
+        0, 0, 0, 0,                         /* storetype/ptr/padding */
         KVSPACE_XVALUE_ATTR_TAG_LANGTYPE,   /* tag = 1 */
-        10, 0,                              /* rlen = 10 -> p+3+10 = 23 > 15 */
+        10, 0,                              /* rlen = 10 -> p+3+10 = 29 > 23 */
         'i', '6'
     };
     lt = &sentinel;
     CHECK(kvspaceXvalueHeadLangtypeBounded(trunc_rec, sizeof trunc_rec, &lt) == 0 && lt == NULL,
           "bounded rejects truncated attr record (p + 3 + rlen > end)");
 
-    /* Trailing record header shorter than 3 bytes (alen = 4 leaves 2 bytes) */
-    uint8_t short_rec_hdr[12] = {
-        0, 0, 0, 0, 0, 0, 0, 0,
-        4, 0,
+    /* Trailing record header shorter than 3 bytes (attrslen = 4 leaves 2 bytes) */
+    uint8_t short_rec_hdr[16 + 2] = {
+        0, 0, 0, 0, 0, 0, 0, 0,             /* bodylen=0 */
+        2, 0, 0, 0,                          /* attrslen=2 -> p+3 > end */
+        0, 0, 0, 0,
         KVSPACE_XVALUE_ATTR_TAG_LANGTYPE, 0
     };
     lt = &sentinel;
@@ -316,11 +326,12 @@ static void test_bounded_and_reserve_fail(void) {
     /* Non-NUL-terminated bounded slice after skipping an unknown tag:
        record 1 is tag=2 (reserved), record 2 is tag=1 (langtype="int64") immediately
        followed by non-NUL byte 9 (next record tag); verify exact rlen=5 slice. */
-    uint8_t multi_non_nul[8 + 0 + 2 + (3 + 2) + (3 + 5) + (3 + 1)] = {
-        0, 0, 0, 0, 0, 0, 0, 0,             /* head: body_len=0 */
-        19, 0,                              /* attr_len = 2 + 5 + 8 + 4 = 19 */
+    uint8_t multi_non_nul[16 + (3 + 2) + (3 + 5) + (3 + 1)] = {
+        0, 0, 0, 0, 0, 0, 0, 0,             /* bodylen=0 */
+        17, 0, 0, 0,                         /* attrslen = 5 + 8 + 4 = 17 */
+        0, 0, 0, 0,
         2, 2, 0, 0xaa, 0xbb,                /* tag=2, rlen=2 */
-        KVSPACE_XVALUE_ATTR_TAG_LANGTYPE, 5, 0, 'i', 'n', 't', '6', '4', /* tag=1, rlen=5 (followed by non-zero) */
+        KVSPACE_XVALUE_ATTR_TAG_LANGTYPE, 5, 0, 'i', 'n', 't', '6', '4', /* tag=1, rlen=5 */
         9, 1, 0, 'Z'                        /* tag=9, rlen=1 -> lt[5] == 9 != '\0' */
     };
     lt = &sentinel;
@@ -329,7 +340,50 @@ static void test_bounded_and_reserve_fail(void) {
           "bounded returns exact non-NUL-terminated slice after skipping unknown tag");
 }
 
+/* padding 是 ABI 的一部分：非零即非法，读取路径必须先过这一关。 */
+static void test_nonzero_padding_is_rejected(void) {
+    uint8_t *buf = NULL;
+    uint64_t n = 0;
+    CHECK(kvspaceXvalueHeadNewScalar(KVSPACE_XVALUE_ST_SHORT,
+                                     (const uint8_t *)"abcd", 4, "int64",
+                                     &buf, &n) == 0, "pad build");
+    const uint8_t *lt = (const uint8_t *)"sentinel";
+    CHECK(kvspaceXvalueHeadLangtypeBounded(buf, n, &lt) == 5 && lt != NULL,
+          "pad zero accepted");
+    buf[14] = 1; /* 破坏 padding */
+    lt = (const uint8_t *)"sentinel";
+    CHECK(kvspaceXvalueHeadLangtypeBounded(buf, n, &lt) == 0 && lt == NULL,
+          "nonzero padding rejected by bounded reader");
+    kvspaceXvalueHead h;
+    memcpy(&h, buf, sizeof h);
+    CHECK(!kvspaceXvalueHeadPaddingIsZero(&h), "helper sees nonzero padding");
+    CHECK(kvspaceXvalueHeadTotalLen(&h) == 0, "total len refuses nonzero padding");
+    buf[14] = 0;
+    buf[15] = 1;
+    lt = (const uint8_t *)"sentinel";
+    CHECK(kvspaceXvalueHeadLangtypeBounded(buf, n, &lt) == 0 && lt == NULL,
+          "nonzero padding byte 2 rejected");
+    free(buf);
+}
+
+/* head 单独就能算出总长：不需要先扫 body 之后的前缀。 */
+static void test_total_len_from_head_only(void) {
+    uint8_t *buf = NULL;
+    uint64_t n = 0;
+    CHECK(kvspaceXvalueHeadNewSlack((const uint8_t *)"xyz", 3, 3, "[]char/utf8",
+                                    &buf, &n) == 0, "total build");
+    kvspaceXvalueHead h;
+    memcpy(&h, buf, sizeof h);
+    CHECK(kvspaceXvalueHeadTotalLen(&h) == n, "total len equals built length");
+    CHECK(kvspaceXvalueHeadAttrsLen(&h) == 3 + 11, "attrslen excludes any prefix");
+    CHECK(kvspaceXvalueHeadAttrs(buf) == buf + KVSPACE_XVALUE_HEAD_LEN + 3,
+          "attrs start right after body");
+    free(buf);
+}
+
 int main(void) {
+    test_nonzero_padding_is_rejected();
+    test_total_len_from_head_only();
     test_none();
     test_scalar();
     test_slack();

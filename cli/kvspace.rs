@@ -5,8 +5,8 @@ use std::env;
 use std::os::raw::{c_char, c_int, c_void};
 use std::process::exit;
 
-/* 固定 head 8 字节（见 kvspace/xvalue_head.h）：body 偏移恒 8。 */
-const KVSPACE_XVALUE_HEAD_LEN: usize = 8;
+/* 固定 head 16 字节（见 kvspace/xvalue_head.h）：body 偏移恒 16。 */
+const KVSPACE_XVALUE_HEAD_LEN: usize = 16;
 const KVSPACE_XVALUE_ST_SHORT: u8 = 0;
 /* head.ptr: 0=inline, 1=ptr, 2=@ext (KVSPACE_XVALUE_PTR_*). */
 const KVSPACE_XVALUE_PTR_PTR: u8 = 1;
@@ -172,8 +172,9 @@ struct Value {
     body: Vec<u8>,
 }
 
-/* head 固定 8 字节 [len:u48 LE@0-5][storetype@6][ptr@7]，body 偏移恒 8；
-   langtype 作为 attr 记录 tag=1 置于 body 之尾（值内，非独立 key，见 #571）。
+/* head 固定 16 字节 [bodylen:u64@0][attrslen:u32@8][storetype@12][ptr@13][pad@14]，
+   body 偏移恒 16，attr 区紧随 body 且无自带长度前缀（长度只在 head 里）；
+   langtype 作为 attr 记录 tag=1 置于 body 之后（值内，非独立 key）。
    值自描述：直接解 wire，不经 kvspaceGetHead（它对 Ptr 穿透，读不到本体）。 */
 fn from_wire(data: &[u8]) -> Value {
     if data.len() < KVSPACE_XVALUE_HEAD_LEN {
@@ -187,22 +188,22 @@ fn from_wire(data: &[u8]) -> Value {
     }
     let body_len = wire_len(data) as usize;
     let (dims, kind) = parse_langtype(&wire_langtype(data, body_len));
-    /* body 只到 head.len 为止；其后是 attr 区，不属 body。 */
+    /* body 只到 head.bodylen 为止；其后是 attr 区，不属 body。 */
     let start = KVSPACE_XVALUE_HEAD_LEN;
     let end = start.saturating_add(body_len).min(data.len());
     Value {
         kind,
-        r#ref: data[7],
-        storetype: data[6],
+        r#ref: data[13],
+        storetype: data[12],
         dims,
         body: data[start..end].to_vec(),
     }
 }
 
-/// u48 小端 @0-5（唯一读点，与 C 侧 kvspaceXvalueHeadLen 一致）。
+/// bodylen:u64 小端 @0-7（唯一读点，与 C 侧 kvspaceXvalueHeadLen 一致）。
 fn wire_len(data: &[u8]) -> u64 {
     let mut v = 0u64;
-    for i in (0..6).rev() {
+    for i in (0..8).rev() {
         v = (v << 8) | data[i] as u64;
     }
     v
@@ -211,15 +212,19 @@ fn wire_len(data: &[u8]) -> u64 {
 /// 扫 attr 区取 tag=1（langtype）；无记录/坏 attr → 空串。
 fn wire_langtype(data: &[u8], body_len: usize) -> String {
     let base = KVSPACE_XVALUE_HEAD_LEN.saturating_add(body_len);
-    if base.saturating_add(2) > data.len() {
+    /* attrslen:u32 @8-11；attr 区无自带前缀。padding 非零视为非法。 */
+    if data.len() < KVSPACE_XVALUE_HEAD_LEN || data[14] != 0 || data[15] != 0 {
         return String::new();
     }
-    let alen = (data[base] as usize) | ((data[base + 1] as usize) << 8);
-    if alen < 2 || base + alen > data.len() {
+    let alen = (data[8] as usize)
+        | ((data[9] as usize) << 8)
+        | ((data[10] as usize) << 16)
+        | ((data[11] as usize) << 24);
+    if base + alen > data.len() {
         return String::new();
     }
     let end = base + alen;
-    let mut p = base + 2;
+    let mut p = base;
     while p + 3 <= end {
         let tag = data[p];
         let rlen = (data[p + 1] as usize) | ((data[p + 2] as usize) << 8);
