@@ -6,11 +6,17 @@
  *   shm://...      → libkvspace-c.so.1
  *   其余（redis/fs/s3）→ libkvspace_durable.so.1
  *
- * Wire: [len:u48 LE@0-5][storetype:u8@6][ptr:u8@7][body@8][attr@8+len].
- * Head is fixed 8 bytes; body offset is always 8. attr = [attr_len:u16 LE]
- * + records [tag:u8][len:u16 LE][data]; tag 1 = langtype (plaintext UTF-8,
- * incl. leading [dims]). Empty attr = 2 bytes. Single-key write — no attr key.
- * See kvspace/xvalue_head.h.
+ * Wire: [bodylen:u64 LE@0][attrslen:u32 LE@8][storetype:u8@12][ptr:u8@13]
+ *       [padding:u8@14, must be zero][padding:u8@15, must be zero]
+ *       [body@16][attr records].
+ * Head is fixed 16 bytes, so the body offset equals the head length — never a
+ * literal; read it from kvspaceXvalueHeadLen / the `headlen` field below.
+ * The attr region carries NO length prefix: its size is attrslen in the head,
+ * so a second prefix would be a second source of truth. Records are
+ * [tag:u8][len:u16 LE][data]; tag 1 = langtype (plaintext UTF-8, incl. leading
+ * [dims]). Empty attr = attrslen 0. Single-key write — no attr key.
+ * Total length = 16 + bodylen + attrslen.
+ * See kvspace/xvalue_head.h for the authoritative layout and helpers.
  */
 
 #ifndef KVSPACE_H
@@ -192,8 +198,8 @@ int kvspaceWatch(void *h, const char *key, const uint8_t *target, uint32_t targe
                  uint64_t tick_ns, uint8_t **out, uint32_t *out_len);
 
 /* XValue constructors (stateless, implemented in frontend, byte-identical across backends).
- * Fixed 8-byte header + body + attr region (see kvspace/xvalue_head.h).
- * Empty/NULL langtype = untyped (omits langtype record; attr region is just 2-byte attr_len). */
+ * Fixed 16-byte header + body + attr region (see kvspace/xvalue_head.h).
+ * Empty/NULL langtype = untyped (omits the langtype record; then attrslen is 0). */
 
 /* Construct a leaf Ptr XValue (storetype=SLACK, ptr=PTR, body=target path bytes,
  * target_kindexpr written to attr tag=1; "" means unconstrained; rejects "any" and empty target).

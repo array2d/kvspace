@@ -71,7 +71,7 @@ static void test_scalar(void) {
     CHECK(memcmp(buf + KVSPACE_XVALUE_HEAD_LEN, raw, 8) == 0, "i64 body@8");
     CHECK(attr_ok(buf, n, 8, "int64"), "i64 langtype attr");
     free(buf);
-    /* 无类型（空 langtype）：空 attr [attr_len:2]。 */
+    /* 无类型（空 langtype）：attr 区为空，attrslen = 0。 */
     CHECK(kvspaceXvalueHeadNewScalar(KVSPACE_XVALUE_ST_SHORT, raw, 8, "",
                                      &buf, &n) == 0, "scalar no-langtype");
     CHECK(n == 24, "no-langtype len %llu", (unsigned long long)n);
@@ -275,28 +275,30 @@ static void test_bounded_and_reserve_fail(void) {
     CHECK(kvspaceXvalueHeadLangtypeBounded(short_wire, 9, &lt) == 0 && lt == NULL,
           "bounded wire_len=9 (< 10)");
 
-    /* body_len > wire_len - 10 (legacy wire without attr tail or truncated body) */
+    /* 截断的 wire：head 说 body+attrs 比实际字节多（head 自己就必须能挡住）。 */
     CHECK(kvspaceXvalueHeadReserve(KVSPACE_XVALUE_ST_SLACK, 4, 4, "int32", &buf, &n) == 0,
           "reserve for truncation checks");
     lt = &sentinel;
     CHECK(kvspaceXvalueHeadLangtypeBounded(buf, KVSPACE_XVALUE_HEAD_LEN + 4, &lt) == 0 &&
               lt == NULL,
-          "bounded rejects wire without 2-byte attr_len (body_len > wire_len - 10)");
+          "bounded rejects wire cut before the attr region");
     lt = &sentinel;
     CHECK(kvspaceXvalueHeadLangtypeBounded(buf, KVSPACE_XVALUE_HEAD_LEN + 4 + 1, &lt) == 0 &&
               lt == NULL,
-          "bounded rejects 1-byte truncated attr_len");
-    /* attr_len exceeds remaining room (truncate last byte) */
+          "bounded rejects wire cut one byte into the attr region");
+    /* attrslen 超出剩余字节（掐掉最后一个字节） */
     lt = &sentinel;
     CHECK(kvspaceXvalueHeadLangtypeBounded(buf, n - 1, &lt) == 0 && lt == NULL,
-          "bounded rejects attr_len exceeding remaining room");
+          "bounded rejects attrslen exceeding the remaining bytes");
     free(buf);
 
-    /* attr_len < 2 */
-    uint8_t bad_alen[10] = {0, 0, 0, 0, 0, 0, 0, 0, 1, 0};
+    /* attrslen 放不下一个 record 头（< 3）：无法解析即失败。 */
+    uint8_t bad_alen[16 + 1] = {0};
+    bad_alen[8] = 1;
     lt = &sentinel;
-    CHECK(kvspaceXvalueHeadLangtypeBounded(bad_alen, sizeof bad_alen, &lt) == 0 && lt == NULL,
-          "bounded rejects attr_len < 2");
+    CHECK(kvspaceXvalueHeadLangtypeBounded(bad_alen, sizeof bad_alen, &lt) == 0 &&
+              lt == NULL,
+          "bounded rejects attrslen smaller than a record header");
 
     /* Truncated record: attrslen fits in wire_len, but p + 3 + rlen > end */
     uint8_t trunc_rec[16 + 7] = {
