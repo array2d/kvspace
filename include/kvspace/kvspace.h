@@ -165,7 +165,16 @@ int kvspaceWriteInPlace(void *h, const char *key, int resolve, uint32_t body_len
                         uint8_t **body, char *err, uint32_t err_cap);
 
 /* Reserve a new XValue and return its body pointer; fill it before another KVSpace call.
- * langtype (empty/NULL = untyped) is written with the header/attr in a single-key write. */
+ * langtype (empty/NULL = untyped) is written with the header/attr in a single-key write.
+ *
+ * `storetype` carries no information in the current XValue model: the storage form is
+ * derived from langtype and `layout` is derived from `body_cap > body_len`. The
+ * parameter stays only because the frontend dispatches through a function-pointer
+ * table, so every backend export must keep the exact argument list. Implementations
+ * must not branch on it and must not validate its value; `ref` is still meaningful
+ * (0 inline / 1 pointer / 2 extension) and becomes the `*` / `@` langtype prefix.
+ * Removing the parameter and the KVSPACE_STORETYPE_* constants is a separate ABI
+ * change that must sweep every caller at once. */
 int kvspaceWriteNewPlace(void *h, const char *key, uint8_t ref, uint8_t storetype,
                          uint32_t body_len, uint64_t body_cap, const char *langtype,
                          uint8_t **body, char *err, uint32_t err_cap);
