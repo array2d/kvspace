@@ -7,8 +7,13 @@ use std::process::exit;
 
 /* 固定 head 16 字节（见 kvspace/xvalue_head.h）：body 偏移恒 16。 */
 const KVSPACE_XVALUE_HEAD_LEN: usize = 16;
-const KVSPACE_XVALUE_ST_SHORT: u8 = 0;
-/* head.ptr: 0=inline, 1=ptr, 2=@ext (KVSPACE_XVALUE_PTR_*). */
+/* head 只有 layout@12：0=bodylen 是有效长度，1=容量（有效长度在 attr tag 2）。
+   指针/扩展性**不在 head**，看 langtype 首字符 `*`/`@`。 */
+const KVSPACE_XVALUE_LAYOUT_CAPACITY: u8 = 1;
+/* 后端写侧 storage class（由 layout/dims 推出，传给 kvspaceWriteNewPlace）。 */
+const KVSPACE_STORETYPE_FIXED_SMALL: u8 = 0;
+const KVSPACE_STORETYPE_SLACK: u8 = 1;
+const KVSPACE_STORETYPE_FIXED_LARGE: u8 = 2;
 const KVSPACE_XVALUE_PTR_PTR: u8 = 1;
 const KVSPACE_XVALUE_PTR_EXT: u8 = 2;
 
@@ -131,7 +136,6 @@ extern "C" {
         out_len: *mut u32,
     ) -> c_int;
     fn kvspaceXvalueHeadNewScalar(
-        storetype: u8,
         raw: *const u8,
         raw_len: u32,
         langtype: *const c_char,
@@ -166,16 +170,16 @@ fn fail_op(err: &[u8; 256], op: &str) -> ! {
 
 struct Value {
     kind: String,   // Base kind (langtype without leading [dims])
-    r#ref: u8,      // head.ptr: 0=inline, 1=ptr, 2=@ext
-    storetype: u8,  // head.storetype
+    r#ref: u8,      // langtype 前缀：0=普通, 1=`*`, 2=`@`
+    storetype: u8,  // 后端 storage class（由 layout/dims 推出，不在 head）
     dims: Vec<i32>, // Leading [dims] parsed from langtype
     body: Vec<u8>,
 }
 
-/* head 固定 16 字节 [bodylen:u64@0][attrslen:u32@8][storetype@12][ptr@13][pad@14]，
+/* head 固定 16 字节 [bodylen:u64@0][attrslen:u32@8][layout@12][padding@13-15]，
    body 偏移恒 16，attr 区紧随 body 且无自带长度前缀（长度只在 head 里）；
    langtype 作为 attr 记录 tag=1 置于 body 之后（值内，非独立 key）。
-   值自描述：直接解 wire，不经 kvspaceGetHead（它对 Ptr 穿透，读不到本体）。 */
+   值自描述：直接解 wire（取头函数已删除；它对 Ptr 穿透，读不到本体）。 */
 fn from_wire(data: &[u8]) -> Value {
     if data.len() < KVSPACE_XVALUE_HEAD_LEN {
         return Value {
@@ -187,14 +191,30 @@ fn from_wire(data: &[u8]) -> Value {
         };
     }
     let body_len = wire_len(data) as usize;
-    let (dims, kind) = parse_langtype(&wire_langtype(data, body_len));
+    /* 指针/扩展性由 langtype 前缀表达，不再是 head 的第 13 字节。 */
+    let raw_langtype = wire_langtype(data, body_len);
+    let (r#ref, langtype_body) = match raw_langtype.as_bytes().first() {
+        Some(b'*') => (KVSPACE_XVALUE_PTR_PTR, &raw_langtype[1..]),
+        Some(b'@') => (KVSPACE_XVALUE_PTR_EXT, &raw_langtype[1..]),
+        _ => (0u8, &raw_langtype[..]),
+    };
+    let (dims, kind) = parse_langtype(langtype_body);
+    /* 后端 storage class 不在 head 里：layout=1 即按容量存（slack），
+       有 dims 的定长张量是 fixed-large，其余 fixed-small。 */
+    let storetype = if data[12] == KVSPACE_XVALUE_LAYOUT_CAPACITY {
+        KVSPACE_STORETYPE_SLACK
+    } else if !dims.is_empty() {
+        KVSPACE_STORETYPE_FIXED_LARGE
+    } else {
+        KVSPACE_STORETYPE_FIXED_SMALL
+    };
     /* body 只到 head.bodylen 为止；其后是 attr 区，不属 body。 */
     let start = KVSPACE_XVALUE_HEAD_LEN;
     let end = start.saturating_add(body_len).min(data.len());
     Value {
         kind,
-        r#ref: data[13],
-        storetype: data[12],
+        r#ref,
+        storetype,
         dims,
         body: data[start..end].to_vec(),
     }
@@ -213,7 +233,11 @@ fn wire_len(data: &[u8]) -> u64 {
 fn wire_langtype(data: &[u8], body_len: usize) -> String {
     let base = KVSPACE_XVALUE_HEAD_LEN.saturating_add(body_len);
     /* attrslen:u32 @8-11；attr 区无自带前缀。padding 非零视为非法。 */
-    if data.len() < KVSPACE_XVALUE_HEAD_LEN || data[14] != 0 || data[15] != 0 {
+    if data.len() < KVSPACE_XVALUE_HEAD_LEN
+        || data[13] != 0
+        || data[14] != 0
+        || data[15] != 0
+    {
         return String::new();
     }
     let alen = (data[8] as usize)
@@ -391,7 +415,6 @@ fn parse_value(raw: &str) -> Vec<u8> {
         let mut len64: u64 = 0;
         if unsafe {
             kvspaceXvalueHeadNewScalar(
-                KVSPACE_XVALUE_ST_SHORT,
                 std::ptr::null(),
                 0,
                 cs(langtype),
@@ -445,7 +468,6 @@ fn parse_value(raw: &str) -> Vec<u8> {
             let mut len64: u64 = 0;
             if unsafe {
                 kvspaceXvalueHeadNewScalar(
-                    KVSPACE_XVALUE_ST_SHORT,
                     le.as_ptr(),
                     4,
                     cs(langtype),

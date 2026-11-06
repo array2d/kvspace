@@ -22,7 +22,10 @@ int kvspaceNewPtr(const char *target_kindexpr, const char *target,
     /* `any` 不是类型名（空 kindexpr = 不约束，见 spec [[文法与合法性]]）。 */
     if (strcmp(target_kindexpr, "any") == 0)
         return 1;
-    /* target_kindexpr 拼入 value 尾部（单 key 整体，langtype 尾部）。 */
+    /* 空 target 不是可用的指针目标（None 指针走 xvalue_head 构造器，不经本 codec）。 */
+    if (*target == '\0')
+        return 1;
+    /* target_kindexpr 是被指向类型的基 kindexpr；`*` 前缀由 NewPtr 唯一补上。 */
     uint8_t *value = NULL;
     uint64_t total = 0;
     if (kvspaceXvalueHeadNewPtr((const uint8_t *)target,
@@ -50,8 +53,7 @@ int kvspaceNewBool(uint8_t v, const char *langtype,
     uint8_t b = v ? 1 : 0;
     uint8_t *value = NULL;
     uint64_t total = 0;
-    if (kvspaceXvalueHeadNewScalar(KVSPACE_XVALUE_ST_SHORT, &b, 1, langtype,
-                                   &value, &total) != 0)
+    if (kvspaceXvalueHeadNewScalar(&b, 1, langtype, &value, &total) != 0)
         return 1;
     return finish(value, total, out, out_len);
 }
@@ -65,8 +67,7 @@ int kvspaceNewInt64(int64_t v, const char *langtype,
         raw[i] = (uint8_t)((uint64_t)v >> (8 * i));
     uint8_t *value = NULL;
     uint64_t total = 0;
-    if (kvspaceXvalueHeadNewScalar(KVSPACE_XVALUE_ST_SHORT, raw, 8, langtype,
-                                   &value, &total) != 0)
+    if (kvspaceXvalueHeadNewScalar(raw, 8, langtype, &value, &total) != 0)
         return 1;
     return finish(value, total, out, out_len);
 }
@@ -82,8 +83,7 @@ int kvspaceNewFloat64(double v, const char *langtype,
         raw[i] = (uint8_t)(bits >> (8 * i));
     uint8_t *value = NULL;
     uint64_t total = 0;
-    if (kvspaceXvalueHeadNewScalar(KVSPACE_XVALUE_ST_SHORT, raw, 8, langtype,
-                                   &value, &total) != 0)
+    if (kvspaceXvalueHeadNewScalar(raw, 8, langtype, &value, &total) != 0)
         return 1;
     return finish(value, total, out, out_len);
 }
