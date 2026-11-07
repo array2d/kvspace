@@ -32,31 +32,52 @@ struct KV {
     ~KV() { kvspaceClose(kv); ::unlink(path.c_str()); }
 
     // Write into returned body pointer; WriteNewPlace writes langtype with the header/attr region.
+    // body 长度用 `kvspaceXvalueHeadEffectiveLen` 取（layout=1 时有效长度在 attr tag 2，
+    // 不是 bodylen）；`ref` 由 langtype 的 `*`/`@` 前缀隐含，调用方不再单独给 head 位。
     void set(const char *key, const char *langtype, const uint8_t *val, uint32_t len) {
         if (!val || len < KVSPACE_XVALUE_HEAD_LEN) return;
-        kvspaceXvalueHead hd;
-        memcpy(&hd, val, sizeof hd);
-        uint64_t bl = kvspaceXvalueHeadLen(&hd);
+        uint64_t effective = 0;
+        if (kvspaceXvalueHeadEffectiveLen(val, len, &effective) != 0) return;
+        if (effective > UINT32_MAX) return;
+        const uint32_t bl = (uint32_t)effective;
+        const uint8_t ref = (langtype[0] == '*')   ? 1U
+                          : (langtype[0] == '@')   ? 2U
+                                                   : 0U;
         uint8_t *dst = nullptr; char err[256];
-        if (kvspaceWriteInPlace(kv, key, 1, (uint32_t)bl, &dst, err, sizeof(err)) != 0)
-            kvspaceWriteNewPlace(kv, key, hd.ptr, hd.storetype, (uint32_t)bl, bl,
-                                 langtype, &dst, err, sizeof(err));
+        if (kvspaceWriteInPlace(kv, key, 1, bl, &dst, err, sizeof(err)) != 0)
+            kvspaceWriteNewPlace(kv, key, ref, 0U, bl, bl, langtype, &dst, err,
+                                 sizeof(err));
         if (bl && dst) memcpy(dst, val + KVSPACE_XVALUE_HEAD_LEN, (size_t)bl);
     }
-    // Borrowed read: kind is decoded by kvspaceGetHead from inline attr; body length is head.body_len.
+    // Borrowed read: kind 与 body 长度都从**同一条 wire**解出，不经第二套头结构。
+    // `kvspaceGet` 拿整条 wire；`xvalue_head.h` 的 inline 访问器读它。
     bool get(const char *key, std::string &kind, std::string &raw) {
         uint8_t *out = nullptr; uint32_t len = 0;
         kvspaceGet(kv, key, 0, &out, &len);
         if (!out || len < KVSPACE_XVALUE_HEAD_LEN) return false;
-        kvspaceHead_t h;
-        if (kvspaceGetHead(kv, key, &h) != 0) return false;
-        const char *k = (const char *)h.langtype;
-        if (k[0] == '*' || k[0] == '@') k++;
-        if (k[0] == '[') { const char *e = strchr(k, ']'); if (e) k = e + 1; }
-        kind = k;
-        uint32_t bl = h.body_len > 0 ? (uint32_t)h.body_len : 0;
-        if (bl > len - KVSPACE_XVALUE_HEAD_LEN) return false;
-        raw.assign((const char *)(out + KVSPACE_XVALUE_HEAD_LEN), bl);
+        const uint8_t *lt = nullptr;
+        uint16_t lt_len = 0;
+        uint64_t effective = 0;
+        if (kvspaceXvalueHeadScan(out, len, &lt, &lt_len, nullptr) != 0) return false;
+        if (kvspaceXvalueHeadEffectiveLen(out, len, &effective) != 0) return false;
+        const char *k = (const char *)(const void *)lt;
+        uint16_t k_len = lt_len;
+        if (k != nullptr && k_len != 0) {
+            // 去掉 `*`/`@` 前缀与 `[dims]` 形状段，只留基种类。
+            if (k[0] == '*' || k[0] == '@') { k++; k_len--; }
+            if (k_len != 0 && k[0] == '[') {
+                const char *close = (const char *)memchr(k, ']', k_len);
+                if (close != nullptr) {
+                    const size_t skip = (size_t)(close - k) + 1U;
+                    k += skip;
+                    k_len = (uint16_t)(k_len - skip);
+                }
+            }
+        }
+        kind.assign(k != nullptr ? k : "", k_len);
+        if (effective > len - KVSPACE_XVALUE_HEAD_LEN) return false;
+        raw.assign((const char *)(out + KVSPACE_XVALUE_HEAD_LEN),
+                   (size_t)effective);
         return true;
     }
     void del(const char *key) {

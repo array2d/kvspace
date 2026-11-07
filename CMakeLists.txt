@@ -24,6 +24,11 @@ if(BUILD_TESTING)
     target_include_directories(test_codec_abi PRIVATE src include)
     target_link_libraries(test_codec_abi PRIVATE kvspace)
     add_test(NAME codec_abi COMMAND test_codec_abi)
+    # wire 金标准：打印同一批操作的字节，供 kvspace-c / kvspace-durable 逐字节比对
+    # （tests/compare_wire_golden.sh）。它不做断言，只产出可比对的文本。
+    add_executable(xvalue_wire_golden tests/xvalue_wire_golden.c)
+    target_include_directories(xvalue_wire_golden PRIVATE src include)
+    target_link_libraries(xvalue_wire_golden PRIVATE kvspace)
 endif()
 
 # 前端 SONAME：libkvspace.so.1

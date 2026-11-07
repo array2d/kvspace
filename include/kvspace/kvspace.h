@@ -6,11 +6,20 @@
  *   shm://...      → libkvspace-c.so.1
  *   其余（redis/fs/s3）→ libkvspace_durable.so.1
  *
- * Wire: [len:u48 LE@0-5][storetype:u8@6][ptr:u8@7][body@8][attr@8+len].
- * Head is fixed 8 bytes; body offset is always 8. attr = [attr_len:u16 LE]
- * + records [tag:u8][len:u16 LE][data]; tag 1 = langtype (plaintext UTF-8,
- * incl. leading [dims]). Empty attr = 2 bytes. Single-key write — no attr key.
- * See kvspace/xvalue_head.h.
+ * Wire: [bodylen:u64 LE@0][attrslen:u32 LE@8][layout:u8@12][padding:3@13-15]
+ *       [body@16][attr records].
+ * Head is fixed 16 bytes, so the body offset equals the head length — never a
+ * literal; read it from kvspaceXvalueHeadLen / the `headlen` field below.
+ * `layout` 0 = bodylen is the effective length; 1 = bodylen is capacity and the
+ * effective length lives in attr tag 2. There is no storetype/ptr field: the
+ * storage form and reference-ness are carried by the langtype text (`*`/`@`).
+ * The attr region carries NO length prefix: its size is attrslen in the head,
+ * so a second prefix would be a second source of truth. Records are
+ * [tag:u8][len:u16 LE][data]; tag 1 = langtype (plaintext UTF-8, incl. leading
+ * [dims] and `*`/`@` prefix), tag 2 = reallen (layout=1 only).
+ * Empty attr = attrslen 0. Single-key write — no attr key.
+ * Total length = 16 + bodylen + attrslen.
+ * See kvspace/xvalue_head.h for the authoritative layout and helpers.
  */
 
 #ifndef KVSPACE_H
@@ -29,25 +38,21 @@ extern "C" {
 #define KVSPACE_REF_PTR    1
 #define KVSPACE_REF_EXT    2
 
-/* Storage classes (kvspaceXvalueHead.storetype wire byte). */
+/* 后端写侧 storage class（wire head 已无此字段；由 langtype 推出后传给
+ * kvspaceWriteNewPlace）。 */
 #define KVSPACE_STORETYPE_FIXED_SMALL 0
 #define KVSPACE_STORETYPE_SLACK       1
 #define KVSPACE_STORETYPE_FIXED_LARGE 2
 #define KVSPACE_STORETYPE_EXT         3
 
-/* XValue metadata. langtype is read from attr tag=1; ndim/dims are parsed from leading [dims]. */
-typedef struct {
-    uint16_t headlen;       /* head 总字节数；body 起于偏移 headlen */
-    uint8_t  ref;           /* 存储位置：见 KVSPACE_REF_* */
-    uint8_t  storetype;     /* Storage class. */
-    int32_t  body_len;      /* body 字节数 */
-    int32_t  ndim;          /* Tensor dimensions; zero for other values. */
-    int32_t  dims[8];       /* Tensor shape. */
-    char     langtype[256]; /* 语义类型 kindexpr 串，NUL 终止（含 [dims]、无 ptr/ext 前缀） */
-    int32_t  langtype_len;  /* langtype 内容长度（去 padding） */
-    int32_t  body_offset;   /* body 在 data 内的起始偏移（= headlen） */
-    uint64_t body_cap;
-} kvspaceHead_t;
+/*
+ * **读头一律用 `kvspace/xvalue_head.h` 的 inline 方法；这里不另设解码结构体。**
+ *
+ * 一个「手抄的 head 结构体」就是第二份字段真相：字段一改，副本不跟着变，
+ * 而它仍然能编译、仍然读得出**看起来合理**的值——kvspace-c 曾因此留下一份
+ * 8 字节 head 的过时副本，读新值全是垃圾却不报错。所以「解码结构体 + 取头函数」这一对已删除：需要 langtype/维度就调 `kvspaceXvalueHeadScan`，
+ * 需要 body 长度就调 `kvspaceXvalueHeadEffectiveLen`。
+ */
 
 /* ── 生命周期 ─────────────────────────────────────────────────── */
 void *kvspaceConnect(const char *dsn);
@@ -151,9 +156,6 @@ int kvspaceGetPart(void *h, const char *key, uint32_t offset, uint32_t len,
 int kvspaceSetPart(void *h, const char *key, uint32_t offset, const uint8_t *buf,
                     uint32_t buf_len, char *err, uint32_t err_cap);
 
-/* Read the wire head + langtype tail. Missing keys return nonzero. */
-int kvspaceGetHead(void *h, const char *key, kvspaceHead_t *out);
-
 /* In-place write: key must exist with unchanged kind and body_len; returns existing body
  * pointer for direct mutation, or nonzero + err on precondition failure (never reallocates).
  * resolve != 0 follows leaf Ptr chains (up to 16 hops) and writes the terminal target in place;
@@ -163,7 +165,16 @@ int kvspaceWriteInPlace(void *h, const char *key, int resolve, uint32_t body_len
                         uint8_t **body, char *err, uint32_t err_cap);
 
 /* Reserve a new XValue and return its body pointer; fill it before another KVSpace call.
- * langtype (empty/NULL = untyped) is written with the header/attr in a single-key write. */
+ * langtype (empty/NULL = untyped) is written with the header/attr in a single-key write.
+ *
+ * `storetype` carries no information in the current XValue model: the storage form is
+ * derived from langtype and `layout` is derived from `body_cap > body_len`. The
+ * parameter stays only because the frontend dispatches through a function-pointer
+ * table, so every backend export must keep the exact argument list. Implementations
+ * must not branch on it and must not validate its value; `ref` is still meaningful
+ * (0 inline / 1 pointer / 2 extension) and becomes the `*` / `@` langtype prefix.
+ * Removing the parameter and the KVSPACE_STORETYPE_* constants is a separate ABI
+ * change that must sweep every caller at once. */
 int kvspaceWriteNewPlace(void *h, const char *key, uint8_t ref, uint8_t storetype,
                          uint32_t body_len, uint64_t body_cap, const char *langtype,
                          uint8_t **body, char *err, uint32_t err_cap);
@@ -192,11 +203,12 @@ int kvspaceWatch(void *h, const char *key, const uint8_t *target, uint32_t targe
                  uint64_t tick_ns, uint8_t **out, uint32_t *out_len);
 
 /* XValue constructors (stateless, implemented in frontend, byte-identical across backends).
- * Fixed 8-byte header + body + attr region (see kvspace/xvalue_head.h).
- * Empty/NULL langtype = untyped (omits langtype record; attr region is just 2-byte attr_len). */
+ * Fixed 16-byte header + body + attr region (see kvspace/xvalue_head.h).
+ * Empty/NULL langtype = untyped (omits the langtype record; then attrslen is 0). */
 
-/* Construct a leaf Ptr XValue (storetype=SLACK, ptr=PTR, body=target path bytes,
- * target_kindexpr written to attr tag=1; "" means unconstrained; rejects "any" and empty target).
+/* Construct a leaf Ptr XValue (body=target path bytes, langtype = `*` +
+ * target_kindexpr written to attr tag=1; "" means unconstrained -> bare "*";
+ * rejects "any" and empty target). The head carries no ptr bit.
  * Pure wire constructor: does not connect to a backend or validate target existence/langtype. */
 int kvspaceNewPtr(const char *target_kindexpr, const char *target,
                   uint8_t **out, uint32_t *out_len);

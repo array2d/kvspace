@@ -2,7 +2,7 @@
  *
  * 导出 kvspace* C ABI（与两个后端同名同签名）。运行期按 DSN scheme 用 dlopen
  * （RTLD_NOW | RTLD_LOCAL）装载后端，把 handle 包一层 {vtable, dl, backend}。
- * XValue 构造（kvspaceNew*，head 固定 8 字节 memcpy + body）与 kvspaceConst
+ * XValue 构造（kvspaceNew*，head 固定 16 字节 memcpy + body）与 kvspaceConst
  * 无 handle，由前端静态实现，byte-identical。
  *
  * 后端装载名（后缀随平台）：
@@ -37,7 +37,6 @@ typedef struct {
                      uint8_t **out, uint32_t *out_len);
     int  (*setpart)(void *h, const char *key, uint32_t offset, const uint8_t *buf,
                      uint32_t buf_len, char *err, uint32_t err_cap);
-    int  (*gethead)(void *h, const char *key, kvspaceHead_t *out);
     int  (*writeinplace)(void *h, const char *key, int resolve, uint32_t body_len,
                          uint8_t **body, char *err, uint32_t err_cap);
     int  (*writenewplace)(void *h, const char *key, uint8_t ref, uint8_t storetype,
@@ -226,7 +225,6 @@ void *kvspaceConnect(const char *dsn) {
     LOAD(setvalue, "kvspaceSetValue");
     LOAD(getpart, "kvspaceGetPart");
     LOAD(setpart, "kvspaceSetPart");
-    LOAD(gethead, "kvspaceGetHead");
     LOAD(writeinplace, "kvspaceWriteInPlace");
     LOAD(writenewplace, "kvspaceWriteNewPlace");
     LOAD(listlen, "kvspaceListLen");
@@ -357,11 +355,6 @@ int kvspaceSetPart(void *h, const char *key, uint32_t offset, const uint8_t *buf
                     uint32_t buf_len, char *err, uint32_t err_cap) {
     kvspace_handle *x = H(h);
     return x->vt->setpart(x->backend, key, offset, buf, buf_len, err, err_cap);
-}
-
-int kvspaceGetHead(void *h, const char *key, kvspaceHead_t *out) {
-    kvspace_handle *x = H(h);
-    return x->vt->gethead(x->backend, key, out);
 }
 
 int kvspaceWriteInPlace(void *h, const char *key, int resolve, uint32_t body_len,

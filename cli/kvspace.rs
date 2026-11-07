@@ -5,10 +5,15 @@ use std::env;
 use std::os::raw::{c_char, c_int, c_void};
 use std::process::exit;
 
-/* 固定 head 8 字节（见 kvspace/xvalue_head.h）：body 偏移恒 8。 */
-const KVSPACE_XVALUE_HEAD_LEN: usize = 8;
-const KVSPACE_XVALUE_ST_SHORT: u8 = 0;
-/* head.ptr: 0=inline, 1=ptr, 2=@ext (KVSPACE_XVALUE_PTR_*). */
+/* 固定 head 16 字节（见 kvspace/xvalue_head.h）：body 偏移恒 16。 */
+const KVSPACE_XVALUE_HEAD_LEN: usize = 16;
+/* head 只有 layout@12：0=bodylen 是有效长度，1=容量（有效长度在 attr tag 2）。
+   指针/扩展性**不在 head**，看 langtype 首字符 `*`/`@`。 */
+const KVSPACE_XVALUE_LAYOUT_CAPACITY: u8 = 1;
+/* 后端写侧 storage class（由 layout/dims 推出，传给 kvspaceWriteNewPlace）。 */
+const KVSPACE_STORETYPE_FIXED_SMALL: u8 = 0;
+const KVSPACE_STORETYPE_SLACK: u8 = 1;
+const KVSPACE_STORETYPE_FIXED_LARGE: u8 = 2;
 const KVSPACE_XVALUE_PTR_PTR: u8 = 1;
 const KVSPACE_XVALUE_PTR_EXT: u8 = 2;
 
@@ -131,7 +136,6 @@ extern "C" {
         out_len: *mut u32,
     ) -> c_int;
     fn kvspaceXvalueHeadNewScalar(
-        storetype: u8,
         raw: *const u8,
         raw_len: u32,
         langtype: *const c_char,
@@ -166,15 +170,16 @@ fn fail_op(err: &[u8; 256], op: &str) -> ! {
 
 struct Value {
     kind: String,   // Base kind (langtype without leading [dims])
-    r#ref: u8,      // head.ptr: 0=inline, 1=ptr, 2=@ext
-    storetype: u8,  // head.storetype
+    r#ref: u8,      // langtype 前缀：0=普通, 1=`*`, 2=`@`
+    storetype: u8,  // 后端 storage class（由 layout/dims 推出，不在 head）
     dims: Vec<i32>, // Leading [dims] parsed from langtype
     body: Vec<u8>,
 }
 
-/* head 固定 8 字节 [len:u48 LE@0-5][storetype@6][ptr@7]，body 偏移恒 8；
-   langtype 作为 attr 记录 tag=1 置于 body 之尾（值内，非独立 key，见 #571）。
-   值自描述：直接解 wire，不经 kvspaceGetHead（它对 Ptr 穿透，读不到本体）。 */
+/* head 固定 16 字节 [bodylen:u64@0][attrslen:u32@8][layout@12][padding@13-15]，
+   body 偏移恒 16，attr 区紧随 body 且无自带长度前缀（长度只在 head 里）；
+   langtype 作为 attr 记录 tag=1 置于 body 之后（值内，非独立 key）。
+   值自描述：直接解 wire（取头函数已删除；它对 Ptr 穿透，读不到本体）。 */
 fn from_wire(data: &[u8]) -> Value {
     if data.len() < KVSPACE_XVALUE_HEAD_LEN {
         return Value {
@@ -186,23 +191,39 @@ fn from_wire(data: &[u8]) -> Value {
         };
     }
     let body_len = wire_len(data) as usize;
-    let (dims, kind) = parse_langtype(&wire_langtype(data, body_len));
-    /* body 只到 head.len 为止；其后是 attr 区，不属 body。 */
+    /* 指针/扩展性由 langtype 前缀表达，不再是 head 的第 13 字节。 */
+    let raw_langtype = wire_langtype(data, body_len);
+    let (r#ref, langtype_body) = match raw_langtype.as_bytes().first() {
+        Some(b'*') => (KVSPACE_XVALUE_PTR_PTR, &raw_langtype[1..]),
+        Some(b'@') => (KVSPACE_XVALUE_PTR_EXT, &raw_langtype[1..]),
+        _ => (0u8, &raw_langtype[..]),
+    };
+    let (dims, kind) = parse_langtype(langtype_body);
+    /* 后端 storage class 不在 head 里：layout=1 即按容量存（slack），
+       有 dims 的定长张量是 fixed-large，其余 fixed-small。 */
+    let storetype = if data[12] == KVSPACE_XVALUE_LAYOUT_CAPACITY {
+        KVSPACE_STORETYPE_SLACK
+    } else if !dims.is_empty() {
+        KVSPACE_STORETYPE_FIXED_LARGE
+    } else {
+        KVSPACE_STORETYPE_FIXED_SMALL
+    };
+    /* body 只到 head.bodylen 为止；其后是 attr 区，不属 body。 */
     let start = KVSPACE_XVALUE_HEAD_LEN;
     let end = start.saturating_add(body_len).min(data.len());
     Value {
         kind,
-        r#ref: data[7],
-        storetype: data[6],
+        r#ref,
+        storetype,
         dims,
         body: data[start..end].to_vec(),
     }
 }
 
-/// u48 小端 @0-5（唯一读点，与 C 侧 kvspaceXvalueHeadLen 一致）。
+/// bodylen:u64 小端 @0-7（唯一读点，与 C 侧 kvspaceXvalueHeadLen 一致）。
 fn wire_len(data: &[u8]) -> u64 {
     let mut v = 0u64;
-    for i in (0..6).rev() {
+    for i in (0..8).rev() {
         v = (v << 8) | data[i] as u64;
     }
     v
@@ -211,15 +232,23 @@ fn wire_len(data: &[u8]) -> u64 {
 /// 扫 attr 区取 tag=1（langtype）；无记录/坏 attr → 空串。
 fn wire_langtype(data: &[u8], body_len: usize) -> String {
     let base = KVSPACE_XVALUE_HEAD_LEN.saturating_add(body_len);
-    if base.saturating_add(2) > data.len() {
+    /* attrslen:u32 @8-11；attr 区无自带前缀。padding 非零视为非法。 */
+    if data.len() < KVSPACE_XVALUE_HEAD_LEN
+        || data[13] != 0
+        || data[14] != 0
+        || data[15] != 0
+    {
         return String::new();
     }
-    let alen = (data[base] as usize) | ((data[base + 1] as usize) << 8);
-    if alen < 2 || base + alen > data.len() {
+    let alen = (data[8] as usize)
+        | ((data[9] as usize) << 8)
+        | ((data[10] as usize) << 16)
+        | ((data[11] as usize) << 24);
+    if base + alen > data.len() {
         return String::new();
     }
     let end = base + alen;
-    let mut p = base + 2;
+    let mut p = base;
     while p + 3 <= end {
         let tag = data[p];
         let rlen = (data[p + 1] as usize) | ((data[p + 2] as usize) << 8);
@@ -386,7 +415,6 @@ fn parse_value(raw: &str) -> Vec<u8> {
         let mut len64: u64 = 0;
         if unsafe {
             kvspaceXvalueHeadNewScalar(
-                KVSPACE_XVALUE_ST_SHORT,
                 std::ptr::null(),
                 0,
                 cs(langtype),
@@ -440,7 +468,6 @@ fn parse_value(raw: &str) -> Vec<u8> {
             let mut len64: u64 = 0;
             if unsafe {
                 kvspaceXvalueHeadNewScalar(
-                    KVSPACE_XVALUE_ST_SHORT,
                     le.as_ptr(),
                     4,
                     cs(langtype),
