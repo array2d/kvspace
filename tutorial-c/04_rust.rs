@@ -2,43 +2,66 @@
 // #571: Fixed 8-byte header (body offset is always 8); langtype in inline attr region.
 // 编译: rustc 04_rust.rs -l kvspace
 
+use std::convert::TryInto;
 use std::ffi::{c_char, c_int, c_void, CString};
 use std::ptr;
 
-// Matches kvspaceHead_t (langtype populated by kvspaceGetHead from inline attr).
-#[repr(C)]
-struct Head {
-    headlen: u16,
-    r#ref: u8,
-    storetype: u8,
-    body_len: i32,
-    ndim: i32,
-    dims: [i32; 8],
-    langtype: [u8; 256],
-    langtype_len: i32,
-    body_offset: i32,
-    body_cap: u64,
-}
+const KVSPACE_XVALUE_HEAD_LEN: usize = 16;
+const KVSPACE_XVALUE_LAYOUT_CAPACITY: u8 = 1;
+const KVSPACE_XVALUE_ATTR_TAG_LANGTYPE: u8 = 1;
+const KVSPACE_XVALUE_ATTR_TAG_REALLEN: u8 = 2;
 
-impl Default for Head {
-    fn default() -> Self {
-        Head { headlen: 0, r#ref: 0, storetype: 0, body_len: 0, ndim: 0, dims: [0; 8],
-               langtype: [0; 256], langtype_len: 0, body_offset: 0, body_cap: 0 }
+/// 扫描 16 字节 head + attr 区，返回 (langtype, reallen)。
+/// 与 C 的 `kvspaceXvalueHeadScan` 同语义；Rust 侧没有 inline 头可用，
+/// 这里按线格式直接解，**不复制 C 的结构体字段**（那是第二份字段真相）。
+/// wire: [bodylen:u64][attrslen:u32][layout:u8][padding:3][body][attrs]
+fn xvalue_head_scan(wire: &[u8]) -> (Vec<u8>, Option<u64>) {
+    if wire.len() < KVSPACE_XVALUE_HEAD_LEN {
+        return (vec![], None);
     }
+    let bodylen = u64::from_le_bytes(wire[0..8].try_into().unwrap()) as usize;
+    let attrslen = u32::from_le_bytes(wire[8..12].try_into().unwrap()) as usize;
+    if wire[13..16] != [0u8, 0, 0] {
+        return (vec![], None);
+    }
+    if KVSPACE_XVALUE_HEAD_LEN + bodylen + attrslen > wire.len() {
+        return (vec![], None);
+    }
+    let mut p = KVSPACE_XVALUE_HEAD_LEN + bodylen;
+    let mut left = attrslen;
+    let (mut langtype, mut reallen) = (vec![], None);
+    while left >= 3 {
+        let tag = wire[p];
+        let rlen = u16::from_le_bytes([wire[p + 1], wire[p + 2]]) as usize;
+        if left < 3 + rlen {
+            return (vec![], None);
+        }
+        match tag {
+            KVSPACE_XVALUE_ATTR_TAG_LANGTYPE => langtype = wire[p + 3..p + 3 + rlen].to_vec(),
+            KVSPACE_XVALUE_ATTR_TAG_REALLEN => {
+                if rlen == 8 {
+                    reallen = Some(u64::from_le_bytes(
+                        wire[p + 3..p + 11].try_into().unwrap()));
+                }
+            }
+            _ => {}
+        }
+        p += 3 + rlen;
+        left -= 3 + rlen;
+    }
+    (langtype, reallen)
 }
 
-// 固定 8 字节 head：[len:u48 LE@0-5][storetype@6][ptr@7]，body 偏移恒 8。
-#[repr(C)]
-struct XvalueHead {
-    len: [u8; 6],
-    storetype: u8,
-    ptr: u8,
-}
-
-fn xvalue_head_len(h: &XvalueHead) -> u64 {
-    let mut v: u64 = 0;
-    for i in (0..6).rev() { v = (v << 8) | h.len[i] as u64; }
-    v
+/// 有效长度：layout=0 是 bodylen；layout=1 是 attr tag 2 的 reallen。
+fn xvalue_head_effective_len(wire: &[u8]) -> Option<u64> {
+    if wire.len() < KVSPACE_XVALUE_HEAD_LEN {
+        return None;
+    }
+    let bodylen = u64::from_le_bytes(wire[0..8].try_into().unwrap());
+    if wire[12] != KVSPACE_XVALUE_LAYOUT_CAPACITY {
+        return Some(bodylen);
+    }
+    xvalue_head_scan(wire).1
 }
 
 extern "C" {
@@ -49,7 +72,6 @@ extern "C" {
     // 借用读：out 指向 kvspace 常驻空间，调用方不得 free。resolve=1 穿透 link。
     fn kvspaceGet(h: *mut c_void, key: *const c_char, resolve: c_int,
                   out: *mut *mut u8, out_len: *mut u32) -> c_int;
-    fn kvspaceGetHead(h: *mut c_void, key: *const c_char, out: *mut Head) -> c_int;
     // 就地写：key 已存在且 body_len 不变 → 返回原 box body 偏移指针；否则非 0。
     fn kvspaceWriteInPlace(h: *mut c_void, key: *const c_char, resolve: c_int, body_len: u32,
                            body: *mut *mut u8, err: *mut c_char, err_cap: u32) -> c_int;
@@ -94,19 +116,17 @@ fn new_str(s: &str) -> Vec<u8> {
     r
 }
 
-// Read kind via kvspaceGetHead (from inline attr); body starts at offset 8 with length h.body_len.
-fn read_kind(kv: *mut c_void, key: &str, data: &[u8]) -> (String, Vec<u8>) {
-    let mut h = Head::default();
-    if unsafe { kvspaceGetHead(kv, cs(key).as_ptr(), &mut h) } != 0 {
-        return (String::new(), vec![]);
-    }
-    let klen = h.langtype.iter().position(|&b| b == 0).unwrap_or(256);
-    let mut kx = String::from_utf8_lossy(&h.langtype[..klen]).into_owned();
+// kind 与 body 长度都从**同一条 wire**解出（kvspaceGet 的返回值），
+// 不再调已删除的 kvspaceGetHead，也不维护第二份 head 结构体。
+fn read_kind(_kv: *mut c_void, _key: &str, data: &[u8]) -> (String, Vec<u8>) {
+    let (langtype, _) = xvalue_head_scan(data);
+    let klen = langtype.iter().position(|&b| b == 0).unwrap_or(langtype.len());
+    let mut kx = String::from_utf8_lossy(&langtype[..klen]).into_owned();
     if kx.starts_with('*') || kx.starts_with('@') { kx.drain(..1); }
     if let Some(i) = kx.find(']') { kx.drain(..=i); }
-    let bl = h.body_len.max(0) as usize;
-    let end = (8 + bl).min(data.len());
-    (kx, data[8..end].to_vec())
+    let bl = xvalue_head_effective_len(data).unwrap_or(0) as usize;
+    let end = (KVSPACE_XVALUE_HEAD_LEN + bl).min(data.len());
+    (kx, data[KVSPACE_XVALUE_HEAD_LEN..end].to_vec())
 }
 
 struct KV { ptr: *mut c_void, path: String }
@@ -121,22 +141,25 @@ impl KV {
     }
     // Write into returned body pointer; WriteNewPlace writes langtype with the header/attr region.
     fn set(&self, key: &str, langtype: &str, val: &[u8]) {
-        if val.len() < 8 { return; }
-        let hd: XvalueHead = unsafe { std::ptr::read(val.as_ptr() as *const XvalueHead) };
-        let bl = xvalue_head_len(&hd) as u32;
+        if val.len() < KVSPACE_XVALUE_HEAD_LEN { return; }
+        let bl = xvalue_head_effective_len(val).expect("value head is not well-formed") as u32;
+        // ref 由 langtype 的 * / @ 前缀隐含，不再从 head 位取。
+        let r#ref: u8 = if langtype.starts_with('*') { 1 }
+                        else if langtype.starts_with('@') { 2 } else { 0 };
         let ck = cs(key);
         let lt = cs(langtype);
         let mut dst: *mut u8 = ptr::null_mut();
         let mut err = [0i8; 256];
         unsafe {
             if kvspaceWriteInPlace(self.ptr, ck.as_ptr(), 1, bl, &mut dst, err.as_mut_ptr(), 256) != 0 {
-                let rc = kvspaceWriteNewPlace(self.ptr, ck.as_ptr(), hd.ptr, hd.storetype,
+                let rc = kvspaceWriteNewPlace(self.ptr, ck.as_ptr(), r#ref, 0,
                                               bl, bl as u64, lt.as_ptr(), &mut dst,
                                               err.as_mut_ptr(), 256);
                 assert_eq!(rc, 0, "write {key} failed");
             }
             if bl > 0 && !dst.is_null() {
-                ptr::copy_nonoverlapping(val[8..].as_ptr(), dst, bl as usize);
+                ptr::copy_nonoverlapping(
+                    val[KVSPACE_XVALUE_HEAD_LEN..].as_ptr(), dst, bl as usize);
             }
         }
     }

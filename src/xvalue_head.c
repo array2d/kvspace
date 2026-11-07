@@ -161,3 +161,75 @@ int kvspaceXvalueHeadReserve(uint64_t body_len, uint64_t cap,
                                           : KVSPACE_XVALUE_LAYOUT_LENGTH;
     return build(layout, NULL, cap, body_len, 0, langtype, out, out_len);
 }
+
+int kvspaceXvalueHeadScan(const uint8_t *wire, uint64_t wire_len,
+                                        const uint8_t **out_langtype,
+                                        uint16_t *out_langtype_len,
+                                        uint64_t *out_reallen) {
+    if (out_langtype)
+        *out_langtype = NULL;
+    if (out_langtype_len)
+        *out_langtype_len = 0;
+    if (out_reallen)
+        *out_reallen = 0;
+    if (!wire || wire_len < KVSPACE_XVALUE_HEAD_LEN)
+        return -1;
+    const kvspaceXvalueHead *h = (const kvspaceXvalueHead *)(const void *)wire;
+    const uint64_t total = kvspaceXvalueHeadTotalLen(h);
+    if (total == 0 || total > wire_len)
+        return -1;
+    const uint8_t *p = wire + KVSPACE_XVALUE_HEAD_LEN + h->bodylen;
+    const uint8_t *end = p + h->attrslen;
+    const uint8_t *langtype = NULL;
+    uint16_t langtype_len = 0;
+    uint64_t reallen = 0;
+    int seen_reallen = 0;
+    while (p + 3 <= end) {
+        uint8_t tag = p[0];
+        uint16_t rlen = (uint16_t)((uint16_t)p[1] | ((uint16_t)p[2] << 8));
+        if (p + 3 + rlen > end)
+            return -1;
+        if (tag == KVSPACE_XVALUE_ATTR_TAG_LANGTYPE) {
+            if (!langtype) { /* 重复 langtype 取第一条：单 key 只有一个写方。 */
+                langtype = p + 3;
+                langtype_len = rlen;
+            }
+        } else if (tag == KVSPACE_XVALUE_ATTR_TAG_REALLEN) {
+            if (h->layout != KVSPACE_XVALUE_LAYOUT_CAPACITY || seen_reallen ||
+                rlen != 8)
+                return -1;
+            for (int i = 0; i < 8; i++)
+                reallen |= (uint64_t)p[3 + i] << (8 * i);
+            seen_reallen = 1;
+        }
+        p += 3 + rlen;
+    }
+    if (h->layout == KVSPACE_XVALUE_LAYOUT_CAPACITY &&
+        (!seen_reallen || reallen > h->bodylen))
+        return -1;
+    if (out_langtype)
+        *out_langtype = langtype;
+    if (out_langtype_len)
+        *out_langtype_len = langtype_len;
+    if (out_reallen)
+        *out_reallen = reallen;
+    return 0;
+}
+
+/* 有效长度：layout=0 时是 bodylen；layout=1 时是 attr tag 2 的 reallen。
+   返回 0 成功，-1 失败（*out 置 0；0 本身是合法长度，故错误不走长度值）。 */
+int kvspaceXvalueHeadEffectiveLen(const uint8_t *wire,
+                                                uint64_t wire_len,
+                                                uint64_t *out) {
+    if (out)
+        *out = 0;
+    if (!out)
+        return -1;
+    uint64_t reallen = 0;
+    if (kvspaceXvalueHeadScan(wire, wire_len, NULL, NULL, &reallen) != 0)
+        return -1;
+    const kvspaceXvalueHead *h = (const kvspaceXvalueHead *)(const void *)wire;
+    *out = h->layout == KVSPACE_XVALUE_LAYOUT_CAPACITY ? reallen : h->bodylen;
+    return 0;
+}
+

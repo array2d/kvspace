@@ -42,9 +42,9 @@ static inline const char *read_kind(const uint8_t *data, uint32_t len,
     if (cap) kind[0] = 0;
     *body = NULL; *body_len = 0;
     if (!data || len < KVSPACE_XVALUE_HEAD_LEN || cap == 0) return NULL;
-    kvspaceXvalueHead hd;
-    memcpy(&hd, data, sizeof hd);
-    uint64_t bl = kvspaceXvalueHeadLen(&hd);
+    /* 有效长度走 EffectiveLen：layout=1 时 bodylen 是容量，不是有效长度。 */
+    uint64_t bl = 0;
+    if (kvspaceXvalueHeadEffectiveLen(data, len, &bl) != 0) return NULL;
     if (bl > len - KVSPACE_XVALUE_HEAD_LEN) return NULL;
     const uint8_t *lt = NULL;
     size_t n = kvspaceXvalueHeadLangtypeBounded(data, len, &lt);
@@ -63,12 +63,14 @@ static inline const char *read_kind(const uint8_t *data, uint32_t len,
 static inline int kv_set(void *h, const char *key, const char *langtype,
                          const uint8_t *val, uint32_t len) {
     if (!val || len < KVSPACE_XVALUE_HEAD_LEN) return -1;
-    kvspaceXvalueHead hd;
-    memcpy(&hd, val, sizeof hd);
-    uint64_t bl = kvspaceXvalueHeadLen(&hd);
+    uint64_t bl = 0;
+    if (kvspaceXvalueHeadEffectiveLen(val, len, &bl) != 0) return -1;
+    if (bl > UINT32_MAX) return -1;
+    /* ref 由 langtype 的 * / @ 前缀隐含；storetype 在当前模型不承载信息。 */
+    uint8_t ref = langtype[0] == '*' ? 1U : (langtype[0] == '@' ? 2U : 0U);
     uint8_t *dst = NULL; char err[256];
     if (kvspaceWriteInPlace(h, key, 1, (uint32_t)bl, &dst, err, sizeof err) != 0 &&
-        kvspaceWriteNewPlace(h, key, hd.ptr, hd.storetype, (uint32_t)bl, bl,
+        kvspaceWriteNewPlace(h, key, ref, 0U, (uint32_t)bl, bl,
                              langtype, &dst, err, sizeof err) != 0)
         return -1;
     if (bl && dst) memcpy(dst, val + KVSPACE_XVALUE_HEAD_LEN, (size_t)bl);

@@ -14,39 +14,52 @@ U32P = ctypes.POINTER(ctypes.c_uint32)
 U64P = ctypes.POINTER(ctypes.c_uint64)
 CCHARPP = ctypes.POINTER(ctypes.c_char_p)
 
-KVSPACE_XVALUE_HEAD_LEN = 8
+KVSPACE_XVALUE_HEAD_LEN = 16
+KVSPACE_XVALUE_LAYOUT_CAPACITY = 1
+KVSPACE_XVALUE_ATTR_TAG_LANGTYPE = 1
+KVSPACE_XVALUE_ATTR_TAG_REALLEN = 2
 
 
-# Matches kvspaceHead_t (langtype populated by kvspaceGetHead from inline attr).
-class Head(ctypes.Structure):
-    _fields_ = [
-        ("headlen", ctypes.c_uint16),
-        ("ref", ctypes.c_uint8),
-        ("storetype", ctypes.c_uint8),
-        ("body_len", ctypes.c_int32),
-        ("ndim", ctypes.c_int32),
-        ("dims", ctypes.c_int32 * 8),
-        ("langtype", ctypes.c_char * 256),
-        ("langtype_len", ctypes.c_int32),
-        ("body_offset", ctypes.c_int32),
-        ("body_cap", ctypes.c_uint64),
-    ]
+def xvalue_head_scan(wire):
+    """扫描 16 字节 head + attr 区，返回 (langtype_bytes, reallen)。
+
+    与 C 的 `kvspaceXvalueHeadScan` 同语义；Python 侧没有 inline 头可用，
+    这里按线格式直接解，**不复制 C 的结构体字段**（那是第二份字段真相）。
+    wire: [bodylen:u64][attrslen:u32][layout:u8][padding:3][body][attrs]
+    """
+    if len(wire) < KVSPACE_XVALUE_HEAD_LEN:
+        return b"", None
+    bodylen = int.from_bytes(wire[0:8], "little")
+    attrslen = int.from_bytes(wire[8:12], "little")
+    if wire[13:16] != b"\0\0\0":
+        return b"", None
+    if KVSPACE_XVALUE_HEAD_LEN + bodylen + attrslen > len(wire):
+        return b"", None
+    base = KVSPACE_XVALUE_HEAD_LEN + bodylen
+    langtype, reallen, p, left = b"", None, base, attrslen
+    while left >= 3:
+        tag = wire[p]
+        rlen = int.from_bytes(wire[p + 1:p + 3], "little")
+        if left < 3 + rlen:
+            return b"", None
+        if tag == KVSPACE_XVALUE_ATTR_TAG_LANGTYPE:
+            langtype = bytes(wire[p + 3:p + 3 + rlen])
+        elif tag == KVSPACE_XVALUE_ATTR_TAG_REALLEN:
+            reallen = int.from_bytes(wire[p + 3:p + 3 + rlen], "little")
+        p += 3 + rlen
+        left -= 3 + rlen
+    return langtype, reallen
 
 
-# 固定 8 字节 head：[len:u48 LE@0-5][storetype@6][ptr@7]。
-class XvalueHead(ctypes.Structure):
-    _fields_ = [
-        ("len", ctypes.c_uint8 * 6),
-        ("storetype", ctypes.c_uint8),
-        ("ptr", ctypes.c_uint8),
-    ]
-
-
-def xvalue_head_len(h):
-    v = 0
-    for i in reversed(range(6)):
-        v = (v << 8) | h.len[i]
-    return v
+def xvalue_head_effective_len(wire):
+    """有效长度：layout=0 是 bodylen；layout=1 是 attr tag 2 的 reallen。"""
+    if len(wire) < KVSPACE_XVALUE_HEAD_LEN:
+        return None
+    bodylen = int.from_bytes(wire[0:8], "little")
+    if wire[12] != KVSPACE_XVALUE_LAYOUT_CAPACITY:
+        return bodylen
+    _, reallen = xvalue_head_scan(wire)
+    return reallen
 
 
 def bind(fn, args, restype):
@@ -58,7 +71,6 @@ bind(lib.kvspaceConnect, [ctypes.c_char_p], ctypes.c_void_p)
 bind(lib.kvspaceClose, [ctypes.c_void_p], None)
 # 借用读：out 指向 kvspace 常驻空间，string_at 拷出后不 free。resolve 穿透 link。
 bind(lib.kvspaceGet, [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_int, ctypes.POINTER(U8P), U32P], ctypes.c_int)
-bind(lib.kvspaceGetHead, [ctypes.c_void_p, ctypes.c_char_p, ctypes.POINTER(Head)], ctypes.c_int)
 # 写即构造：就地/新位置二选一原语，往返回的 body 偏移指针写字节。
 bind(lib.kvspaceWriteInPlace, [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_int, ctypes.c_uint32, ctypes.POINTER(U8P), ctypes.c_char_p, ctypes.c_uint32], ctypes.c_int)
 # Signature matches kvspace.h: (h, key, ref, storetype, body_len, body_cap, langtype, body, err, err_cap).
@@ -98,17 +110,18 @@ def new_str(s):
     return data
 
 
-# Read kind via kvspaceGetHead (from inline attr); body starts at offset 8 with length h.body_len.
+# kind 与 body 长度都从**同一条 wire**解出（`kvspaceGet` 的返回值），
+# 不再调已删除的 kvspaceGetHead，也不维护第二份 head 结构体。
 def read_kind(kv, key, data):
-    h = Head()
-    if lib.kvspaceGetHead(kv, key.encode(), ctypes.byref(h)) != 0:
+    if not data:
         return "", b""
-    kx = bytes(h.langtype).split(b"\0", 1)[0].decode()
+    langtype, _ = xvalue_head_scan(data)
+    kx = langtype.split(b"\0", 1)[0].decode()
     if kx.startswith(("*", "@")):
         kx = kx[1:]
     if kx.startswith("["):
         kx = kx[kx.index("]") + 1:]
-    bl = h.body_len if h.body_len > 0 else 0
+    bl = xvalue_head_effective_len(data) or 0
     return kx, data[KVSPACE_XVALUE_HEAD_LEN:KVSPACE_XVALUE_HEAD_LEN + bl]
 
 
@@ -140,14 +153,16 @@ class KV:
     def set(self, key, langtype, val):
         if len(val) < KVSPACE_XVALUE_HEAD_LEN:
             return
+        bl = xvalue_head_effective_len(val)
+        if bl is None:
+            raise RuntimeError(f"write {key}: value head is not well-formed")
+        # ref 由 langtype 的 * / @ 前缀隐含，不再从 head 位取。
+        ref = 1 if langtype.startswith("*") else (2 if langtype.startswith("@") else 0)
         buf = (ctypes.c_uint8 * len(val)).from_buffer_copy(val)
-        hd = XvalueHead()
-        ctypes.memmove(ctypes.byref(hd), buf, ctypes.sizeof(hd))
-        bl = xvalue_head_len(hd)
         dst = U8P()
         err = ctypes.create_string_buffer(256)
         if lib.kvspaceWriteInPlace(self.kv, key.encode(), 1, bl, ctypes.byref(dst), err, 256) != 0:
-            if lib.kvspaceWriteNewPlace(self.kv, key.encode(), hd.ptr, hd.storetype,
+            if lib.kvspaceWriteNewPlace(self.kv, key.encode(), ref, 0,
                                         bl, bl, langtype.encode(), ctypes.byref(dst), err, 256) != 0:
                 raise RuntimeError(f"write {key}: {err.value.decode(errors='replace')}")
         if bl > 0 and dst:
