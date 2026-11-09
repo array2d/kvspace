@@ -176,9 +176,9 @@ struct Value {
     body: Vec<u8>,
 }
 
-/* head 固定 16 字节 [bodylen:u64@0][attrslen:u32@8][layout@12][padding@13-15]，
-   body 偏移恒 16，attr 区紧随 body 且无自带长度前缀（长度只在 head 里）；
-   langtype 作为 attr 记录 tag=1 置于 body 之后（值内，非独立 key）。
+/* head 固定 16 字节 [bodylen:u64@0][attrslen:u16@8][reserved:u16@10]
+   [layout@12][padding@13-15]，body 偏移恒 16，attr 区紧随 body 且无自带长度前缀
+   （长度只在 head 里）；langtype 作为 attr 记录 tag=1 置于 body 之后（值内，非独立 key）。
    值自描述：直接解 wire（取头函数已删除；它对 Ptr 穿透，读不到本体）。 */
 fn from_wire(data: &[u8]) -> Value {
     if data.len() < KVSPACE_XVALUE_HEAD_LEN {
@@ -232,18 +232,18 @@ fn wire_len(data: &[u8]) -> u64 {
 /// 扫 attr 区取 tag=1（langtype）；无记录/坏 attr → 空串。
 fn wire_langtype(data: &[u8], body_len: usize) -> String {
     let base = KVSPACE_XVALUE_HEAD_LEN.saturating_add(body_len);
-    /* attrslen:u32 @8-11；attr 区无自带前缀。padding 非零视为非法。 */
+    /* attrslen:u16 @8-9；reserved:u16 @10-11 与 padding @13-15 非零视为非法。
+       attr 区无自带前缀。 */
     if data.len() < KVSPACE_XVALUE_HEAD_LEN
+        || data[10] != 0
+        || data[11] != 0
         || data[13] != 0
         || data[14] != 0
         || data[15] != 0
     {
         return String::new();
     }
-    let alen = (data[8] as usize)
-        | ((data[9] as usize) << 8)
-        | ((data[10] as usize) << 16)
-        | ((data[11] as usize) << 24);
+    let alen = (data[8] as usize) | ((data[9] as usize) << 8);
     if base + alen > data.len() {
         return String::new();
     }

@@ -1,4 +1,5 @@
-/* Wire: [bodylen:u64 LE@0][attrslen:u32 LE@8][layout:u8@12][padding:3@13-15]
+/* Wire: [bodylen:u64 LE@0][attrslen:u16 LE@8][reserved:u16 LE@10]
+   [layout:u8@12][padding:3@13-15]
    [body @16..16+bodylen][attr @16+bodylen..16+bodylen+attrslen].
    Head is fixed 16 bytes; body offset is always 16.
    head 只描述「字节怎么读」：bodylen 是 body 区字节数，layout 说它是不是容量。
@@ -37,10 +38,12 @@ extern "C" {
 #define KVSPACE_XVALUE_LAYOUT_CAPACITY 1u /* bodylen = 容量；有效长度在 attr tag 2 */
 
 /* Fixed 16-byte layout (direct memcpy struct + body + attrs).
-   wire: bodylen:u64@0, attrslen:u32@8, layout@12, padding@13-15. */
+   wire: bodylen:u64@0, attrslen:u16@8, reserved:u16@10, layout@12,
+   padding@13-15. */
 typedef struct kvspaceXvalueHead {
     uint64_t bodylen;      /* body 区字节数：有效长度，或容量（见 layout） */
-    uint32_t attrslen;     /* attr 区字节数（不含任何前缀） */
+    uint16_t attrslen;     /* attr 区字节数（不含任何前缀）；上限 UINT16_MAX */
+    uint16_t reserved;     /* 必须为零；旧格式的 attrslen 高 2 字节落在这里 */
     uint8_t  layout;       /* KVSPACE_XVALUE_LAYOUT_*；其它值非法 */
     uint8_t  padding[3];   /* 必须为零；读取方遇到非零按非法处理 */
 } kvspaceXvalueHead;
@@ -49,6 +52,7 @@ KVSPACE_STATIC_ASSERT(sizeof(kvspaceXvalueHead) == KVSPACE_XVALUE_HEAD_LEN,
                "XValue head must be exactly 16 bytes");
 KVSPACE_STATIC_ASSERT(offsetof(kvspaceXvalueHead, bodylen) == 0U, "bodylen@0");
 KVSPACE_STATIC_ASSERT(offsetof(kvspaceXvalueHead, attrslen) == 8U, "attrslen@8");
+KVSPACE_STATIC_ASSERT(offsetof(kvspaceXvalueHead, reserved) == 10U, "reserved@10");
 KVSPACE_STATIC_ASSERT(offsetof(kvspaceXvalueHead, layout) == 12U, "layout@12");
 KVSPACE_STATIC_ASSERT(offsetof(kvspaceXvalueHead, padding) == 13U, "padding@13");
 
@@ -59,10 +63,10 @@ static inline uint64_t kvspaceXvalueHeadLen(const kvspaceXvalueHead *h) {
 static inline void kvspaceXvalueHeadSetLen(kvspaceXvalueHead *h, uint64_t v) {
     h->bodylen = v;
 }
-static inline uint32_t kvspaceXvalueHeadAttrsLen(const kvspaceXvalueHead *h) {
+static inline uint16_t kvspaceXvalueHeadAttrsLen(const kvspaceXvalueHead *h) {
     return h->attrslen;
 }
-static inline void kvspaceXvalueHeadSetAttrsLen(kvspaceXvalueHead *h, uint32_t v) {
+static inline void kvspaceXvalueHeadSetAttrsLen(kvspaceXvalueHead *h, uint16_t v) {
     h->attrslen = v;
 }
 static inline uint8_t kvspaceXvalueHeadLayout(const kvspaceXvalueHead *h) {
@@ -75,14 +79,19 @@ static inline int kvspaceXvalueHeadLayoutIsValid(const kvspaceXvalueHead *h) {
     return h->layout == KVSPACE_XVALUE_LAYOUT_LENGTH ||
            h->layout == KVSPACE_XVALUE_LAYOUT_CAPACITY;
 }
-/* padding 是 ABI 的一部分：非零即非法，读取路径必须先过这一关。 */
+/* reserved 与 padding 都是 ABI 的一部分：非零即非法，读取路径必须先过这一关。 */
+static inline int kvspaceXvalueHeadReservedIsZero(const kvspaceXvalueHead *h) {
+    return h->reserved == 0u;
+}
 static inline int kvspaceXvalueHeadPaddingIsZero(const kvspaceXvalueHead *h) {
     return h->padding[0] == 0u && h->padding[1] == 0u && h->padding[2] == 0u;
 }
-/* 总长 = 16 + bodylen + attrslen；非法 layout、非零 padding、溢出都返回 0
-   （0 不是合法总长）。 */
+/* 总长 = 16 + bodylen + attrslen；非法 layout、非零 reserved/padding、溢出都
+   返回 0（0 不是合法总长）。 */
 static inline uint64_t kvspaceXvalueHeadTotalLen(const kvspaceXvalueHead *h) {
-    if (!kvspaceXvalueHeadPaddingIsZero(h) || !kvspaceXvalueHeadLayoutIsValid(h))
+    if (!kvspaceXvalueHeadReservedIsZero(h) ||
+        !kvspaceXvalueHeadPaddingIsZero(h) ||
+        !kvspaceXvalueHeadLayoutIsValid(h))
         return 0;
     uint64_t body = kvspaceXvalueHeadLen(h);
     uint64_t attrs = kvspaceXvalueHeadAttrsLen(h);
@@ -106,8 +115,8 @@ static inline const uint8_t *kvspaceXvalueHeadAttrs(const uint8_t *wire) {
    data 恒 8 字节 u64 LE。 */
 #define KVSPACE_XVALUE_ATTR_TAG_REALLEN 2u
 
-/* attr 扫描的唯一入口：校验 padding、layout、总长与 tag 2 归属，取出 tag 1
-   与 tag 2。输出参数都可为 NULL。返回 0 成功，-1 失败。 */
+/* attr 扫描的唯一入口：校验 reserved、padding、layout、总长与 tag 2 归属，
+   取出 tag 1 与 tag 2。输出参数都可为 NULL。返回 0 成功，-1 失败。 */
 int kvspaceXvalueHeadScan(const uint8_t *wire, uint64_t wire_len,
                            const uint8_t **out_langtype,
                            uint16_t *out_langtype_len,

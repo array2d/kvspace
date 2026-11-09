@@ -6,8 +6,9 @@
  *   shm://...      → libkvspace-c.so.1
  *   其余（redis/fs/s3）→ libkvspace_durable.so.1
  *
- * Wire: [bodylen:u64 LE@0][attrslen:u32 LE@8][layout:u8@12][padding:3@13-15]
- *       [body@16][attr records].
+ * Wire: [bodylen:u64 LE@0][attrslen:u16 LE@8][reserved:u16 LE@10]
+ *       [layout:u8@12][padding:3@13-15][body@16][attr records].
+ * `reserved` 必须为零（旧格式 attrslen 的高 2 字节）。
  * Head is fixed 16 bytes, so the body offset equals the head length — never a
  * literal; read it from kvspaceXvalueHeadLen / the `headlen` field below.
  * `layout` 0 = bodylen is the effective length; 1 = bodylen is capacity and the

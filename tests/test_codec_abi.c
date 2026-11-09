@@ -8,8 +8,9 @@
 
 #define CHECK(x) do { if (!(x)) { fprintf(stderr, "failed: %s\n", #x); return 1; } } while (0)
 
-/* 固定 head 16 字节 [bodylen:u64@0][attrslen:u32@8][layout@12][padding@13-15]，
-   body 偏移恒 16，attr 区紧随 body 且无自带长度前缀。单 key 整体。 */
+/* 固定 head 16 字节 [bodylen:u64@0][attrslen:u16@8][reserved:u16@10]
+   [layout@12][padding@13-15]，body 偏移恒 16，attr 区紧随 body 且无自带长度
+   前缀。单 key 整体。 */
 
 /* 校验 head 与 attr 区：head 的 bodylen/attrslen/padding 正确，
    total = 16+bodylen+attrslen；langtype 记录存在且与 lt 一致。 */

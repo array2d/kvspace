@@ -36,8 +36,7 @@ typedef enum kvspace_status {
 void *kvspaceConnect(const char *dsn);
 void kvspaceClose(void *h);
 
-/* key → 偏移。anchor 0 = root；失效返回 KVSPACE_ANCHOR_INVALID。
- * 跟随目录叠加（extindex）；不跟 Ptr。 */
+/* key → 偏移。anchor 0 = root；失效返回 KVSPACE_ANCHOR_INVALID；不跟 Ptr。 */
 int kvspaceResolve(void *handle, const char *key, uint64_t parent_key_anchor,
                    uint64_t *out_value_offset, char *err, uint32_t err_cap);
 
@@ -54,13 +53,9 @@ int kvspaceFree(void *handle, const char *key, char *err, uint32_t err_cap);
 int kvspaceCp(void *handle, const char *old_key, const char *new_key, char *err,
               uint32_t err_cap);
 
-/* 确保目录键存在（写 None 标记）；不复制、不建成员表。 */
+/* 建 index 位置：key 必须尾 `·` 或 `/`。只保证位置存在；
+ * XValue 的 body（以及 langtype 等）由上层用写路径填写。不建成员表。 */
 int kvspaceMkindex(void *handle, const char *key, char *err, uint32_t err_cap);
-
-/* 目录叠加：key 下的读取回退到 extension_key 的子树；不复制值。
- * 删除叠加用 kvspaceFree(key)。 */
-int kvspaceExtindex(void *handle, const char *key, const char *extension_key,
-                    char *err, uint32_t err_cap);
 
 /* 递归删除整棵子树。 */
 int kvspaceDeltree(void *handle, const char *key, char *err, uint32_t err_cap);
@@ -69,14 +64,20 @@ int kvspaceDeltree(void *handle, const char *key, char *err, uint32_t err_cap);
 int kvspaceCpdir(void *handle, const char *source_key,
                  const char *destination_key, char *err, uint32_t err_cap);
 
-/* 直接子项数；非索引返回 NOT_INDEX，空索引返回 0。 */
-int kvspaceListlen(void *handle, const char *key, int64_t *out_count, char *err,
-                   uint32_t err_cap);
+/* 直接子项数 N 与最长子项名字节数 M；非索引返回 NOT_INDEX，空索引 N=M=0。
+ * M 按 list 返回的同一字节串计（目录项含尾 `/`），供上层一次分配缓冲。 */
+int kvspaceListlen(void *handle, const char *key, int64_t *out_count,
+                   uint32_t *out_max_name_length, char *err, uint32_t err_cap);
 
-/* 第 index 个直接子项名（不写 NUL）；越界返回 MISSING，容量不足返回 CAPACITY。 */
-int kvspaceListat(void *handle, const char *key, uint64_t index,
-                  char *out_name, uint32_t out_capacity, uint32_t *out_length,
-                  char *err, uint32_t err_cap);
+/* 直接子项原始枚举：后端顺序、不排序。名字以 NUL 分隔写入 out_names
+ * （目录项带尾 `/`，与旧 ListAt 一致）；out_length 是总字节数。
+ * out_names 为 NULL 时只回报长度/个数/generation。
+ * 容量不足返回 CAPACITY，且仍写出所需长度与个数，不截断。
+ * out_generation 用于上层缓存失效：key 集合变化时前进。 */
+int kvspaceList(void *handle, const char *key, char *out_names,
+                uint32_t out_capacity, uint32_t *out_length,
+                uint32_t *out_count, uint64_t *out_generation, char *err,
+                uint32_t err_cap);
 
 #ifdef __cplusplus
 }

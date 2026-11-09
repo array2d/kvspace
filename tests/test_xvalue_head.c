@@ -4,9 +4,10 @@
 #include <stdlib.h>
 #include <string.h>
 
-/* 固定 head 16 字节 [bodylen:u64@0][attrslen:u32@8][layout@12][padding:3@13-15]，
-   body 偏移恒 16，attr 区紧随 body 且**无**自带长度前缀（长度只在 head 里）。
-   单 key 整体——无 attr key。head 不含 storetype/ptr：引用性在 langtype 前缀。 */
+/* 固定 head 16 字节 [bodylen:u64@0][attrslen:u16@8][reserved:u16@10]
+   [layout@12][padding:3@13-15]，body 偏移恒 16，attr 区紧随 body 且**无**自带
+   长度前缀（长度只在 head 里）。单 key 整体——无 attr key。
+   head 不含 storetype/ptr：引用性在 langtype 前缀。 */
 
 static int failures = 0;
 #define CHECK(cond, ...)                                                       \
@@ -73,8 +74,10 @@ static void test_none(void) {
     memcpy(&h, buf, sizeof h);
     CHECK(h.layout == KVSPACE_XVALUE_LAYOUT_LENGTH &&
           kvspaceXvalueHeadLen(&h) == 0, "none head");
-    /* wire 布局：bodylen@0、attrslen@8、layout@12、padding@13-15 全零 */
-    CHECK(buf[0] == 0 && buf[7] == 0 && buf[8] == 0 && buf[11] == 0 &&
+    /* wire 布局：bodylen@0-7、attrslen@8-9、reserved@10-11、layout@12、
+       padding@13-15 全零 */
+    CHECK(buf[0] == 0 && buf[7] == 0 && buf[8] == 0 && buf[9] == 0 &&
+          buf[10] == 0 && buf[11] == 0 &&
           buf[12] == KVSPACE_XVALUE_LAYOUT_LENGTH && buf[13] == 0 &&
           buf[14] == 0 && buf[15] == 0,
           "none wire layout");
@@ -268,7 +271,8 @@ static void test_reserve_code(void) {
           "code cap<len");
 }
 
-/* padding 是 ABI 的一部分：非零即非法；layout 只许 0/1，其它值按非法处理。 */
+/* reserved 与 padding 都是 ABI 的一部分：非零即非法；layout 只许 0/1，
+   其它值按非法处理。 */
 static void test_nonzero_padding_and_layout(void) {
     uint8_t *buf = NULL;
     uint64_t n = 0;
@@ -277,6 +281,22 @@ static void test_nonzero_padding_and_layout(void) {
     const uint8_t *lt = (const uint8_t *)"sentinel";
     CHECK(kvspaceXvalueHeadLangtypeBounded(buf, n, &lt) == 5 && lt != NULL,
           "pad zero accepted");
+    for (int at = 10; at <= 11; at++) {
+        buf[at] = 1;
+        kvspaceXvalueHead h;
+        memcpy(&h, buf, sizeof h);
+        lt = (const uint8_t *)"sentinel";
+        CHECK(kvspaceXvalueHeadLangtypeBounded(buf, n, &lt) == 0 && lt == NULL,
+              "nonzero reserved byte %d rejected", at);
+        CHECK(!kvspaceXvalueHeadReservedIsZero(&h),
+              "helper sees nonzero reserved");
+        CHECK(kvspaceXvalueHeadTotalLen(&h) == 0,
+              "total len refuses nonzero reserved");
+        uint64_t eff = 0;
+        CHECK(kvspaceXvalueHeadEffectiveLen(buf, n, &eff) != 0,
+              "effective len refuses nonzero reserved");
+        buf[at] = 0;
+    }
     for (int at = 13; at <= 15; at++) {
         buf[at] = 1;
         kvspaceXvalueHead h;
@@ -605,8 +625,39 @@ static void test_bounded_and_reserve_fail(void) {
           "bounded returns exact non-NUL-terminated slice after skipping unknown tag");
 }
 
+/* attrslen 是 u16：3 字节记录头 + langtype 数据必须 <= UINT16_MAX。 */
+static void test_attrslen_limit(void) {
+    const size_t max_langtype = UINT16_MAX - 3u;
+    const size_t too_long_langtype = max_langtype + 1u;
+    char *lt = (char *)malloc(too_long_langtype + 1u);
+    CHECK(lt != NULL, "attrslen limit allocation");
+    if (!lt)
+        return;
+    memset(lt, 'a', too_long_langtype);
+    lt[max_langtype] = '\0';
+    uint8_t *buf = NULL;
+    uint64_t n = 0;
+    CHECK(kvspaceXvalueHeadNewScalar(NULL, 0, lt, &buf, &n) == 0,
+          "attrslen == UINT16_MAX accepted");
+    if (buf) {
+        kvspaceXvalueHead h;
+        memcpy(&h, buf, sizeof h);
+        CHECK(kvspaceXvalueHeadAttrsLen(&h) == UINT16_MAX,
+              "max attrslen lands in the u16 field");
+        free(buf);
+    }
+    lt[max_langtype] = 'a';
+    lt[too_long_langtype] = '\0';
+    buf = NULL;
+    n = 0;
+    CHECK(kvspaceXvalueHeadNewScalar(NULL, 0, lt, &buf, &n) != 0 && buf == NULL,
+          "attrslen > UINT16_MAX rejected");
+    free(lt);
+}
+
 int main(void) {
     test_nonzero_padding_and_layout();
+    test_attrslen_limit();
     test_old_format_rejected();
     test_reallen_rules();
     test_total_len_from_head_only();

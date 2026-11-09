@@ -25,13 +25,13 @@ def xvalue_head_scan(wire):
 
     与 C 的 `kvspaceXvalueHeadScan` 同语义；Python 侧没有 inline 头可用，
     这里按线格式直接解，**不复制 C 的结构体字段**（那是第二份字段真相）。
-    wire: [bodylen:u64][attrslen:u32][layout:u8][padding:3][body][attrs]
+    wire: [bodylen:u64][attrslen:u16][reserved:u16][layout:u8][padding:3][body][attrs]
     """
     if len(wire) < KVSPACE_XVALUE_HEAD_LEN:
         return b"", None
     bodylen = int.from_bytes(wire[0:8], "little")
-    attrslen = int.from_bytes(wire[8:12], "little")
-    if wire[13:16] != b"\0\0\0":
+    attrslen = int.from_bytes(wire[8:10], "little")
+    if wire[10:12] != b"\0\0" or wire[13:16] != b"\0\0\0":
         return b"", None
     if KVSPACE_XVALUE_HEAD_LEN + bodylen + attrslen > len(wire):
         return b"", None

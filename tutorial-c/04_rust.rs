@@ -14,14 +14,14 @@ const KVSPACE_XVALUE_ATTR_TAG_REALLEN: u8 = 2;
 /// 扫描 16 字节 head + attr 区，返回 (langtype, reallen)。
 /// 与 C 的 `kvspaceXvalueHeadScan` 同语义；Rust 侧没有 inline 头可用，
 /// 这里按线格式直接解，**不复制 C 的结构体字段**（那是第二份字段真相）。
-/// wire: [bodylen:u64][attrslen:u32][layout:u8][padding:3][body][attrs]
+/// wire: [bodylen:u64][attrslen:u16][reserved:u16][layout:u8][padding:3][body][attrs]
 fn xvalue_head_scan(wire: &[u8]) -> (Vec<u8>, Option<u64>) {
     if wire.len() < KVSPACE_XVALUE_HEAD_LEN {
         return (vec![], None);
     }
     let bodylen = u64::from_le_bytes(wire[0..8].try_into().unwrap()) as usize;
-    let attrslen = u32::from_le_bytes(wire[8..12].try_into().unwrap()) as usize;
-    if wire[13..16] != [0u8, 0, 0] {
+    let attrslen = u16::from_le_bytes(wire[8..10].try_into().unwrap()) as usize;
+    if wire[10..12] != [0u8, 0] || wire[13..16] != [0u8, 0, 0] {
         return (vec![], None);
     }
     if KVSPACE_XVALUE_HEAD_LEN + bodylen + attrslen > wire.len() {

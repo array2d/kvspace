@@ -3,8 +3,8 @@
 #include <stdlib.h>
 #include <string.h>
 
-/* Layout: fixed 16-byte header [bodylen:u64@0][attrslen:u32@8][layout@12][padding@13]
-   [padding@14,16), body at offset 16, attr region right after the body with NO length
+/* Layout: fixed 16-byte header [bodylen:u64@0][attrslen:u16@8][reserved:u16@10]
+   [layout@12][padding@13,16), body at offset 16, attr region right after the body with NO length
    prefix (attrslen is in the head — a second prefix would be a second truth).
    Single-key atomic write — no separate attr key. Empty langtype = empty attr.
    layout=1 时 bodylen 是容量：body 区按容量分配、有效长度写进 attr tag 2。 */
@@ -39,12 +39,10 @@ static int build(uint8_t layout, const uint8_t *body, uint64_t region_len,
     }
     const uint64_t ltl = langtype ? (uint64_t)strlen(langtype) : 0;
     const uint64_t record_len = ltl + (langtype_prefix ? 1u : 0u);
-    if (record_len > UINT16_MAX)
-        return -1;
     uint64_t alen = record_len ? 3 + record_len : 0;
     if (layout == KVSPACE_XVALUE_LAYOUT_CAPACITY)
         alen += REALLEN_RECORD_LEN;
-    if (alen > UINT32_MAX)
+    if (alen > UINT16_MAX)
         return -1;
     if (region_len > UINT64_MAX - KVSPACE_XVALUE_HEAD_LEN ||
         alen > UINT64_MAX - KVSPACE_XVALUE_HEAD_LEN - region_len)
@@ -57,7 +55,7 @@ static int build(uint8_t layout, const uint8_t *body, uint64_t region_len,
         return -1;
     kvspaceXvalueHead h = {.layout = layout, .padding = {0u, 0u, 0u}};
     kvspaceXvalueHeadSetLen(&h, region_len);
-    kvspaceXvalueHeadSetAttrsLen(&h, (uint32_t)alen);
+    kvspaceXvalueHeadSetAttrsLen(&h, (uint16_t)alen);
     memcpy(p, &h, sizeof h);
     if (body && effective_len)
         memcpy(p + KVSPACE_XVALUE_HEAD_LEN, body, effective_len);
@@ -179,7 +177,7 @@ int kvspaceXvalueHeadScan(const uint8_t *wire, uint64_t wire_len,
     if (total == 0 || total > wire_len)
         return -1;
     const uint8_t *p = wire + KVSPACE_XVALUE_HEAD_LEN + h->bodylen;
-    const uint8_t *end = p + h->attrslen;
+    const uint8_t *end = p + kvspaceXvalueHeadAttrsLen(h);
     const uint8_t *langtype = NULL;
     uint16_t langtype_len = 0;
     uint64_t reallen = 0;
