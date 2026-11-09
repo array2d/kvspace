@@ -14,3 +14,6 @@ kvtest*
 
 # CLI 冒烟测试 store 产物
 cli/smoke*
+
+# 工作文档（审计/规划/调查，不入库）
+workspace/
