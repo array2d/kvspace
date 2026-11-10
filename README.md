@@ -4,7 +4,7 @@ KVSpace 的存储层实现：一个 `.so`，两个层次，互不越界。
 
 | 层 | 头 | 符号 |
 |---|---|---|
-| 存储 ABI | `kvspace.h` | 12 个：Connect / Close / XvalueInProcessAddress / Resolve / Realloc / Free / Cp / Mkindex / Deltree / Cpdir / Listlen / List |
+| 存储 ABI | `kvspace.h` | 12 个：Connect / Close / XvalueInProcessAddress / ResolveOffset / Realloc / Free / Cp / Mkindex / Deltree / Cpdir / Listlen / List |
 | 字节层 | `kvspace_xvalue.h` | 3 个：XvalueGetAttr / XvalueSetAttr / XvalueHeadEffectiveLen |
 | 存储常量 | `const.h` | 1 个：`kvspaceConstStorage` |
 

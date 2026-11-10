@@ -60,14 +60,14 @@ int main(void) {
 
     /* resolve 能定位到同一个偏移。 */
     uint64_t got = 0;
-    CHECK(kvspaceResolve(h, "/v", 0 /* anchor 0 = root */, &got, err, sizeof err) ==
+    CHECK(kvspaceResolveOffset(h, "/v", 0 /* anchor 0 = root */, &got, err, sizeof err) ==
               KVSPACE_OK,
           "resolve created: %s", err);
     CHECK(got == created, "resolve 偏移 %llu != realloc %llu",
           (unsigned long long)got, (unsigned long long)created);
 
     /* 不存在的 key 报 MISSING。 */
-    CHECK(kvspaceResolve(h, "/nope", 0 /* anchor 0 = root */, &got, err,
+    CHECK(kvspaceResolveOffset(h, "/nope", 0 /* anchor 0 = root */, &got, err,
                          sizeof err) == KVSPACE_MISSING,
           "resolve missing key");
 
@@ -87,7 +87,7 @@ int main(void) {
     CHECK(off != created, "超容量必须搬移（偏移没变：%llu）",
           (unsigned long long)off);
     uint64_t moved = off;
-    CHECK(kvspaceResolve(h, "/v", 0 /* anchor 0 = root */, &got, err, sizeof err) ==
+    CHECK(kvspaceResolveOffset(h, "/v", 0 /* anchor 0 = root */, &got, err, sizeof err) ==
               KVSPACE_OK && got == moved,
           "resolve 应指向新偏移");
 
@@ -98,7 +98,7 @@ int main(void) {
 
     /* ── 4. free ──────────────────────────────────────────────── */
     CHECK(kvspaceFree(h, "/v", err, sizeof err) == KVSPACE_OK, "free value");
-    CHECK(kvspaceResolve(h, "/v", 0 /* anchor 0 = root */, &got, err, sizeof err) ==
+    CHECK(kvspaceResolveOffset(h, "/v", 0 /* anchor 0 = root */, &got, err, sizeof err) ==
               KVSPACE_MISSING,
           "free 后应 MISSING");
     CHECK(kvspaceFree(h, "/v", err, sizeof err) == KVSPACE_MISSING,
@@ -109,12 +109,12 @@ int main(void) {
           "makeindex /d/: %s", err);
     /* 幂等：第二次仍 OK，且不重建（偏移不变）。 */
     uint64_t d_off = 0;
-    CHECK(kvspaceResolve(h, "/d/", 0 /* anchor 0 = root */, &d_off, err,
+    CHECK(kvspaceResolveOffset(h, "/d/", 0 /* anchor 0 = root */, &d_off, err,
                          sizeof err) == KVSPACE_OK,
           "resolve /d/");
     CHECK(kvspaceMkindex(h, "/d/", err, sizeof err) == KVSPACE_OK,
           "makeindex 幂等");
-    CHECK(kvspaceResolve(h, "/d/", 0 /* anchor 0 = root */, &got, err, sizeof err) ==
+    CHECK(kvspaceResolveOffset(h, "/d/", 0 /* anchor 0 = root */, &got, err, sizeof err) ==
               KVSPACE_OK && got == d_off,
           "幂等 makeindex 不得搬移索引自身");
     /* 非索引 key 拒绝。 */
@@ -131,7 +131,7 @@ int main(void) {
                   KVSPACE_OK,
               "realloc probe: %s", err);
         uint64_t roff = 0;
-        CHECK(kvspaceResolve(h, "/base/probe", 0, &roff, err, sizeof err) ==
+        CHECK(kvspaceResolveOffset(h, "/base/probe", 0, &roff, err, sizeof err) ==
                   KVSPACE_OK,
               "resolve probe: %s", err);
         CHECK(roff == voff, "resolve 偏移应与 realloc 一致");
@@ -283,7 +283,7 @@ int main(void) {
     CHECK(kvspaceFree(h, "/d/c/", err, sizeof err) == KVSPACE_OK, "free c/");
     CHECK(kvspaceFree(h, "/d/", err, sizeof err) == KVSPACE_OK,
           "空索引应可删（实际：%s）", err);
-    CHECK(kvspaceResolve(h, "/d/", 0 /* anchor 0 = root */, &got, err, sizeof err) ==
+    CHECK(kvspaceResolveOffset(h, "/d/", 0 /* anchor 0 = root */, &got, err, sizeof err) ==
               KVSPACE_MISSING,
           "空索引删后应 MISSING");
 
@@ -316,22 +316,22 @@ int main(void) {
         CHECK(kvspaceDeltree(h, "/dt/src/", err, sizeof err) == KVSPACE_OK,
               "deltree: %s", err);
         /* 根：带尾 `/` 与不带尾的两种形态都必须 MISSING。 */
-        CHECK(kvspaceResolve(h, "/dt/src", 0, &x, err, sizeof err) ==
+        CHECK(kvspaceResolveOffset(h, "/dt/src", 0, &x, err, sizeof err) ==
                   KVSPACE_MISSING,
               "deltree 后根（值形态）应 MISSING");
-        CHECK(kvspaceResolve(h, "/dt/src/", 0, &x, err, sizeof err) ==
+        CHECK(kvspaceResolveOffset(h, "/dt/src/", 0, &x, err, sizeof err) ==
                   KVSPACE_MISSING,
               "deltree 后根（目录形态）应 MISSING");
-        CHECK(kvspaceResolve(h, "/dt/src/a", 0, &x, err, sizeof err) ==
+        CHECK(kvspaceResolveOffset(h, "/dt/src/a", 0, &x, err, sizeof err) ==
                   KVSPACE_MISSING,
               "deltree 后后代 a 应 MISSING");
-        CHECK(kvspaceResolve(h, "/dt/src/sub/y", 0, &x, err, sizeof err) ==
+        CHECK(kvspaceResolveOffset(h, "/dt/src/sub/y", 0, &x, err, sizeof err) ==
                   KVSPACE_MISSING,
               "deltree 后后代 sub/y 应 MISSING");
         /* 兄弟不受影响：前缀相同但是不同子树。 */
-        CHECK(kvspaceResolve(h, "/dt/keep", 0, &x, err, sizeof err) == KVSPACE_OK,
+        CHECK(kvspaceResolveOffset(h, "/dt/keep", 0, &x, err, sizeof err) == KVSPACE_OK,
               "deltree 不得误删兄弟 /dt/keep");
-        CHECK(kvspaceResolve(h, "/dt/keepx/a", 0, &x, err, sizeof err) ==
+        CHECK(kvspaceResolveOffset(h, "/dt/keepx/a", 0, &x, err, sizeof err) ==
                   KVSPACE_OK,
               "deltree 不得误删 /dt/keepx/a");
         /* 幂等：再删一次仍 OK，不存在的 key 也 OK。 */
@@ -339,7 +339,7 @@ int main(void) {
               "deltree 应幂等");
         CHECK(kvspaceDeltree(h, "/dt/nope/", err, sizeof err) == KVSPACE_OK,
               "deltree 不存在的 key 应幂等成功");
-        CHECK(kvspaceResolve(h, "/dt/keep", 0, &x, err, sizeof err) == KVSPACE_OK,
+        CHECK(kvspaceResolveOffset(h, "/dt/keep", 0, &x, err, sizeof err) == KVSPACE_OK,
               "幂等 deltree 不得波及兄弟");
     }
 
@@ -438,7 +438,7 @@ int main(void) {
         CHECK(om == 6, "最长子项名应是 \"child/\"（6 字节），实际 %u",
               (unsigned)om);
         /* resolve 问值：该索引没有根值，MISSING 是对的。 */
-        CHECK(kvspaceResolve(h, "/only/", 0, &y, err, sizeof err) ==
+        CHECK(kvspaceResolveOffset(h, "/only/", 0, &y, err, sizeof err) ==
                   KVSPACE_MISSING,
               "无根值的索引 resolve 应 MISSING（问值，不问子项）");
         /* 值形态：/only 与 /only/ 是两个 key，前者没有值也没有同名目录值。 */
@@ -457,11 +457,11 @@ int main(void) {
     /* ── 10. resolve：失效 anchor ─────────────────────────────── */
     /* 公共 anchor 是 key 区 int64 字节偏移。远超 ART 区大小 → 必失效。 */
     const int64_t dead_anchor = INT64_C(1) << 40;
-    CHECK(kvspaceResolve(h, "/x", dead_anchor, &got, err, sizeof err) ==
+    CHECK(kvspaceResolveOffset(h, "/x", dead_anchor, &got, err, sizeof err) ==
               KVSPACE_ANCHOR_INVALID,
           "越界 key 区偏移应 ANCHOR_INVALID");
     /* 非块数据偏移（未对齐）同样必须拒绝。 */
-    CHECK(kvspaceResolve(h, "/x", 1, &got, err, sizeof err) ==
+    CHECK(kvspaceResolveOffset(h, "/x", 1, &got, err, sizeof err) ==
               KVSPACE_ANCHOR_INVALID,
           "错位偏移应 ANCHOR_INVALID");
 

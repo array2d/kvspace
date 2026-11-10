@@ -132,7 +132,7 @@ void kvspaceShmTestSetHoldReserveMilliseconds(uint32_t milliseconds);
 void kvspaceShmTestSetFailAlloc(bool enabled);
 void kvspaceShmTestSetFailArtInsert(bool enabled);
 /* benchmark-only：给已存在的父节点 key，反算它在 ART key 区的公共 int64 偏移，
- * 即 `kvspaceResolve` 的 `parent_key_anchor` 可接受的值。节点不存在 / 值槽为空 /
+ * 即 `kvspaceResolveOffset` 的 `parent_key_anchor` 可接受的值。节点不存在 / 值槽为空 /
  * 偏移反算不到合法块 → 失败，不造值。 */
 int kvspaceShmTestAnchorOf(kvspace_t *kv, const char *parent_key,
                            int64_t *out_anchor);

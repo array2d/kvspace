@@ -3393,7 +3393,7 @@ static int anchor_from_offset(kvspace_t *kv, int64_t key_offset,
  * 块数自证 id 在范围内，再取节点。anchor 来自调用方（可能是跨进程传的旧值），
  * 不能假设它可信。
  *
- * **两层哨兵别混**：公共 ABI 的 `anchor == 0` 是 root 哨兵，由 `kvspaceResolve`
+ * **两层哨兵别混**：公共 ABI 的 `anchor == 0` 是 root 哨兵，由 `kvspaceResolveOffset`
  * 在进 `ResolveFrom` 之前就分流掉，根本不会走到这里；到了这里的 `block_id`
  * 是引擎块号，**0 是合法节点**（`art_id_of` 的失败值才是 -1）。曾经这里写
  * `<= 0`，于是空库中落在 block 0 的父节点拿到锚点也被判 ANCHOR_INVALID——
@@ -3898,7 +3898,7 @@ KVSPACE_PUBLIC uint8_t *kvspaceXvalueInProcessAddress(void *handle) {
     return kvspaceShmStorageDataBase((kvspace_t *)handle);
 }
 
-KVSPACE_PUBLIC int kvspaceResolve(void *handle, const char *key,
+KVSPACE_PUBLIC int kvspaceResolveOffset(void *handle, const char *key,
                                  int64_t parent_key_anchor,
                                  uint64_t *out_value_offset, char *err,
                                  uint32_t err_cap) {

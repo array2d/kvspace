@@ -44,6 +44,40 @@ LIB_DIR="$RELEASE_DIR/lib"
 INC_DIR="$RELEASE_DIR/include/kvspace"
 SONAME_FILE="$LIB_DIR/libkvspace.so.1.0.0"
 
+# ── 0. 布局闸：先分清「目录给错了」与「内容不对」 ────────────────────
+#
+# `cmake --install --prefix X` 把库装到 `X/lib/kvspace/`（CMakeLists 的
+# `LIBRARY DESTINATION .../kvspace`），而 release tarball 把它们平铺在 `lib/`。
+# 两种布局里**只有一种是本检查器的对象**。
+#
+# 为什么不在下面各步各自兜底、也不让检查器两种都接受：那会变成「两个入口」——
+# 一个检查器同时认两种布局，就意味着它没有确定的判据，将来第三种布局出现时没人
+# 知道该不该加。这里显式只认发布包布局，别的直接退出去并说清该怎么转。
+#
+# 判据：**错误信息必须让人一眼分清「布局不对」与「内容不对」**。之前有过一次
+# 因为检查器硬编码路径而误判「handler 缺失」的事故，排查花了一轮。
+#
+# 判据的落点：**看库文件实际在哪，不看目录在不在。**
+#
+# 第一版写成 `[ ! -d "$LIB_DIR" ] && ...`，实测这个闸**从不触发**——因为
+# `cmake --install` 的布局里 `lib/` 是存在的（它是 `lib/kvspace/` 的父目录），
+# 于是条件恒假，流程直接掉进第 1 组断言报「缺少 3 个文件」。
+# **目录存在不代表内容在正确位置。**
+#
+# 但只判「`lib/kvspace/` 存在」又会走向另一个错：发布包里若意外多出这个空子目录，
+# 就被误判成 install 布局。所以**两个条件都要成立**才归为 install 布局：
+#   1. `lib/` 平铺处**没有** libkvspace 系列（否则它就是发布包）；
+#   2. `lib/kvspace/` 里**有**。
+if ! ls "$LIB_DIR"/libkvspace.so* >/dev/null 2>&1 &&
+   ls "$RELEASE_DIR"/lib/kvspace/libkvspace.so* >/dev/null 2>&1; then
+    bad "$RELEASE_DIR 不是发布包布局（库在 lib/kvspace/ 子目录里，不在 lib/ 平铺）"
+    say "      这看起来是 **cmake --install 的前缀目录**，不是 release tarball 解包后的目录。"
+    say "      本检查器只验发布包布局：lib/libkvspace.so* + include/kvspace/。"
+    say "      要验安装布局，先把它摊平再跑："
+    say "        cp -P '$RELEASE_DIR/lib/kvspace/libkvspace.so'* '$RELEASE_DIR/lib/'"
+    exit 2
+fi
+
 failures=0
 
 # ── 1. lib/ 恰好三个 libkvspace.so 系列 ──────────────────────────────

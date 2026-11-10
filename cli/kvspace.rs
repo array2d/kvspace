@@ -50,7 +50,7 @@ extern "C" {
     fn kvspaceXvalueInProcessAddress(h: *mut c_void) -> *mut u8; // 1 参
     /* key → 偏移；anchor 0 = root。不跟 Ptr。 */
     /* 6 参 */
-    fn kvspaceResolve(
+    fn kvspaceResolveOffset(
         h: *mut c_void,
         key: *const c_char,
         parent_key_anchor: u64,
@@ -150,17 +150,15 @@ fn fail_op(err: &[u8; 256], op: &str) -> ! {
 
 /// bodylen:u64 小端 @0-7（唯一读点，与 C 侧 kvspaceXvalueHeadLen 一致）。
 
-/// 扫 attr 区取 tag=1（langtype）；无记录/坏 attr → 空串。
+/* 这里曾有 5 段 doc 注释，描述「扫 attr 取 langtype」「剥 [dims] 得基 kind」
+「判 bufferarray」「标量宽度」「解小端标量」几个函数。那些函数随语言层迁出而删除
+（TASK-085/082：本 CLI 只做存储子命令），但注释留了下来——**注释描述的函数不存在**
+比没有注释更坏：读者会去找，找不到就会以为是自己漏看了。
 
-/// langtype 无 ref 前缀（ref 是独立字段）：只剥前导 [dims]，其余为基 kind。
-
-/// 是否 bufferarray：`char/<enc>` 基种类，或轴写成 `[]` / `[.]` 等运行期长度
-/// （见 spec [[compact形态]]）。bufferarray 的 bodylen 是容量，其余是有效长度。
-
-
-/// Element width in bytes for fixed-width scalars; None otherwise.
-
-/// Decode one little-endian fixed-width scalar; returns None on unknown kind or short slice.
+尤其 `扫 attr 区取 tag=1（langtype）` 那句，与本文件 `print_help` 里
+「本 CLI 不解析 langtype——那是语言层的事」直接矛盾。实现（`raw_attrs`）只拆
+record 打印 tag 编号、不解释含义，也没有 `GetAttr` 的 extern——行为是对的，
+错的是那句残留注释。 */
 
 
 
@@ -187,7 +185,7 @@ fn resolve_view<'a>(kv: *mut c_void, key: &str) -> Option<&'a [u8]> {
     let mut offset: u64 = 0;
     let mut err = [0u8; 256];
     let rc = unsafe {
-        kvspaceResolve(
+        kvspaceResolveOffset(
             kv,
             cs(key),
             0,

@@ -6,11 +6,15 @@
  * 不解释值的语义；上层拿到 value_offset 后用「本进程基址 + 偏移」自行读写。
  *
  * value_offset 是**映射后端**（shm）的 sbo data 区字节偏移，不是指针；0 合法。
- * 无映射后端（durable 的 fs/redis/s3）没有进程内值区，resolve/realloc
+ * 无映射后端（durable 的 fs/redis/s3）没有进程内值区，`kvspaceResolveOffset` / `kvspaceRealloc`
  * 返回 KVSPACE_UNSUPPORTED；**本期没有非映射写路径**（durable 暂停；若恢复，
  * 需要新增写入操作或 commit 语义再扩展）。parent_key_anchor 是父节点在 key 区的 int64 字节偏移，
  * 0 = root；内部布局由后端转换，公共 ABI 不暴露。
  * 返回 0 或负 errno；不用 0/-1 当偏移哨兵。
+ *
+ * **别和语言层的 `kvlang·resolvekey` 混淆**：本层的 `kvspaceResolveOffset` 收一条**已算好的 key
+ * 文本**、返回**值区偏移**；语言层的 `kvlang·resolvekey(base, k)` 收容器/Ptr 加**运行期键值**、
+ * 返回 **Ptr**。两者不可互换，顺序也是先语言层拼文本、再存储层定位。
  *
  * **偏移生命周期**：offset 只在「下一次对该 key 的 Realloc/Free 之前」有效。
  * Realloc 容量内原地时旧 offset 仍指向同一盒子；超容量搬移后旧 offset 立即
@@ -74,10 +78,15 @@ void kvspaceClose(void *h);
  * 不传 base。无映射后端（durable）返回 NULL。 */
 uint8_t *kvspaceXvalueInProcessAddress(void *handle);
 
-/* key → 偏移。anchor 是**父节点在 key 区的字节偏移**，由后端按自己的 key 数据结构
- * 解释；调用方只持有一个 int64 偏移，不解释内部布局。0 = root（从根按绝对 key 查找）。
- * 偏移失效返回 KVSPACE_ANCHOR_INVALID；不跟 Ptr。 */
-int kvspaceResolve(void *handle, const char *key, int64_t parent_key_anchor,
+/* key → **偏移**（`Offset`）。anchor 是**父节点在 key 区的字节偏移**，由后端按自己的
+ * key 数据结构解释；调用方只持有一个 int64 偏移，不解释内部布局。0 = root（从根按
+ * 绝对 key 查找）。偏移失效返回 KVSPACE_ANCHOR_INVALID；不跟 Ptr。
+ *
+ * **名字里带 `Offset` 是为了与另一处 resolve 区分**：语言层的 key 解析（把相对/成员/
+ * 坐标路径解析成**绝对 key 字符串**）叫 `resolvekey`，它在 kvlang 侧；本函数解析成
+ * **值区字节偏移**，是存储层唯一的寻址原语。两件事都叫 resolve 时，读代码的人分不清
+ * 「解析出来的是 key 还是偏移」，也就分不清该拿它去 `kvspaceRealloc` 还是去再查一次。 */
+int kvspaceResolveOffset(void *handle, const char *key, int64_t parent_key_anchor,
                    uint64_t *out_value_offset, char *err, uint32_t err_cap);
 
 /* 唯一写原语：key 不存在则创建（清零），存在则调整容量。

@@ -2,12 +2,12 @@
  * benchmark-only 锚点钩子的自测：`kvspaceShmTestAnchorOf`。
  *
  * 验的是三条：
- *   1. 已存在父节点 → 能拿到 anchor，且这个 anchor **真能被 kvspaceResolve 用**
+ *   1. 已存在父节点 → 能拿到 anchor，且这个 anchor **真能被 kvspaceResolveOffset 用**
  *      （不是随便一个数：拿它去解析子键必须成功）；
  *   2. 不存在的父节点 → 失败，且 out_anchor 不被写；
  *   3. NULL 参数 → 失败。
  *
- * 为什么第 1 条要走到 kvspaceResolve：锚点的唯一用途就是当
+ * 为什么第 1 条要走到 kvspaceResolveOffset：锚点的唯一用途就是当
  * `parent_key_anchor` 传回去。只断言「返回 0 且值非零」等于测了自己写的返回值，
  * 而没测它是否真的是一个可用锚点——那正是这个钩子存在的意义。
  */
@@ -82,7 +82,7 @@ int main(void) {
 
     uint64_t child_off = 0;
     memset(err, 0, sizeof err);
-    rc = kvspaceResolve(h, "/d/x", (uint64_t)anchor, &child_off, err,
+    rc = kvspaceResolveOffset(h, "/d/x", (uint64_t)anchor, &child_off, err,
                         sizeof err);
     CHECK(rc == KVSPACE_OK,
           "用钩子给的 anchor 解析 /d/x 必须成功（rc=%d err=%s）—— "

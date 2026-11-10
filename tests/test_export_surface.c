@@ -34,7 +34,7 @@ static const void *const exported_symbols[] = {
     (const void *)&kvspaceConnect,
     (const void *)&kvspaceClose,
     /* 存储 ABI（9 个语义操作） */
-    (const void *)&kvspaceResolve,
+    (const void *)&kvspaceResolveOffset,
     (const void *)&kvspaceRealloc,
     (const void *)&kvspaceFree,
     (const void *)&kvspaceCp,
