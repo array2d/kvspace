@@ -23,25 +23,21 @@
 #include "common.h"
 #include <stdio.h>
 
+/* 读一个 key：resolve 拿 offset，在 base+offset 处读 head/body/attr。 */
 static void get(void *kv, const char *key) {
-    uint32_t len; uint8_t *v = kv_get(kv, key, &len);
-    if (!v || len == 0) { printf("%s\t(nil)\n", key); return; }
-    char kind[32]; const uint8_t *body; uint32_t bl;
-    read_kind(v, len, kind, sizeof(kind), &body, &bl);
+    kv_value v;
+    if (kv_read(kv, key, &v) != 0) { printf("%s\t(nil)\n", key); return; }
+    char kind[32];
+    kv_kind(&v, kind, sizeof kind);
     printf("%s\t%s:", key, kind);
-    if (strcmp(kind, "int64") == 0 && bl >= 8) printf("%ld", *(const int64_t *)body);
-    else if (strcmp(kind, "char/utf8") == 0) printf("%.*s", (int)bl, body);
-    else if (strcmp(kind, "float64") == 0 && bl >= 8) printf("%.2f", *(const double *)body);
+    if (strcmp(kind, "int64") == 0 && v.body_len >= 8) printf("%ld", *(const int64_t *)v.body);
+    else if (strcmp(kind, "char/utf8") == 0) printf("%.*s", (int)v.body_len, v.body);
+    else if (strcmp(kind, "float64") == 0 && v.body_len >= 8) printf("%.2f", *(const double *)v.body);
     printf("\n");
-    free(v);
 }
 
-static void set_int(void *kv, const char *key, int64_t v) {
-    uint32_t l; uint8_t *b = new_int64(v, &l); kv_set(kv, key, "int64", b, l); free(b);
-}
-static void set_str(void *kv, const char *key, const char *s) {
-    uint32_t l; uint8_t *b = new_str(s, &l); kv_set(kv, key, "char/utf8", b, l); free(b);
-}
+static void set_int(void *kv, const char *key, int64_t v) { kv_set_int(kv, key, v); }
+static void set_str(void *kv, const char *key, const char *s) { kv_set_str(kv, key, s); }
 static void list(void *kv, const char *dir, int show_kind) {
     uint32_t len; uint8_t *out = NULL;
     kv_list(kv, dir, &out, &len);
@@ -56,13 +52,13 @@ static void list(void *kv, const char *dir, int show_kind) {
         memcpy(name, out + i, n); name[n] = 0;
         if (show_kind) {
             char full[512]; snprintf(full, sizeof(full), "%s%s", dir, name);
-            uint32_t vl; uint8_t *v = kv_get(kv, full, &vl);
-            if (v) { char kind[32]; const uint8_t *body; uint32_t bl;
-                read_kind(v, vl, kind, sizeof(kind), &body, &bl);
+            kv_value v;
+            if (kv_read(kv, full, &v) == 0) {
+                char kind[32];
+                kv_kind(&v, kind, sizeof kind);
                 printf("%s\t%s", name, kind);
-                if (strcmp(kind, "int64") == 0 && bl >= 8) printf("\t%ld", *(const int64_t *)body);
+                if (strcmp(kind, "int64") == 0 && v.body_len >= 8) printf("\t%ld", *(const int64_t *)v.body);
                 printf("\n");
-                free(v);
             }
         } else {
             printf("%s\n", name);
@@ -77,7 +73,7 @@ int main(void) {
     remove(path);
     void *kv = kv_open_shm(path);
     if (!kv) return 1;
-    kvspaceMkindex(kv, "/t01/", 0, NULL, 0);
+    kv_mkindex(kv, "/t01/");
 
     printf("=== Set & Get ===\n");
     set_int(kv, "/t01/a", 42);

@@ -8,7 +8,8 @@
  * 输出格式：每行 `<case-name> <total-len> <hex>`，顺序固定，便于 diff。
  */
 
-#include <kvspace/xvalue_head.h>
+#include <kvspace/kvspace_xvalue.h>
+#include <kvspace/kvlang_xvalue.h>
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -77,8 +78,8 @@ static void emit_slack_utf8(void) {
     uint8_t *wire = NULL;
     uint64_t length = 0;
 
-    REQUIRE(kvspaceXvalueHeadNewSlack(body, sizeof body, sizeof body,
-                                      "[]char/utf8", &wire, &length) == 0,
+    REQUIRE(kvspaceXvalueHeadNewSlack(body, sizeof body, "[]char/utf8",
+                                      &wire, &length) == 0,
             "utf8");
     if (wire != NULL) {
         emit("slack-utf8", wire, length);
@@ -91,8 +92,7 @@ static void emit_slack_no_langtype(void) {
     uint8_t *wire = NULL;
     uint64_t length = 0;
 
-    REQUIRE(kvspaceXvalueHeadNewSlack(body, sizeof body, sizeof body, "", &wire,
-                                      &length) == 0,
+    REQUIRE(kvspaceXvalueHeadNewSlack(body, sizeof body, "", &wire, &length) == 0,
             "no-langtype");
     if (wire != NULL) {
         emit("slack-no-langtype", wire, length);
@@ -146,7 +146,7 @@ static void emit_reserve(void) {
     uint8_t *wire = NULL;
     uint64_t length = 0;
 
-    REQUIRE(kvspaceXvalueHeadReserve(4, 8, "[]u8",
+    REQUIRE(kvspaceXvalueHeadReserve(4, "[]u8",
                                      &wire, &length) == 0,
             "reserve");
     if (wire != NULL) {

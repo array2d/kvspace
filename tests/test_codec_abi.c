@@ -1,5 +1,6 @@
 #include <kvspace/kvspace.h>
-#include <kvspace/xvalue_head.h>
+#include <kvspace/kvspace_xvalue.h>
+#include <kvspace/kvlang_xvalue.h>
 
 #include <stdint.h>
 #include <stdio.h>
@@ -8,7 +9,7 @@
 
 #define CHECK(x) do { if (!(x)) { fprintf(stderr, "failed: %s\n", #x); return 1; } } while (0)
 
-/* 固定 head 16 字节 [bodylen:u64@0][attrslen:u32@8][layout@12][padding@13-15]，
+/* 固定 head 16 字节 [bodylen:u64@0][attrslen:u16@8][padding:6@10-15]，
    body 偏移恒 16，attr 区紧随 body 且无自带长度前缀。单 key 整体。 */
 
 /* 校验 head 与 attr 区：head 的 bodylen/attrslen/padding 正确，
@@ -41,8 +42,7 @@ int main(void) {
     CHECK(kvspaceNewInt64(42, "int64", &value, &len) == 0);
     CHECK(len == 32);
     memcpy(&h, value, sizeof h);
-    CHECK(h.layout == KVSPACE_XVALUE_LAYOUT_LENGTH &&
-          kvspaceXvalueHeadLen(&h) == 8);
+    CHECK(kvspaceXvalueHeadLen(&h) == 8);
     CHECK(attr_ok(value, len, 8, "int64"));
     uint64_t v = 0;
     for (int i = 7; i >= 0; i--)
@@ -53,8 +53,7 @@ int main(void) {
     CHECK(kvspaceNewBool(1, "bool", &value, &len) == 0);
     CHECK(len == 24);
     memcpy(&h, value, sizeof h);
-    CHECK(h.layout == KVSPACE_XVALUE_LAYOUT_LENGTH &&
-          kvspaceXvalueHeadLen(&h) == 1 && value[KVSPACE_XVALUE_HEAD_LEN] == 1);
+    CHECK(kvspaceXvalueHeadLen(&h) == 1 && value[KVSPACE_XVALUE_HEAD_LEN] == 1);
     CHECK(attr_ok(value, len, 1, "bool"));
     free(value);
     CHECK(kvspaceNewBool(0, "bool", &value, &len) == 0);
@@ -64,8 +63,7 @@ int main(void) {
     CHECK(kvspaceNewFloat64(2.5, "float64", &value, &len) == 0);
     CHECK(len == 34);
     memcpy(&h, value, sizeof h);
-    CHECK(h.layout == KVSPACE_XVALUE_LAYOUT_LENGTH &&
-          kvspaceXvalueHeadLen(&h) == 8);
+    CHECK(kvspaceXvalueHeadLen(&h) == 8);
     CHECK(attr_ok(value, len, 8, "float64"));
     uint64_t bits = 0;
     for (int i = 7; i >= 0; i--)
@@ -79,8 +77,7 @@ int main(void) {
     CHECK(kvspaceNewChar(utf8, sizeof utf8, "char/utf8", &value, &len) == 0);
     CHECK(len == 16 + sizeof utf8 + 12);
     memcpy(&h, value, sizeof h);
-    CHECK(h.layout == KVSPACE_XVALUE_LAYOUT_LENGTH &&
-          kvspaceXvalueHeadLen(&h) == sizeof utf8);
+    CHECK(kvspaceXvalueHeadLen(&h) == sizeof utf8);
     CHECK(memcmp(value + KVSPACE_XVALUE_HEAD_LEN, utf8, sizeof utf8) == 0);
     CHECK(attr_ok(value, len, sizeof utf8, "char/utf8"));
     free(value);
@@ -92,8 +89,7 @@ int main(void) {
     /* langtype 记录带 `*` 前缀：record = "*int64"（6 字节）。 */
     CHECK(len == KVSPACE_XVALUE_HEAD_LEN + 2 + 3 + 6);
     memcpy(&h, value, sizeof h);
-    CHECK(h.layout == KVSPACE_XVALUE_LAYOUT_LENGTH &&
-          kvspaceXvalueHeadLen(&h) == 2);
+    CHECK(kvspaceXvalueHeadLen(&h) == 2);
     CHECK(memcmp(value + KVSPACE_XVALUE_HEAD_LEN, "/x", 2) == 0);
     CHECK(attr_ok(value, len, 2, "*int64"));
     free(value);
@@ -102,8 +98,7 @@ int main(void) {
     /* 空 kindexpr ⇒ 裸 `*` 一条记录。 */
     CHECK(len == KVSPACE_XVALUE_HEAD_LEN + 2 + 3 + 1);
     memcpy(&h, value, sizeof h);
-    CHECK(h.layout == KVSPACE_XVALUE_LAYOUT_LENGTH &&
-          kvspaceXvalueHeadLen(&h) == 2);
+    CHECK(kvspaceXvalueHeadLen(&h) == 2);
     /* **空 kindexpr 时仍写裸 `*`**：指针形态只有一个落点（langtype 前缀），
        构造器自己补——否则 runtimec 的 form 判据会在运行期判不出 POINTER。 */
     CHECK(attr_ok(value, len, 2, "*"));

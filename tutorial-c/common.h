@@ -1,124 +1,192 @@
-// common.h — tutorial 公共助手：统一 kvspace* ABI 的 XValue 构造/读取与单键读写便捷封装。
-// 所有 tutorial 均链接 libkvspace（dispatch 前端），运行期经 shm:// 选择 kvspace-c 后端。
-// #571: Fixed 8-byte header (body offset is always 8); langtype (incl. [dims]) in inline attr.
+// common.h — tutorial 公共助手：新存储 ABI 上的单键读写与目录枚举。
+//
+// 新 ABI 的模型只有三个动作，示例也正是按这三步写的，不含任何兼容层：
+//   读：kvspaceResolve(key) → offset，再读 base+offset 处的 head/body/attr
+//   写：kvspaceRealloc(key, bodylen, attrlen) → offset，再直接写 base+offset
+//   目录：kvspaceListlen 取 N/M → kvspaceList 一次取全部名字
+//
+// base 来自 kvspaceXvalueInProcessAddress(h)，对 shm 后端稳定；durable 没有
+// 进程内值区，返回 NULL——那时读写走不了这套，示例只用 shm。
+//
+// XValue 的字节布局由 kvspace_xvalue.h / kvlang_xvalue.h 定义，这里不重复。
 #ifndef KVSPACE_TUTORIAL_COMMON_H
 #define KVSPACE_TUTORIAL_COMMON_H
 
-#include "kvspace/kvspace.h"
-#include <kvspace/xvalue_head.h>
+#include <kvspace/kvspace.h>
+#include <kvspace/kvspace_xvalue.h>
+#include <kvspace/kvlang_xvalue.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
-// Constructors: return malloc-allocated XValue bytes (header + body + attr); caller frees.
+#define KV_ERR_CAP 256
 
-static inline uint8_t *new_int64(int64_t v, uint32_t *len) {
-    uint8_t *out = NULL; uint32_t n = 0;
-    kvspaceNewInt64(v, "int64", &out, &n);
-    *len = n; return out;
+// 一条值的只读视图：head 在 wire 起点，body 紧随其后。attr 用 GetAttr 取。
+typedef struct {
+    const uint8_t *head;
+    uint32_t head_len;   // 恒为 KVSPACE_XVALUE_HEAD_LEN
+    const uint8_t *body;
+    uint32_t body_len;   // 有效字节数
+} kv_value;
+
+// ── 连接 ─────────────────────────────────────────────────────────────
+
+static inline void *kv_open_shm(const char *path) {
+    char dsn[512];
+    snprintf(dsn, sizeof dsn, "shm://%s", path);
+    return kvspaceConnect(dsn);
 }
 
-static inline uint8_t *new_str(const char *s, uint32_t *len) {
-    uint8_t *out = NULL; uint32_t n = 0;
-    kvspaceNewChar((const uint8_t *)s, (uint32_t)strlen(s), "char/utf8", &out, &n);
-    *len = n; return out;
+// 进程内值区基址。每个读/写都经它把 offset 变成地址——offset 本身不是指针。
+static inline uint8_t *kv_base(void *h) { return kvspaceXvalueInProcessAddress(h); }
+
+// ── 读 ───────────────────────────────────────────────────────────────
+
+// 解析 key 并填出只读视图。值不存在或 wire 不合法返回 -1。
+// 注意 body 指针指向**后端常驻内存**，随该 key 被改写或 handle 关闭而失效；
+// 需要留存就必须自己拷出去（示例里不需要，都是现读现打印）。
+static inline int kv_read(void *h, const char *key, kv_value *out) {
+    uint64_t offset = 0;
+    char err[KV_ERR_CAP];
+    if (kvspaceResolve(h, key, 0, &offset, err, sizeof err) != KVSPACE_OK)
+        return -1;
+    uint8_t *base = kv_base(h);
+    if (!base)
+        return -1;
+    const uint8_t *wire = base + offset;
+    const kvspaceXvalueHead *head = (const kvspaceXvalueHead *)(const void *)wire;
+    const uint64_t total = kvspaceXvalueHeadTotalLen(head);
+    if (total == 0)
+        return -1;
+    out->head = wire;
+    out->head_len = KVSPACE_XVALUE_HEAD_LEN;
+    out->body = wire + KVSPACE_XVALUE_HEAD_LEN;
+    out->body_len = (uint32_t)kvspaceXvalueHeadLen(head);
+    return 0;
 }
 
-static inline uint8_t *new_bytes(const uint8_t *raw, uint32_t rl, uint32_t *len) {
-    uint8_t *out = NULL; uint64_t n = 0;
-    uint64_t dims[1] = { rl };
-    kvspaceXvalueHeadNewTensor(dims, 1, raw, rl, NULL, &out, &n);
-    *len = n > UINT32_MAX ? 0 : (uint32_t)n;
-    return out;
-}
-
-// Reader: bounded langtype parse from inline attr (stripping leading [dims] for base kind);
-// body starts at offset 8 with length from header.
-
-static inline const char *read_kind(const uint8_t *data, uint32_t len,
-                                    char *kind, size_t cap,
-                                    const uint8_t **body, uint32_t *body_len) {
-    if (cap) kind[0] = 0;
-    *body = NULL; *body_len = 0;
-    if (!data || len < KVSPACE_XVALUE_HEAD_LEN || cap == 0) return NULL;
-    /* 有效长度走 EffectiveLen：layout=1 时 bodylen 是容量，不是有效长度。 */
-    uint64_t bl = 0;
-    if (kvspaceXvalueHeadEffectiveLen(data, len, &bl) != 0) return NULL;
-    if (bl > len - KVSPACE_XVALUE_HEAD_LEN) return NULL;
+// 取 langtype（剥掉前导 [dims]，只留基 kind）。取不到返回空串。
+// 整条 wire 的长度由 head 自己算得出，不需要调用方再传——这正是 attrslen 放在
+// head 里的好处：attr 区没有第二层长度前缀。
+static inline const char *kv_kind(const kv_value *v, char *kind, size_t cap) {
+    if (cap)
+        kind[0] = 0;
+    const kvspaceXvalueHead *head = (const kvspaceXvalueHead *)(const void *)v->head;
+    const uint64_t total = kvspaceXvalueHeadTotalLen(head);
+    if (total == 0 || cap == 0)
+        return kind;
     const uint8_t *lt = NULL;
-    size_t n = kvspaceXvalueHeadLangtypeBounded(data, len, &lt);
-    const uint8_t *e = lt && n && lt[0] == '[' ? memchr(lt, ']', n) : NULL;
-    if (e) { n -= (size_t)(e + 1 - lt); lt = e + 1; }
-    if (n >= cap) n = cap - 1;
-    if (n) memcpy(kind, lt, n);
+    uint16_t n = kvspaceXvalueHeadLangtypeBounded(v->head, total, &lt);
+    const uint8_t *close = lt && n && lt[0] == '[' ? memchr(lt, ']', n) : NULL;
+    if (close) {
+        n -= (uint16_t)(close + 1 - lt);
+        lt = close + 1;
+    }
+    if (n >= cap)
+        n = (uint16_t)(cap - 1);
+    if (n)
+        memcpy(kind, lt, n);
     kind[n] = 0;
-    *body = data + KVSPACE_XVALUE_HEAD_LEN;
-    *body_len = (uint32_t)bl;
     return kind;
 }
 
-// Single-key read/write helpers (WriteInPlace or WriteNewPlace with inline langtype).
+// ── 写 ───────────────────────────────────────────────────────────────
 
-static inline int kv_set(void *h, const char *key, const char *langtype,
-                         const uint8_t *val, uint32_t len) {
-    if (!val || len < KVSPACE_XVALUE_HEAD_LEN) return -1;
-    uint64_t bl = 0;
-    if (kvspaceXvalueHeadEffectiveLen(val, len, &bl) != 0) return -1;
-    if (bl > UINT32_MAX) return -1;
-    /* ref 由 langtype 的 * / @ 前缀隐含；storetype 在当前模型不承载信息。 */
-    uint8_t ref = langtype[0] == '*' ? 1U : (langtype[0] == '@' ? 2U : 0U);
-    uint8_t *dst = NULL; char err[256];
-    if (kvspaceWriteInPlace(h, key, 1, (uint32_t)bl, &dst, err, sizeof err) != 0 &&
-        kvspaceWriteNewPlace(h, key, ref, 0U, (uint32_t)bl, bl,
-                             langtype, &dst, err, sizeof err) != 0)
+// 写入一条值：先 realloc 出 body+attr 空间，再直接写 base+offset。
+// langtype 为空/NULL 时不写 attr 记录。
+static inline int kv_write(void *h, const char *key, const uint8_t *body,
+                           uint64_t body_len, const char *langtype) {
+    const uint16_t lt_len = langtype && langtype[0] ? (uint16_t)strlen(langtype) : 0;
+    const uint64_t attr_len = lt_len ? 3u + lt_len : 0u;
+    uint64_t offset = 0;
+    char err[KV_ERR_CAP];
+    if (kvspaceRealloc(h, key, body_len, attr_len, &offset, err, sizeof err) !=
+        KVSPACE_OK)
         return -1;
-    if (bl && dst) memcpy(dst, val + KVSPACE_XVALUE_HEAD_LEN, (size_t)bl);
-    return 0;
-}
-
-// 借用读 + 拷出自持：调用方以 libc free 释放（借用本身不得 free）。
-static inline uint8_t *kv_get(void *h, const char *key, uint32_t *len) {
-    uint8_t *out = NULL; uint32_t n = 0;
-    kvspaceGet(h, key, 0, &out, &n);
-    if (!out || n == 0) { *len = 0; return NULL; }
-    uint8_t *copy = malloc(n);
-    memcpy(copy, out, n);
-    *len = n; return copy;
-}
-
-// 前缀枚举：ListLen 定计数 + 逐 idx ListAt 取名（自备缓冲），拼成 \n 分隔的 malloc 缓冲（调用方 free）。
-static inline int kv_list(void *h, const char *prefix, uint8_t **out, uint32_t *out_len) {
-    *out = NULL; *out_len = 0;
-    int32_t count = 0;
-    if (kvspaceListLen(h, prefix, 0, 1, &count) != 0 || count <= 0) return 0;
-    size_t cap = 256, used = 0;
-    uint8_t *buf = malloc(cap);
-    for (int32_t i = 0; i < count; i++) {
-        uint8_t nm[1024]; uint32_t nl = 0;
-        if (kvspaceListAt(h, prefix, 0, 1, i, nm, sizeof(nm), &nl) != 0 || nl == 0) continue;
-        if (used + nl + 1 > cap) { while (used + nl + 1 > cap) cap *= 2; buf = realloc(buf, cap); }
-        if (used > 0) buf[used++] = '\n';
-        memcpy(buf + used, nm, nl); used += nl;
+    uint8_t *base = kv_base(h);
+    if (!base)
+        return -1;
+    uint8_t *wire = base + offset;
+    if (body_len && body)
+        memcpy(wire + KVSPACE_XVALUE_HEAD_LEN, body, (size_t)body_len);
+    if (lt_len) {
+        uint8_t *attr = wire + KVSPACE_XVALUE_HEAD_LEN + body_len;
+        attr[0] = KVSPACE_XVALUE_ATTR_TAG_LANGTYPE;
+        attr[1] = (uint8_t)lt_len;
+        attr[2] = (uint8_t)(lt_len >> 8);
+        memcpy(attr + 3, langtype, lt_len);
     }
-    *out = buf; *out_len = (uint32_t)used;
     return 0;
+}
+
+static inline int kv_set_int(void *h, const char *key, int64_t v) {
+    return kv_write(h, key, (const uint8_t *)&v, sizeof v, "int64");
+}
+static inline int kv_set_str(void *h, const char *key, const char *s) {
+    return kv_write(h, key, (const uint8_t *)s, strlen(s), "char/utf8");
+}
+
+// 下面三个是给「同一段 body 要写成不同 langtype」的示例用的：它们在示例里
+// 各自扮演「造一条值」的角色，与新 ABI 的 realloc+直写是同一步，不需要把
+// body 先打包成 wire 再拆开——那样反而多了两次拷贝。
+static inline int kv_set_bytes(void *h, const char *key, const uint8_t *raw,
+                               uint64_t len, const char *langtype) {
+    return kv_write(h, key, raw, len, langtype);
+}
+static inline int kv_set_raw(void *h, const char *key, const uint8_t *raw,
+                             uint64_t len) {
+    return kv_write(h, key, raw, len, NULL);
 }
 
 static inline void kv_del(void *h, const char *key) {
-    const char *keys[1] = { key };
-    kvspaceDel(h, keys, 1, NULL, 0);
+    char err[KV_ERR_CAP];
+    (void)kvspaceFree(h, key, err, sizeof err);
 }
 
-// ── 连接：shm:// DSN → dispatch 前端 → kvspace-c 后端 ──
+static inline void kv_mkindex(void *h, const char *prefix) {
+    char err[KV_ERR_CAP];
+    (void)kvspaceMkindex(h, prefix, err, sizeof err);
+}
 
-static inline void *kv_open_shm(const char *path) {
-    size_t n = strlen(path) + 7;
-    char *dsn = malloc(n);
-    snprintf(dsn, n, "shm://%s", path);
-    void *h = kvspaceConnect(dsn);
-    free(dsn);
-    return h;
+// ── 目录 ─────────────────────────────────────────────────────────────
+
+// 一次取全部直接子项名（NUL 分隔，目录项带尾 `/`），拼成 \n 分隔的 malloc
+// 缓冲交给调用方 free。N 由 listlen 给出，M 给最长名字节数——两者配合就能
+// 一次分配到位，不必先试错容量。
+static inline int kv_list(void *h, const char *prefix, uint8_t **out, uint32_t *out_len) {
+    *out = NULL;
+    *out_len = 0;
+    int64_t count = 0;
+    uint32_t max_name = 0;
+    char err[KV_ERR_CAP];
+    if (kvspaceListlen(h, prefix, &count, &max_name, err, sizeof err) != KVSPACE_OK)
+        return -1;
+    if (count <= 0)
+        return 0;
+    char *names = malloc((size_t)count * (max_name + 1));
+    uint32_t length = 0, listed = 0;
+    uint64_t generation = 0;
+    if (kvspaceList(h, prefix, names, (uint32_t)((size_t)count * (max_name + 1)),
+                    &length, &listed, &generation, err, sizeof err) != KVSPACE_OK) {
+        free(names);
+        return -1;
+    }
+    // NUL 分隔 → \n 分隔（示例打印用这套分隔符，保留原可读性）。
+    uint8_t *buf = malloc(length);
+    uint32_t used = 0;
+    for (uint32_t i = 0; i < length; i++) {
+        if (names[i] == '\0') {
+            if (used > 0)
+                buf[used++] = '\n';
+        } else {
+            buf[used++] = (uint8_t)names[i];
+        }
+    }
+    free(names);
+    *out = buf;
+    *out_len = used;
+    return 0;
 }
 
 #endif

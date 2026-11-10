@@ -1,143 +1,134 @@
 // kvspace CLI — 走 libkvspace dispatch 前端（C ABI），后端由 DSN 运行时选择。
-// 命令与输出格式对齐 kvspace-go/cmd/kvspace。
+//
+// ## 构建前提（缺一即链接失败）
+//
+// 链接期需要 `-lkvspace`，即 `kvspace` 仓的前端库：
+//
+//     cmake -S ../kvspace -B ../kvspace/build && cmake --build ../kvspace/build -j
+//     LIBRARY_PATH=<kvspace>/build cargo build --release     # ← 缺它会报
+//                                                          #   unable to find library -lkvspace
+//     LD_LIBRARY_PATH=<kvspace>/build ./target/release/kvspace help
+//
+// 运行期后端由 DSN 选：`shm://` → libkvspace-c（映射后端），`fs://`/`redis://`/`s3://`
+// → libkvspace_durable。前端在本库同目录及其 `kvspace/` 子目录找后端 .so。
+//
+// ## 只支持 shm
+//
+// `kvspaceXvalueInProcessAddress` 返回 NULL 的后端（fs/redis/s3）没有进程内值区，
+// 读写无从落地，CLI 在写入入口直接报错退出，不退化成第二路径。
 
 use std::env;
 use std::os::raw::{c_char, c_int, c_void};
 use std::process::exit;
 
-/* 固定 head 16 字节（见 kvspace/xvalue_head.h）：body 偏移恒 16。 */
-const KVSPACE_XVALUE_HEAD_LEN: usize = 16;
-/* head 只有 layout@12：0=bodylen 是有效长度，1=容量（有效长度在 attr tag 2）。
+/* 固定 head 16 字节（见 kvspace/kvspace_xvalue.h）：[bodylen:u64@0][attrslen:u16@8]
+   [padding:6@10-15]，body 偏移恒 16。bodylen 是容量还是有效长度由 langtype 判；
    指针/扩展性**不在 head**，看 langtype 首字符 `*`/`@`。 */
-const KVSPACE_XVALUE_LAYOUT_CAPACITY: u8 = 1;
-/* 后端写侧 storage class（由 layout/dims 推出，传给 kvspaceWriteNewPlace）。 */
-const KVSPACE_STORETYPE_FIXED_SMALL: u8 = 0;
-const KVSPACE_STORETYPE_SLACK: u8 = 1;
-const KVSPACE_STORETYPE_FIXED_LARGE: u8 = 2;
+const KVSPACE_XVALUE_HEAD_LEN: usize = 16;
 const KVSPACE_XVALUE_PTR_PTR: u8 = 1;
 const KVSPACE_XVALUE_PTR_EXT: u8 = 2;
+/* kvspace_status_t 的 MISSING（kvspace/kvspace.h:39，= -ENOENT）。只这一处需要判它。 */
+const KVSPACE_MISSING: c_int = -2;
 
+/* 每个 extern 后标注 `// N 参`：Rust 的 `extern "C"` **不校验参数个数**，
+   与 C 头不符时会以 segfault（而非编译错误）出现——本文件就因 NewSlack 按旧五参
+   写、新头是四参而崩过一次。标注让「对不上」在阅读时可见。 */
 #[link(name = "kvspace")]
 extern "C" {
-    fn kvspaceConnect(dsn: *const c_char) -> *mut c_void;
-    fn kvspaceClose(h: *mut c_void);
-    fn free(p: *mut c_void); // libc：释放 codec 产出的 frontend malloc 缓冲
-                             // 借用读：*out 指向后端常驻/回收空间，调用方不得 free。resolve=1 穿透 link。
-    fn kvspaceGet(
+    fn kvspaceConnect(dsn: *const c_char) -> *mut c_void; // 1 参
+    fn kvspaceClose(h: *mut c_void); // 1 参
+    fn free(p: *mut c_void); // libc：释放构造器产出的 frontend malloc 缓冲
+
+    /* ── 新存储层 ABI（kvspace/kvspace.h，12 个符号） ─────────────────────
+       旧 kvspaceGet/SetValue/ListLen/ListAt/Del/DelTree/CpTree/MkindexExt/
+       Watch/Clear/New* 已全部删除：本文件不允许再出现它们的 extern。 */
+
+    /* 进程内值区基址；durable 的 fs/redis/s3 返回 NULL（CLI 见到即拒绝启动）。 */
+    fn kvspaceXvalueInProcessAddress(h: *mut c_void) -> *mut u8; // 1 参
+    /* key → 偏移；anchor 0 = root。不跟 Ptr。 */
+    /* 6 参 */
+    fn kvspaceResolve(
         h: *mut c_void,
         key: *const c_char,
-        resolve: c_int,
-        out: *mut *mut u8,
-        out_len: *mut u32,
+        parent_key_anchor: u64,
+        out_value_offset: *mut u64,
+        err: *mut c_char,
+        err_cap: u32,
     ) -> c_int;
-    fn kvspaceSetValue(
+    /* 唯一写原语：不存在则创建，存在则调整容量。head 由它写，调用方只填 body/attr。 */
+    /* 7 参 */
+    fn kvspaceRealloc(
         h: *mut c_void,
         key: *const c_char,
-        value: *const u8,
-        value_len: u32,
+        body_length: u64,
+        attr_length: u64,
+        out_value_offset: *mut u64,
         err: *mut c_char,
         err_cap: u32,
     ) -> c_int;
-    // 前缀遍历：listlen 定计数，逐 idx 取名（借用回收缓冲，不得 free），不一次性返回整段名单。
-    fn kvspaceListLen(
-        h: *mut c_void,
-        prefix: *const c_char,
-        expand_ext: c_int,
-        resolve: c_int,
-        out_count: *mut i32,
-    ) -> c_int;
-    fn kvspaceListAt(
-        h: *mut c_void,
-        prefix: *const c_char,
-        expand_ext: c_int,
-        resolve: c_int,
-        idx: i32,
-        buf: *mut u8,
-        buf_cap: u32,
-        out_len: *mut u32,
-    ) -> c_int;
-    fn kvspaceDel(
-        h: *mut c_void,
-        keys: *const *const c_char,
-        nkeys: u32,
-        err: *mut c_char,
-        err_cap: u32,
-    ) -> c_int;
-    fn kvspaceDelTree(
-        h: *mut c_void,
-        prefix: *const c_char,
-        err: *mut c_char,
-        err_cap: u32,
-    ) -> c_int;
+    fn kvspaceFree(h: *mut c_void, key: *const c_char, err: *mut c_char, err_cap: u32) -> c_int; // 4 参
+    /* 5 参 */
     fn kvspaceCp(
         h: *mut c_void,
-        src: *const c_char,
-        dst: *const c_char,
+        old_key: *const c_char,
+        new_key: *const c_char,
         err: *mut c_char,
         err_cap: u32,
     ) -> c_int;
-    fn kvspaceCpTree(
+    /* 四参、无 capacity。 */
+    fn kvspaceMkindex(h: *mut c_void, key: *const c_char, err: *mut c_char, err_cap: u32) -> c_int; // 4 参（无 capacity）
+    fn kvspaceDeltree(h: *mut c_void, key: *const c_char, err: *mut c_char, err_cap: u32) -> c_int; // 4 参
+    /* 5 参 */
+    fn kvspaceCpdir(
         h: *mut c_void,
-        src: *const c_char,
-        dst: *const c_char,
+        source_key: *const c_char,
+        destination_key: *const c_char,
         err: *mut c_char,
         err_cap: u32,
     ) -> c_int;
-    fn kvspaceMkindex(
+    /* 6 参 */
+    fn kvspaceListlen(
         h: *mut c_void,
-        path: *const c_char,
-        capacity: u32,
+        key: *const c_char,
+        out_count: *mut i64,
+        out_max_name_length: *mut u32,
         err: *mut c_char,
         err_cap: u32,
     ) -> c_int;
-    fn kvspaceMkindexExt(
+    /* 9 参 */
+    fn kvspaceList(
         h: *mut c_void,
-        path: *const c_char,
-        ext: *const c_char,
+        key: *const c_char,
+        out_names: *mut c_char,
+        out_capacity: u32,
+        out_length: *mut u32,
+        out_count: *mut u32,
+        out_generation: *mut u64,
         err: *mut c_char,
         err_cap: u32,
     ) -> c_int;
-    fn kvspaceRmindexExt(
-        h: *mut c_void,
-        path: *const c_char,
-        err: *mut c_char,
-        err_cap: u32,
-    ) -> c_int;
-    fn kvspaceClear(h: *mut c_void, err: *mut c_char, err_cap: u32) -> c_int;
-    fn kvspaceNewPtr(
-        target_kindexpr: *const c_char,
-        target: *const c_char,
-        out: *mut *mut u8,
-        out_len: *mut u32,
-    ) -> c_int;
-    fn kvspaceNewChar(
-        bytes: *const u8,
-        len: u32,
-        langtype: *const c_char,
-        out: *mut *mut u8,
-        out_len: *mut u32,
-    ) -> c_int;
-    fn kvspaceNewBool(
-        v: u8,
-        langtype: *const c_char,
-        out: *mut *mut u8,
-        out_len: *mut u32,
-    ) -> c_int;
-    fn kvspaceNewInt64(
-        v: i64,
-        langtype: *const c_char,
-        out: *mut *mut u8,
-        out_len: *mut u32,
-    ) -> c_int;
-    fn kvspaceNewFloat64(
-        v: f64,
-        langtype: *const c_char,
-        out: *mut *mut u8,
-        out_len: *mut u32,
-    ) -> c_int;
+
+    /* ── 值构造器（kvspace/kvlang_xvalue.h）：造完整 wire，CLI 拆 body/attr 后写 ── */
+    /* 5 参 */
     fn kvspaceXvalueHeadNewScalar(
         raw: *const u8,
         raw_len: u32,
+        langtype: *const c_char,
+        out: *mut *mut u8,
+        out_len: *mut u64,
+    ) -> c_int;
+    /* 5 参 */
+    fn kvspaceXvalueHeadNewSlack(
+        data: *const u8,
+        data_len: u64,
+        langtype: *const c_char,
+        out: *mut *mut u8,
+        out_len: *mut u64,
+    ) -> c_int;
+    /* 5 参 */
+    fn kvspaceXvalueHeadNewPtr(
+        path: *const u8,
+        path_len: u32,
         langtype: *const c_char,
         out: *mut *mut u8,
         out_len: *mut u64,
@@ -171,23 +162,25 @@ fn fail_op(err: &[u8; 256], op: &str) -> ! {
 struct Value {
     kind: String,   // Base kind (langtype without leading [dims])
     r#ref: u8,      // langtype 前缀：0=普通, 1=`*`, 2=`@`
-    storetype: u8,  // 后端 storage class（由 layout/dims 推出，不在 head）
     dims: Vec<i32>, // Leading [dims] parsed from langtype
     body: Vec<u8>,
+    body_len: u64,  // head.bodylen
+    attrs_len: u16, // head.attrslen
 }
 
-/* head 固定 16 字节 [bodylen:u64@0][attrslen:u32@8][layout@12][padding@13-15]，
-   body 偏移恒 16，attr 区紧随 body 且无自带长度前缀（长度只在 head 里）；
-   langtype 作为 attr 记录 tag=1 置于 body 之后（值内，非独立 key）。
-   值自描述：直接解 wire（取头函数已删除；它对 Ptr 穿透，读不到本体）。 */
+/* head 固定 16 字节 [bodylen:u64@0][attrslen:u16@8][padding:6@10-15]，body 偏移恒 16，
+   attr 区紧随 body 且无自带长度前缀（长度只在 head 里）；langtype 作为 attr 记录 tag=1
+   置于 body 之后（值内，非独立 key）。值自描述：直接解 wire（取头函数已删除；它对 Ptr
+   穿透，读不到本体）。head 里没有 layout / reserved / storetype / ptr。 */
 fn from_wire(data: &[u8]) -> Value {
     if data.len() < KVSPACE_XVALUE_HEAD_LEN {
         return Value {
             kind: String::new(),
             r#ref: 0,
-            storetype: 0,
             dims: vec![],
             body: vec![],
+            body_len: 0,
+            attrs_len: 0,
         };
     }
     let body_len = wire_len(data) as usize;
@@ -199,24 +192,17 @@ fn from_wire(data: &[u8]) -> Value {
         _ => (0u8, &raw_langtype[..]),
     };
     let (dims, kind) = parse_langtype(langtype_body);
-    /* 后端 storage class 不在 head 里：layout=1 即按容量存（slack），
-       有 dims 的定长张量是 fixed-large，其余 fixed-small。 */
-    let storetype = if data[12] == KVSPACE_XVALUE_LAYOUT_CAPACITY {
-        KVSPACE_STORETYPE_SLACK
-    } else if !dims.is_empty() {
-        KVSPACE_STORETYPE_FIXED_LARGE
-    } else {
-        KVSPACE_STORETYPE_FIXED_SMALL
-    };
     /* body 只到 head.bodylen 为止；其后是 attr 区，不属 body。 */
     let start = KVSPACE_XVALUE_HEAD_LEN;
     let end = start.saturating_add(body_len).min(data.len());
+    let attrs_len = (data[8] as u16) | ((data[9] as u16) << 8);
     Value {
         kind,
         r#ref,
-        storetype,
         dims,
         body: data[start..end].to_vec(),
+        body_len: body_len as u64,
+        attrs_len,
     }
 }
 
@@ -232,18 +218,11 @@ fn wire_len(data: &[u8]) -> u64 {
 /// 扫 attr 区取 tag=1（langtype）；无记录/坏 attr → 空串。
 fn wire_langtype(data: &[u8], body_len: usize) -> String {
     let base = KVSPACE_XVALUE_HEAD_LEN.saturating_add(body_len);
-    /* attrslen:u32 @8-11；attr 区无自带前缀。padding 非零视为非法。 */
-    if data.len() < KVSPACE_XVALUE_HEAD_LEN
-        || data[13] != 0
-        || data[14] != 0
-        || data[15] != 0
-    {
+    /* attrslen:u16 @8-9；padding @10-15 六字节非零视为非法。attr 区无自带前缀。 */
+    if data.len() < KVSPACE_XVALUE_HEAD_LEN || data[10..16].iter().any(|&b| b != 0) {
         return String::new();
     }
-    let alen = (data[8] as usize)
-        | ((data[9] as usize) << 8)
-        | ((data[10] as usize) << 16)
-        | ((data[11] as usize) << 24);
+    let alen = (data[8] as usize) | ((data[9] as usize) << 8);
     if base + alen > data.len() {
         return String::new();
     }
@@ -280,6 +259,9 @@ fn parse_langtype(lt: &str) -> (Vec<i32>, String) {
     }
     (Vec::new(), lt.to_string())
 }
+
+/// 是否 bufferarray：`char/<enc>` 基种类，或轴写成 `[]` / `[.]` 等运行期长度
+/// （见 spec [[compact形态]]）。bufferarray 的 bodylen 是容量，其余是有效长度。
 
 fn fmt_float(v: f64) -> String {
     let s = format!("{}", v);
@@ -377,23 +359,61 @@ fn format_value(v: &Value) -> String {
     format!("{}:{}", v.kind, plain(v))
 }
 
-// 借用读：kvspaceGet 返回后端常驻/回收空间偏移指针，读出即拷贝自持，绝不 free。resolve=0 不穿透 link。
-fn get(kv: *mut c_void, key: &str) -> Vec<u8> {
-    let mut out: *mut u8 = std::ptr::null_mut();
-    let mut len: u32 = 0;
-    unsafe {
-        if kvspaceGet(kv, cs(key), 0, &mut out, &mut len) != 0 || out.is_null() || len == 0 {
-            return vec![];
-        }
-        std::slice::from_raw_parts(out, len as usize).to_vec()
+// 借用读：resolve_view 返回值区内的切片（共享映射），读出即拷贝自持，绝不 free。
+/* ── 进程内值区（新 ABI 的唯一读写路径） ──────────────────────────────
+   resolve 给偏移，InProcessAddress 给基址，地址 = base + offset。值区里的字节就是
+   wire 本体：16 字节 head（Realloc/后端写）+ body + attr。
+
+   写没有「commit」：Realloc 写 head 并把这段交给我们，填完 body/attr 函数返回即生效
+   （shm 靠共享映射）。这是新 ABI 的真实语义，不发明提交点。 */
+
+/// 该句柄的进程内值区基址。NULL = 后端无映射区（fs/redis/s3）→ CLI 不支持读写。
+fn data_base(kv: *mut c_void) -> *mut u8 {
+    unsafe { kvspaceXvalueInProcessAddress(kv) }
+}
+
+/// 读一个 key 的 wire 切片（借自值区，活到下一次写/删该 key）。
+fn resolve_view<'a>(kv: *mut c_void, key: &str) -> Option<&'a [u8]> {
+    let base = data_base(kv);
+    if base.is_null() {
+        return None;
     }
+    let mut offset: u64 = 0;
+    let mut err = [0u8; 256];
+    let rc = unsafe {
+        kvspaceResolve(
+            kv,
+            cs(key),
+            0,
+            &mut offset,
+            err.as_mut_ptr() as *mut c_char,
+            256,
+        )
+    };
+    if rc != 0 {
+        return None;
+    }
+    let head = unsafe { base.add(offset as usize) };
+    /* bodylen@0-7、attrslen@8-9 决定整条 wire 的长度。 */
+    let raw = unsafe { std::slice::from_raw_parts(head, KVSPACE_XVALUE_HEAD_LEN) };
+    let body_len = wire_len(raw) as usize;
+    let attrs_len = (raw[8] as usize) | ((raw[9] as usize) << 8);
+    let total = KVSPACE_XVALUE_HEAD_LEN
+        .checked_add(body_len)?
+        .checked_add(attrs_len)?;
+    Some(unsafe { std::slice::from_raw_parts(head, total) })
+}
+
+/// 拷贝读：给调用方一份独立字节（值区切片会在写时变化）。
+fn get(kv: *mut c_void, key: &str) -> Vec<u8> {
+    resolve_view(kv, key).map(|v| v.to_vec()).unwrap_or_default()
 }
 
 // Parse CLI value syntax into full XValue wire bytes (langtype stored in tag=1 attr).
 // Empty Vec represents `nil:` (delete).
 fn parse_value(raw: &str) -> Vec<u8> {
     let mut out: *mut u8 = std::ptr::null_mut();
-    let mut len: u32 = 0;
+    let len: u32;
     if let Some(rest) = raw.strip_prefix('*') {
         // `*:kindexpr:target` (typed ptr) or `*:target` (unconstrained ptr).
         let rest = rest.strip_prefix(':').unwrap_or(rest);
@@ -401,11 +421,19 @@ fn parse_value(raw: &str) -> Vec<u8> {
             Some(i) => (&rest[..i], &rest[i + 1..]),
             None => ("", rest),
         };
-        if unsafe { kvspaceNewPtr(cs(k), cs(t), &mut out, &mut len) != 0 } {
+        let mut len64: u64 = 0;
+        if unsafe {
+            kvspaceXvalueHeadNewPtr(
+                t.as_ptr(),
+                t.len() as u32,
+                cs(k),
+                &mut out,
+                &mut len64,
+            ) != 0
+        } {
             fatalf(&format!("parse value failed: {:?}", raw));
         }
-        // Unprefixed kindexpr; empty kindexpr -> unconstrained (empty langtype).
-        return take_wire(out, len);
+        return take_wire(out, len64 as u32);
     }
     if let Some(langtype) = raw.strip_prefix("map:") {
         if !langtype.contains('·') {
@@ -437,28 +465,46 @@ fn parse_value(raw: &str) -> Vec<u8> {
         _ => "[]char/utf8", // string 与默认字符串
     };
     match kind {
-        "int" => unsafe {
-            if kvspaceNewInt64(
-                repr.parse().unwrap_or_else(|_| fatalf(&format!("parse value failed: {:?}", raw))),
-                cs(langtype),
-                &mut out,
-                &mut len,
-            ) != 0
-            {
-                fatalf(&format!("parse value failed: {:?}", raw));
+        "int" => {
+            let n: i64 = repr
+                .parse()
+                .unwrap_or_else(|_| fatalf(&format!("parse value failed: {:?}", raw)));
+            let le = n.to_le_bytes();
+            let mut len64: u64 = 0;
+            unsafe {
+                if kvspaceXvalueHeadNewScalar(
+                    le.as_ptr(),
+                    8,
+                    cs(langtype),
+                    &mut out,
+                    &mut len64,
+                ) != 0
+                {
+                    fatalf(&format!("parse value failed: {:?}", raw));
+                }
             }
-        },
-        "float" => unsafe {
-            if kvspaceNewFloat64(
-                repr.parse().unwrap_or_else(|_| fatalf(&format!("parse value failed: {:?}", raw))),
-                cs(langtype),
-                &mut out,
-                &mut len,
-            ) != 0
-            {
-                fatalf(&format!("parse value failed: {:?}", raw));
+            len = len64 as u32;
+        }
+        "float" => {
+            let f: f64 = repr
+                .parse()
+                .unwrap_or_else(|_| fatalf(&format!("parse value failed: {:?}", raw)));
+            let le = f.to_le_bytes();
+            let mut len64: u64 = 0;
+            unsafe {
+                if kvspaceXvalueHeadNewScalar(
+                    le.as_ptr(),
+                    8,
+                    cs(langtype),
+                    &mut out,
+                    &mut len64,
+                ) != 0
+                {
+                    fatalf(&format!("parse value failed: {:?}", raw));
+                }
             }
-        },
+            len = len64 as u32;
+        }
         "float32" => {
             let f: f32 = repr
                 .parse()
@@ -485,39 +531,57 @@ fn parse_value(raw: &str) -> Vec<u8> {
                 "false" => false,
                 _ => fatalf(&format!("bool 只接受 true/false: {:?}", raw)),
             };
+            let body = [b as u8];
+            let mut len64: u64 = 0;
             unsafe {
-                if kvspaceNewBool(b as u8, cs(langtype), &mut out, &mut len) != 0 {
+                if kvspaceXvalueHeadNewScalar(
+                    body.as_ptr(),
+                    1,
+                    cs(langtype),
+                    &mut out,
+                    &mut len64,
+                ) != 0
+                {
                     fatalf(&format!("parse value failed: {:?}", raw));
                 }
             }
+            len = len64 as u32;
         }
-        "string" => unsafe {
-            if kvspaceNewChar(
-                repr.as_ptr(),
-                repr.len() as u32,
-                cs(langtype),
-                &mut out,
-                &mut len,
-            ) != 0
-            {
-                fatalf(&format!("parse value failed: {:?}", raw));
+        "string" => {
+            let mut len64: u64 = 0;
+            unsafe {
+                if kvspaceXvalueHeadNewSlack(
+                    repr.as_ptr(),
+                    repr.len() as u64,
+                    cs(langtype),
+                    &mut out,
+                    &mut len64,
+                ) != 0
+                {
+                    fatalf(&format!("parse value failed: {:?}", raw));
+                }
             }
-        },
+            len = len64 as u32;
+        }
         "nil" => return Vec::new(), // delete (no value)
         "index" => fatalf("use mkindex for directories"),
         // Default to string when no recognized kind prefix is present.
-        _ => unsafe {
-            if kvspaceNewChar(
-                raw.as_ptr(),
-                raw.len() as u32,
-                cs(langtype),
-                &mut out,
-                &mut len,
-            ) != 0
-            {
-                fatalf(&format!("parse value failed: {:?}", raw));
+        _ => {
+            let mut len64: u64 = 0;
+            unsafe {
+                if kvspaceXvalueHeadNewSlack(
+                    raw.as_ptr(),
+                    raw.len() as u64,
+                    cs(langtype),
+                    &mut out,
+                    &mut len64,
+                ) != 0
+                {
+                    fatalf(&format!("parse value failed: {:?}", raw));
+                }
             }
-        },
+            len = len64 as u32;
+        }
     }
     take_wire(out, len)
 }
@@ -531,38 +595,68 @@ fn take_wire(out: *mut u8, len: u32) -> Vec<u8> {
     }
 }
 
-// Single-key full-value write (head + body + attr tail).
-fn set_one(kv: *mut c_void, key: &str, val: &[u8]) {
-    if val.is_empty() {
-        // `nil:` deletes the key; report errors just like `del` (missing key returns 0).
-        let key_ptr = cs(key);
-        let mut err = [0u8; 256];
-        let rc = unsafe { kvspaceDel(kv, &key_ptr, 1, err.as_mut_ptr() as *mut c_char, 256) };
-        if rc != 0 {
-            fail_op(&err, &format!("set {} nil", key));
-        }
-        return;
+/* 写入一条完整 wire：head 由 `kvspaceRealloc` 写，本函数只把 body 与 attr 拷进值区。
+   Realloc 的 body_length/attr_length 两个参数就是 head 的内容，所以不必也不该再写 head。 */
+fn write_wire(kv: *mut c_void, key: &str, wire: &[u8]) {
+    let base = data_base(kv);
+    if base.is_null() {
+        fatalf("本后端无进程内值区（fs/redis/s3），CLI 读写不支持");
     }
-    let ck = cs(key);
+    if wire.len() < KVSPACE_XVALUE_HEAD_LEN {
+        fatalf(&format!("set {}: 构造器产出的 wire 短于 head", key));
+    }
+    let body_len = wire_len(wire) as usize;
+    let attrs_len = (wire[8] as usize) | ((wire[9] as usize) << 8);
+    let body_at = KVSPACE_XVALUE_HEAD_LEN;
+    let attr_at = body_at + body_len;
+    if attr_at + attrs_len > wire.len() {
+        fatalf(&format!("set {}: wire 自述长度越界", key));
+    }
+
+    let mut offset: u64 = 0;
     let mut err = [0u8; 256];
     let rc = unsafe {
-        kvspaceSetValue(
+        kvspaceRealloc(
             kv,
-            ck,
-            val.as_ptr(),
-            val.len() as u32,
+            cs(key),
+            body_len as u64,
+            attrs_len as u64,
+            &mut offset,
             err.as_mut_ptr() as *mut c_char,
             256,
         )
     };
     if rc != 0 {
-        let n = err.iter().position(|&b| b == 0).unwrap_or(err.len());
-        fatalf(&format!(
-            "set {}: {}",
-            key,
-            String::from_utf8_lossy(&err[..n])
-        ));
+        fail_op(&err, &format!("set {}", key));
     }
+
+    /* 落到 base+offset：body 在 +16，attr 紧随 body。head 已由 Realloc 写好。 */
+    unsafe {
+        let dst = base.add(offset as usize);
+        if body_len > 0 {
+            std::ptr::copy_nonoverlapping(wire[body_at..].as_ptr(), dst.add(body_at), body_len);
+        }
+        if attrs_len > 0 {
+            std::ptr::copy_nonoverlapping(wire[attr_at..].as_ptr(), dst.add(attr_at), attrs_len);
+        }
+    }
+    /* offset 到此作废：不跨调用持有，下次可能被搬移。 */
+}
+
+// Single-key full-value write (head + body + attr tail).
+fn set_one(kv: *mut c_void, key: &str, val: &[u8]) {
+    if val.is_empty() {
+        // `nil:` deletes the key; missing key is not an error for `free`? 旧 Del 对缺失返回 0,
+        // 新 Free 返回 MISSING —— 与旧行为一致：不存在就什么都不做，不报错。
+        let mut err = [0u8; 256];
+        let rc = unsafe { kvspaceFree(kv, cs(key), err.as_mut_ptr() as *mut c_char, 256) };
+        /* KVSPACE_MISSING = -ENOENT：删不存在的键不算错（与旧 Del 一致）。 */
+        if rc != 0 && rc != KVSPACE_MISSING {
+            fail_op(&err, &format!("set {} nil", key));
+        }
+        return;
+    }
+    write_wire(kv, key, val);
 }
 
 // Normalize directory prefix (trailing `/` or `·`): ListLen/ListAt, mkindex, and
@@ -575,38 +669,58 @@ fn dir_form(prefix: &str) -> String {
     }
 }
 
-// Prefix listing via ListLen + ListAt (resolve=1 follows links; expand_ext=false lists own children only).
-fn list_names(kv: *mut c_void, prefix: &str, expand_ext: bool) -> Vec<String> {
+/* 前缀列举：先用 Listlen 拿 (N, M)，再一次性 List 拿 NUL 分隔的名字。
+   **顺序是后端顺序，不排序**——新 ABI 把排序上移给调用方，CLI 不再假装有序。 */
+fn list_names(kv: *mut c_void, prefix: &str) -> Vec<String> {
     let p = cs(&dir_form(prefix));
-    let mut count: i32 = 0;
-    unsafe {
-        if kvspaceListLen(kv, p, expand_ext as c_int, 1, &mut count) != 0 || count <= 0 {
-            return vec![];
-        }
-        let mut v = Vec::with_capacity(count as usize);
-        let mut buf = [0u8; 4096];
-        for i in 0..count {
-            let mut len: u32 = 0;
-            if kvspaceListAt(
-                kv,
-                p,
-                expand_ext as c_int,
-                1,
-                i,
-                buf.as_mut_ptr(),
-                buf.len() as u32,
-                &mut len,
-            ) == 0
-                && len > 0
-            {
-                let name = String::from_utf8_lossy(&buf[..len as usize]).into_owned();
-                if !name.is_empty() {
-                    v.push(name);
-                }
-            }
-        }
-        v
+    let mut count: i64 = 0;
+    let mut max_len: u32 = 0;
+    let mut err = [0u8; 256];
+    let rc = unsafe {
+        kvspaceListlen(
+            kv,
+            p,
+            &mut count,
+            &mut max_len,
+            err.as_mut_ptr() as *mut c_char,
+            256,
+        )
+    };
+    if rc != 0 || count <= 0 {
+        return Vec::new();
     }
+    /* 容量按「N 个名字 + N 个 NUL」给：count*(max_len+1) 是上界，不必先探探测一次。 */
+    let cap = (count as usize)
+        .saturating_mul(max_len as usize + 1)
+        .min(u32::MAX as usize) as u32;
+    if cap == 0 {
+        return Vec::new();
+    }
+    let mut buf = vec![0u8; cap as usize];
+    let mut length: u32 = 0;
+    let mut out_count: u32 = 0;
+    let mut generation: u64 = 0;
+    let rc = unsafe {
+        kvspaceList(
+            kv,
+            p,
+            buf.as_mut_ptr() as *mut c_char,
+            cap,
+            &mut length,
+            &mut out_count,
+            &mut generation,
+            err.as_mut_ptr() as *mut c_char,
+            256,
+        )
+    };
+    if rc != 0 {
+        fail_op(&err, "list");
+    }
+    buf.truncate(length as usize);
+    buf.split(|b| *b == 0)
+        .filter(|s| !s.is_empty())
+        .map(|s| String::from_utf8_lossy(s).into_owned())
+        .collect()
 }
 
 fn join_path(parent: &str, child: &str) -> String {
@@ -619,35 +733,21 @@ fn join_path(parent: &str, child: &str) -> String {
     format!("{}/{}", parent, child)
 }
 
-// An extindex mount is an @ext value on the directory key (head.ptr=2), whose body
-// holds the source path. Ignore langtype since backends differ on whether it is set.
-fn read_ext(kv: *mut c_void, prefix: &str) -> String {
-    let v = get(kv, &dir_form(prefix));
-    if v.is_empty() {
-        return String::new();
-    }
-    let d = from_wire(&v);
-    if d.r#ref != KVSPACE_XVALUE_PTR_EXT {
-        return String::new();
-    }
-    String::from_utf8_lossy(&d.body).into_owned()
-}
-
-// Shared list/tree arguments: [prefix] [--kind[=false]] [--showext[=false]]; default prefix is `/`.
-fn parse_walk_args(tail: &[String], show_kind_default: bool) -> (String, bool, bool) {
-    let mut show_ext = true;
+// Shared list/tree arguments: [prefix] [--kind[=false]]; default prefix is `/`.
+fn parse_walk_args(tail: &[String], show_kind_default: bool) -> (String, bool) {
     let mut show_kind = show_kind_default;
     let mut prefix = "/".to_string();
     for a in tail {
         match a.as_str() {
             "--kind" => show_kind = true,
             "--kind=false" => show_kind = false,
-            "--showext" => show_ext = true,
-            "--showext=false" => show_ext = false,
+            other if other.starts_with("--showext") => {
+                fatalf("--showext 已移除：新 ABI 无 extindex")
+            }
             _ => prefix = a.clone(),
         }
     }
-    (prefix, show_ext, show_kind)
+    (prefix, show_kind)
 }
 
 fn print_help() {
@@ -656,18 +756,18 @@ fn print_help() {
     println!("子命令:");
     println!("  get <key>...            读取并打印 key:kind:value");
     println!("  set <key> <value>       写入值；value 语法见下；nil: 删除键");
-    println!("  head <key>...           打印值头（ref/storetype/ndim/dims）");
+    println!("  head <key>...           打印值头（ref/ndim/dims/bodylen/attrslen）");
     println!("  del <key>...            删除键");
-    println!("  deltree <prefix>        删除整棵子树");
+    println!("  deltree <prefix>        删除整棵子树（含根）");
     println!("  cp <src> <dst>          拷贝单键");
     println!("  cpdir <src> <dst>       递归拷贝子树");
-    println!("  mkindex <path> [capacity]  创建目录（index）");
-    println!("  extindex <path> <src_key> 挂载扩展存储（类型取 src_key 的 langtype；path/src_key 须目录形键）");
-    println!("  delextindex <path>      卸载扩展存储");
-    println!("  list|ls <prefix> [--kind[=false]] [--showext[=false]]  列子键");
-    println!("  tree <prefix> [--kind] [--showext=false]  树状遍历");
-    println!("  clear                   清空 kvspace");
+    println!("  mkindex <path>          创建目录（index）；无 capacity 参数");
+    println!("  list|ls <prefix> [--kind[=false]]  列子键（后端顺序，不排序）");
+    println!("  tree <prefix> [--kind]  树状遍历（后端顺序，不排序）");
+    println!("  clear                   清空 kvspace（等价 deltree /，不可恢复）");
     println!("  help                    print this help");
+    println!();
+    println!("后端限制: 仅 shm:// 支持读写（进程内值区）；fs/redis/s3 无映射区，connect 后即拒绝。");
     println!();
     println!("value 语法: [kind:]payload");
     println!("  int:42  float:3.14  float32:1.5  bool:true|false  string:foo");
@@ -728,13 +828,14 @@ fn main() {
                     // ndim/dims come from leading [dims] in langtype.
                     let d = from_wire(&v);
                     println!(
-                        "{}\t{}\tref={}\tstoretype={}\tndim={}\tdims=[{}]",
+                        "{}\t{}\tref={}\tndim={}\tdims=[{}]\tbodylen={}\tattrslen={}",
                         k,
                         d.kind,
                         d.r#ref,
-                        d.storetype,
                         d.dims.len(),
-                        join_dims(&d.dims)
+                        join_dims(&d.dims),
+                        d.body_len,
+                        d.attrs_len
                     );
                 }
             }
@@ -743,19 +844,13 @@ fn main() {
             if tail.is_empty() {
                 fatalf("usage: kvspace del <key>...");
             }
-            let keys: Vec<*const c_char> = tail.iter().map(|k| cs(k)).collect();
-            let mut err = [0u8; 256];
-            let rc = unsafe {
-                kvspaceDel(
-                    kv,
-                    keys.as_ptr(),
-                    keys.len() as u32,
-                    err.as_mut_ptr() as *mut c_char,
-                    256,
-                )
-            };
-            if rc != 0 {
-                fail_op(&err, "del");
+            /* 逐个 Free：新 ABI 没有批量 Del。缺失的键跳过（与旧 Del 一致）。 */
+            for k in tail {
+                let mut err = [0u8; 256];
+                let rc = unsafe { kvspaceFree(kv, cs(k), err.as_mut_ptr() as *mut c_char, 256) };
+                if rc != 0 && rc != KVSPACE_MISSING {
+                    fail_op(&err, &format!("del {}", k));
+                }
             }
         }
         "deltree" => {
@@ -763,7 +858,7 @@ fn main() {
                 .first()
                 .unwrap_or_else(|| fatalf("usage: kvspace deltree <prefix>"));
             let mut err = [0u8; 256];
-            let rc = unsafe { kvspaceDelTree(kv, cs(p), err.as_mut_ptr() as *mut c_char, 256) };
+            let rc = unsafe { kvspaceDeltree(kv, cs(p), err.as_mut_ptr() as *mut c_char, 256) };
             if rc != 0 {
                 fail_op(&err, "deltree");
             }
@@ -792,7 +887,7 @@ fn main() {
             }
             let mut err = [0u8; 256];
             let rc = unsafe {
-                kvspaceCpTree(
+                kvspaceCpdir(
                     kv,
                     cs(&tail[0]),
                     cs(&tail[1]),
@@ -807,68 +902,35 @@ fn main() {
         "mkindex" => {
             let p = tail
                 .first()
-                .unwrap_or_else(|| fatalf("usage: kvspace mkindex <path> [capacity]"));
-            // 目录形归一：shm 自动补 /，durable 强校验 —— CLI 统一补，三后端一致。
+                .unwrap_or_else(|| fatalf("usage: kvspace mkindex <path>"));
+            if tail.len() > 1 {
+                fatalf("mkindex 不再接受 capacity（新 ABI 无该参数）");
+            }
+            // 目录形归一：CLI 统一补 /，三后端一致。
             let p = dir_form(p);
-            let capacity: u32 = tail.get(1).and_then(|s| s.parse().ok()).unwrap_or(0);
             let mut err = [0u8; 256];
-            let rc = unsafe {
-                kvspaceMkindex(kv, cs(&p), capacity, err.as_mut_ptr() as *mut c_char, 256)
-            };
+            let rc = unsafe { kvspaceMkindex(kv, cs(&p), err.as_mut_ptr() as *mut c_char, 256) };
             if rc != 0 {
                 fail_op(&err, "mkindex");
             }
         }
-        "delextindex" => {
-            let p = tail
-                .first()
-                .unwrap_or_else(|| fatalf("usage: kvspace delextindex <path>"));
-            let mut err = [0u8; 256];
-            let rc = unsafe { kvspaceRmindexExt(kv, cs(p), err.as_mut_ptr() as *mut c_char, 256) };
-            if rc != 0 {
-                fail_op(&err, "delextindex");
-            }
-        }
-        "extindex" => {
-            if tail.len() < 2 {
-                fatalf("usage: kvspace extindex <path> <src_key>");
-            }
-            let mut err = [0u8; 256];
-            let rc = unsafe {
-                kvspaceMkindexExt(
-                    kv,
-                    cs(&tail[0]),
-                    cs(&tail[1]),
-                    err.as_mut_ptr() as *mut c_char,
-                    256,
-                )
-            };
-            if rc != 0 {
-                // Fallback diagnostic when backend leaves err empty.
-                fail_op(
-                    &err,
-                    &format!(
-                        "extindex {} {} (path/src_key must be directory keys and src_key must exist)",
-                        tail[0], tail[1]
-                    ),
-                );
-            }
-        }
-        "list" | "ls" => {
-            let (p, show_ext, show_kind) = parse_walk_args(tail, true);
-            fprint_list(kv, &p, show_ext, show_kind);
-        }
-        "tree" => {
-            let (p, show_ext, show_kind) = parse_walk_args(tail, false);
-            println!("{}", p);
-            fprint_tree(kv, &p, "", show_ext, show_kind);
-        }
         "clear" => {
+            /* 整库清空 = Deltree("/")。新 ABI 没有 Clear。 */
+            eprintln!("warning: clear 删除整个 kvspace（等价 deltree /），不可恢复");
             let mut err = [0u8; 256];
-            let rc = unsafe { kvspaceClear(kv, err.as_mut_ptr() as *mut c_char, 256) };
+            let rc = unsafe { kvspaceDeltree(kv, cs("/"), err.as_mut_ptr() as *mut c_char, 256) };
             if rc != 0 {
                 fail_op(&err, "clear");
             }
+        }
+        "list" | "ls" => {
+            let (p, show_kind) = parse_walk_args(tail, true);
+            fprint_list(kv, &p, show_kind);
+        }
+        "tree" => {
+            let (p, show_kind) = parse_walk_args(tail, false);
+            println!("{}", p);
+            fprint_tree(kv, &p, "", show_kind);
         }
         other => {
             eprintln!("unknown subcommand: {}", other);
@@ -881,9 +943,9 @@ fn main() {
     }
 }
 
-fn fprint_list(kv: *mut c_void, prefix: &str, show_ext: bool, show_kind: bool) {
-    // When show_ext is false, list own children only and print the ext mount separately below.
-    for c in list_names(kv, prefix, show_ext) {
+fn fprint_list(kv: *mut c_void, prefix: &str, show_kind: bool) {
+    /* 顺序 = 后端顺序，**不排序**：新 ABI 把排序上移，CLI 输出按 List 返回原序。 */
+    for c in list_names(kv, prefix) {
         let v = get(kv, &join_path(prefix, &c));
         if v.is_empty() {
             println!("{}", c);
@@ -896,29 +958,11 @@ fn fprint_list(kv: *mut c_void, prefix: &str, show_ext: bool, show_kind: bool) {
             println!("{}\t{}", c, plain(&d));
         }
     }
-    if !show_ext {
-        let ext = read_ext(kv, prefix);
-        if !ext.is_empty() {
-            println!("…{}", ext);
-            for c in list_names(kv, &ext, false) {
-                println!("  {}", c);
-            }
-        }
-    }
 }
 
-fn fprint_tree(kv: *mut c_void, prefix: &str, indent: &str, show_ext: bool, show_kind: bool) {
-    // When show_ext is false, list own children only and print the ext mount separately below.
-    let mut children = list_names(kv, prefix, show_ext);
-    children.sort_by(|a, b| {
-        let (aa, bb) = (a.trim_end_matches('/'), b.trim_end_matches('/'));
-        if aa == bb {
-            a.ends_with('/').cmp(&b.ends_with('/'))
-        } else {
-            aa.cmp(bb)
-        }
-    });
-
+fn fprint_tree(kv: *mut c_void, prefix: &str, indent: &str, show_kind: bool) {
+    /* 同样按后端顺序；树形分支线只表示「是不是最后一个」，不隐含排序语义。 */
+    let children = list_names(kv, prefix);
     let n = children.len();
     for (i, c) in children.iter().enumerate() {
         let full = join_path(prefix, c);
@@ -926,8 +970,8 @@ fn fprint_tree(kv: *mut c_void, prefix: &str, indent: &str, show_ext: bool, show
         let branch = if last { "└── " } else { "├── " };
         let next_indent = format!("{}{}", indent, if last { "    " } else { "│   " });
         if c.ends_with('/') {
-            println!("{}{}{}/", indent, branch, c.trim_end_matches('/'));
-            fprint_tree(kv, &full, &next_indent, show_ext, show_kind);
+            println!("{}{}{}", indent, branch, c);
+            fprint_tree(kv, &full, &next_indent, show_kind);
         } else {
             let v = get(kv, &full);
             if v.is_empty() {
@@ -940,12 +984,6 @@ fn fprint_tree(kv: *mut c_void, prefix: &str, indent: &str, show_ext: bool, show
             } else {
                 println!("{}{}{}\t{}", indent, branch, c, plain(&d));
             }
-        }
-    }
-    if !show_ext {
-        let ext = read_ext(kv, prefix);
-        if !ext.is_empty() {
-            println!("{}└── …{}", indent, ext);
         }
     }
 }

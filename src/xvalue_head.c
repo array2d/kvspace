@@ -1,177 +1,23 @@
-#include <kvspace/xvalue_head.h>
+#include <kvspace/kvspace_xvalue.h>
 
-#include <stdlib.h>
+#include <stdint.h>
 #include <string.h>
 
-/* Layout: fixed 16-byte header [bodylen:u64@0][attrslen:u32@8][layout@12][padding@13]
-   [padding@14,16), body at offset 16, attr region right after the body with NO length
-   prefix (attrslen is in the head — a second prefix would be a second truth).
-   Single-key atomic write — no separate attr key. Empty langtype = empty attr.
-   layout=1 时 bodylen 是容量：body 区按容量分配、有效长度写进 attr tag 2。 */
+/* 存储层的字节读写：只认 head 布局与 attr 记录，不解释任何 tag 的语义。
+   构造器（写 langtype）在 kvlang_xvalue.c。 */
 
-#define REALLEN_RECORD_LEN 11u /* [tag:u8][len:u16][reallen:u64] */
+#define KVSPACE_XVALUE_ATTR_TAG_RETIRED_REALLEN 2u
 
-/* Failure helper: clear *out per header contract. */
-static int fail(uint8_t **out) {
-    if (out)
-        *out = NULL;
-    return -1;
+static int tag_is_writable(uint8_t tag) {
+    return tag != KVSPACE_XVALUE_ATTR_TAG_RETIRED_REALLEN && tag != 0u;
 }
 
-/* Single wire builder. Zero-fills the body when body is NULL (Reserve
-   placeholder); public entry points validate whether non-zero effective_len
-   requires non-NULL body.
-   langtype_prefix 只由 NewPtr/NewExt 传入 '*' 或 '@'，构造成 langtype 记录的前缀。 */
-static int build(uint8_t layout, const uint8_t *body, uint64_t region_len,
-                 uint64_t effective_len, char langtype_prefix,
-                 const char *langtype, uint8_t **out, uint64_t *out_len) {
-    if (!out || !out_len)
-        return fail(out);
-    *out = NULL;
-    if (layout == KVSPACE_XVALUE_LAYOUT_LENGTH) {
-        if (effective_len != region_len)
-            return -1;
-    } else if (layout == KVSPACE_XVALUE_LAYOUT_CAPACITY) {
-        if (effective_len > region_len)
-            return -1;
-    } else {
-        return -1;
-    }
-    const uint64_t ltl = langtype ? (uint64_t)strlen(langtype) : 0;
-    const uint64_t record_len = ltl + (langtype_prefix ? 1u : 0u);
-    if (record_len > UINT16_MAX)
-        return -1;
-    uint64_t alen = record_len ? 3 + record_len : 0;
-    if (layout == KVSPACE_XVALUE_LAYOUT_CAPACITY)
-        alen += REALLEN_RECORD_LEN;
-    if (alen > UINT32_MAX)
-        return -1;
-    if (region_len > UINT64_MAX - KVSPACE_XVALUE_HEAD_LEN ||
-        alen > UINT64_MAX - KVSPACE_XVALUE_HEAD_LEN - region_len)
-        return -1;
-    const uint64_t n = (uint64_t)KVSPACE_XVALUE_HEAD_LEN + region_len + alen;
-    if (n > SIZE_MAX)
-        return -1;
-    uint8_t *p = (uint8_t *)calloc(1, (size_t)n);
-    if (!p)
-        return -1;
-    kvspaceXvalueHead h = {.layout = layout, .padding = {0u, 0u, 0u}};
-    kvspaceXvalueHeadSetLen(&h, region_len);
-    kvspaceXvalueHeadSetAttrsLen(&h, (uint32_t)alen);
-    memcpy(p, &h, sizeof h);
-    if (body && effective_len)
-        memcpy(p + KVSPACE_XVALUE_HEAD_LEN, body, effective_len);
-    uint8_t *a = p + KVSPACE_XVALUE_HEAD_LEN + region_len;
-    if (record_len) {
-        a[0] = KVSPACE_XVALUE_ATTR_TAG_LANGTYPE;
-        a[1] = (uint8_t)record_len;
-        a[2] = (uint8_t)(record_len >> 8);
-        uint64_t at = 3;
-        if (langtype_prefix)
-            a[at++] = (uint8_t)langtype_prefix;
-        if (ltl)
-            memcpy(a + at, langtype, ltl);
-        a += 3 + record_len;
-    }
-    if (layout == KVSPACE_XVALUE_LAYOUT_CAPACITY) {
-        a[0] = KVSPACE_XVALUE_ATTR_TAG_REALLEN;
-        a[1] = 8;
-        a[2] = 0;
-        for (int i = 0; i < 8; i++)
-            a[3 + i] = (uint8_t)(effective_len >> (8 * i));
-    }
-    *out = p;
-    *out_len = n;
-    return 0;
-}
-
-int kvspaceXvalueHeadNewNone(uint8_t **out, uint64_t *out_len) {
-    return build(KVSPACE_XVALUE_LAYOUT_LENGTH, NULL, 0, 0, 0, NULL, out,
-                 out_len);
-}
-
-int kvspaceXvalueHeadNewScalar(const uint8_t *raw, uint32_t raw_len,
-                               const char *langtype,
-                               uint8_t **out, uint64_t *out_len) {
-    if (raw_len && !raw)
-        return fail(out);
-    return build(KVSPACE_XVALUE_LAYOUT_LENGTH, raw, raw_len, raw_len, 0,
-                 langtype, out, out_len);
-}
-
-int kvspaceXvalueHeadNewSlack(const uint8_t *data, uint64_t data_len,
-                              uint64_t cap, const char *langtype,
-                              uint8_t **out, uint64_t *out_len) {
-    if (cap < data_len || (data_len && !data))
-        return fail(out);
-    const uint8_t layout = cap > data_len ? KVSPACE_XVALUE_LAYOUT_CAPACITY
-                                          : KVSPACE_XVALUE_LAYOUT_LENGTH;
-    return build(layout, data, cap, data_len, 0, langtype, out, out_len);
-}
-
-int kvspaceXvalueHeadNewTensor(const uint64_t *dims, uint32_t ndim,
-                               const uint8_t *raw, uint64_t raw_len,
-                               const char *langtype,
-                               uint8_t **out, uint64_t *out_len) {
-    /* Shape lives in leading [dims] of langtype; body byte length is raw_len. */
-    if (!dims || ndim == 0 || ndim > 64 || (raw_len && !raw))
-        return fail(out);
-    return build(KVSPACE_XVALUE_LAYOUT_LENGTH, raw, raw_len, raw_len, 0,
-                 langtype, out, out_len);
-}
-
-/* path_len == 0 是合法的 None 指针：`*T` + 空 body。 */
-int kvspaceXvalueHeadNewPtr(const uint8_t *path, uint32_t path_len,
-                            const char *langtype,
-                            uint8_t **out, uint64_t *out_len) {
-    if (path_len && !path)
-        return fail(out);
-    if (langtype && (langtype[0] == '*' || langtype[0] == '@'))
-        return fail(out);
-    return build(KVSPACE_XVALUE_LAYOUT_LENGTH, path, path_len, path_len, '*',
-                 langtype, out, out_len);
-}
-
-int kvspaceXvalueHeadNewExt(const uint8_t *locator, uint32_t locator_len,
-                            const char *langtype,
-                            uint8_t **out, uint64_t *out_len) {
-    if (!locator_len || !locator)
-        return fail(out);
-    if (langtype && (langtype[0] == '*' || langtype[0] == '@'))
-        return fail(out);
-    return build(KVSPACE_XVALUE_LAYOUT_LENGTH, locator, locator_len, locator_len,
-                 '@', langtype, out, out_len);
-}
-
-int kvspaceXvalueHeadNewCode(const uint8_t *body, uint64_t body_len,
-                             uint64_t cap, const char *langtype,
-                             uint8_t **out, uint64_t *out_len) {
-    return kvspaceXvalueHeadNewSlack(body, body_len, cap, langtype, out,
-                                     out_len);
-}
-
-int kvspaceXvalueHeadReserve(uint64_t body_len, uint64_t cap,
-                             const char *langtype,
-                             uint8_t **out, uint64_t *out_len) {
-    /* 预留 = 产 cap 字节零 body 的占位（后由调用方填充前 body_len 字节），
-       attr 区（含 langtype 与 reallen）一并写入。 */
-    if (cap < body_len)
-        return fail(out);
-    const uint8_t layout = cap > body_len ? KVSPACE_XVALUE_LAYOUT_CAPACITY
-                                          : KVSPACE_XVALUE_LAYOUT_LENGTH;
-    return build(layout, NULL, cap, body_len, 0, langtype, out, out_len);
-}
-
-int kvspaceXvalueHeadScan(const uint8_t *wire, uint64_t wire_len,
-                                        const uint8_t **out_langtype,
-                                        uint16_t *out_langtype_len,
-                                        uint64_t *out_reallen) {
-    if (out_langtype)
-        *out_langtype = NULL;
-    if (out_langtype_len)
-        *out_langtype_len = 0;
-    if (out_reallen)
-        *out_reallen = 0;
+int kvspaceXvalueGetAttr(const uint8_t *wire, uint64_t wire_len, uint8_t tag,
+                          const uint8_t **out_data, uint16_t *out_len) {
+    if (out_data)
+        *out_data = NULL;
+    if (out_len)
+        *out_len = 0;
     if (!wire || wire_len < KVSPACE_XVALUE_HEAD_LEN)
         return -1;
     const kvspaceXvalueHead *h = (const kvspaceXvalueHead *)(const void *)wire;
@@ -179,57 +25,133 @@ int kvspaceXvalueHeadScan(const uint8_t *wire, uint64_t wire_len,
     if (total == 0 || total > wire_len)
         return -1;
     const uint8_t *p = wire + KVSPACE_XVALUE_HEAD_LEN + h->bodylen;
-    const uint8_t *end = p + h->attrslen;
-    const uint8_t *langtype = NULL;
-    uint16_t langtype_len = 0;
-    uint64_t reallen = 0;
-    int seen_reallen = 0;
+    const uint8_t *end = p + kvspaceXvalueHeadAttrsLen(h);
+    /* 必须**扫完整个 attr 区**再决定返回值：命中目标 tag 只是「找到了」，不是
+     * 「wire 合法」。早先这里命中即 return，于是「tag 1 在前、tag 2 在后」的
+     * wire 会被当成合法读出来——而 tag 2 是退役编号，出现即说明写读双方理解
+     * 不一致，整条 wire 都不能采信。位置无关：tag 2 在目标之前或之后都必须拒。 */
+    const uint8_t *found = NULL;
+    uint16_t found_len = 0;
     while (p + 3 <= end) {
-        uint8_t tag = p[0];
-        uint16_t rlen = (uint16_t)((uint16_t)p[1] | ((uint16_t)p[2] << 8));
-        if (p + 3 + rlen > end)
+        const uint8_t record_tag = p[0];
+        const uint16_t record_len =
+            (uint16_t)((uint16_t)p[1] | ((uint16_t)p[2] << 8));
+        if (p + 3 + record_len > end)
             return -1;
-        if (tag == KVSPACE_XVALUE_ATTR_TAG_LANGTYPE) {
-            if (!langtype) { /* 重复 langtype 取第一条：单 key 只有一个写方。 */
-                langtype = p + 3;
-                langtype_len = rlen;
-            }
-        } else if (tag == KVSPACE_XVALUE_ATTR_TAG_REALLEN) {
-            if (h->layout != KVSPACE_XVALUE_LAYOUT_CAPACITY || seen_reallen ||
-                rlen != 8)
-                return -1;
-            for (int i = 0; i < 8; i++)
-                reallen |= (uint64_t)p[3 + i] << (8 * i);
-            seen_reallen = 1;
+        if (record_tag == KVSPACE_XVALUE_ATTR_TAG_RETIRED_REALLEN)
+            return -1;
+        if (record_tag == tag && !found) {
+            found = p + 3;
+            found_len = record_len;
         }
-        p += 3 + rlen;
+        p += 3 + record_len;
     }
-    if (h->layout == KVSPACE_XVALUE_LAYOUT_CAPACITY &&
-        (!seen_reallen || reallen > h->bodylen))
+    if (!found)
         return -1;
-    if (out_langtype)
-        *out_langtype = langtype;
-    if (out_langtype_len)
-        *out_langtype_len = langtype_len;
-    if (out_reallen)
-        *out_reallen = reallen;
+    if (out_data)
+        *out_data = found;
+    if (out_len)
+        *out_len = found_len;
     return 0;
 }
 
-/* 有效长度：layout=0 时是 bodylen；layout=1 时是 attr tag 2 的 reallen。
-   返回 0 成功，-1 失败（*out 置 0；0 本身是合法长度，故错误不走长度值）。 */
-int kvspaceXvalueHeadEffectiveLen(const uint8_t *wire,
-                                                uint64_t wire_len,
-                                                uint64_t *out) {
+int kvspaceXvalueSetAttr(uint8_t *wire, uint64_t wire_capacity, uint8_t tag,
+                          const uint8_t *data, uint16_t len,
+                          uint64_t *out_new_length) {
+    if (out_new_length)
+        *out_new_length = 0;
+    if (!wire || !out_new_length || !tag_is_writable(tag))
+        return -1;
+    /* len == 0 且 data == NULL 是删除；给了 len 就必须给 data。 */
+    if (len != 0 && !data)
+        return -1;
+
+    kvspaceXvalueHead *h = (kvspaceXvalueHead *)(void *)wire;
+    const uint64_t total = kvspaceXvalueHeadTotalLen(h);
+    if (total == 0 || total > wire_capacity)
+        return -1;
+    const uint64_t attrs_at = KVSPACE_XVALUE_HEAD_LEN + kvspaceXvalueHeadLen(h);
+    uint8_t *const begin = wire + attrs_at;
+    uint8_t *const end = begin + kvspaceXvalueHeadAttrsLen(h);
+
+    /* 先扫一遍：确定 tag 在不在，同时确认整段 attr 自洽、不含 tag 2。
+     * 「先算清楚再动手」是这里唯一可行的写法——边扫边改会让后面的记录位置
+     * 全部失效；而且容量检查必须在任何写入之前完成，失败时 wire 必须原样不动。 */
+    uint8_t *found = NULL;
+    uint16_t found_len = 0;
+    for (uint8_t *p = begin; p + 3 <= end;) {
+        const uint16_t record_len =
+            (uint16_t)((uint16_t)p[1] | ((uint16_t)p[2] << 8));
+        if (p + 3 + record_len > end ||
+            p[0] == KVSPACE_XVALUE_ATTR_TAG_RETIRED_REALLEN)
+            return -1;
+        if (p[0] == tag) {
+            found = p;
+            found_len = record_len;
+            break;
+        }
+        p += 3 + record_len;
+    }
+
+    const int removing = (len == 0 && data == NULL);
+    if (removing && !found) {
+        /* 删一个不存在的 tag：幂等成功，wire 原样。 */
+        *out_new_length = total;
+        return 0;
+    }
+
+    const uint64_t old_record = found ? 3u + (uint64_t)found_len : 0u;
+    const uint64_t new_record = removing ? 0u : 3u + (uint64_t)len;
+    const uint64_t old_attrs = kvspaceXvalueHeadAttrsLen(h);
+    const int64_t delta = (int64_t)new_record - (int64_t)old_record;
+    const int64_t new_attrs = (int64_t)old_attrs + delta;
+    if (new_attrs < 0 || new_attrs > UINT16_MAX)
+        return -1;
+    if (delta > 0 && total + (uint64_t)delta > wire_capacity)
+        return -1;
+
+    /* 移动的永远是 found 之后的整段；追加时 found 为空，起点就是 end。 */
+    uint8_t *const from = found ? found + 3 + found_len : end;
+    uint8_t *const to = from + delta;
+    const uint64_t tail = (uint64_t)(end - from);
+    if (tail && delta != 0)
+        memmove(to, from, (size_t)tail);
+    if (!removing) {
+        uint8_t *write_at = found ? found : end;
+        write_at[0] = tag;
+        write_at[1] = (uint8_t)len;
+        write_at[2] = (uint8_t)(len >> 8);
+        if (len)
+            memcpy(write_at + 3, data, len);
+    }
+    kvspaceXvalueHeadSetAttrsLen(h, (uint16_t)new_attrs);
+    *out_new_length = total + (uint64_t)delta;
+    return 0;
+}
+
+/* 有效长度 = bodylen；保留入口给调用方统一走 accessor。
+   读之前必须确认整条 wire 自洽（padding 为零、总长不越界、attr 区无 tag 2），
+   否则「长度」这个数字是从一条坏 wire 上读出来的，不该被采信。 */
+int kvspaceXvalueHeadEffectiveLen(const uint8_t *wire, uint64_t wire_len,
+                                  uint64_t *out) {
     if (out)
         *out = 0;
-    if (!out)
-        return -1;
-    uint64_t reallen = 0;
-    if (kvspaceXvalueHeadScan(wire, wire_len, NULL, NULL, &reallen) != 0)
+    if (!out || !wire || wire_len < KVSPACE_XVALUE_HEAD_LEN)
         return -1;
     const kvspaceXvalueHead *h = (const kvspaceXvalueHead *)(const void *)wire;
-    *out = h->layout == KVSPACE_XVALUE_LAYOUT_CAPACITY ? reallen : h->bodylen;
+    const uint64_t total = kvspaceXvalueHeadTotalLen(h);
+    if (total == 0 || total > wire_len)
+        return -1;
+    const uint8_t *record = wire + KVSPACE_XVALUE_HEAD_LEN + h->bodylen;
+    const uint8_t *const end = record + kvspaceXvalueHeadAttrsLen(h);
+    while (record + 3 <= end) {
+        const uint16_t record_len =
+            (uint16_t)((uint16_t)record[1] | ((uint16_t)record[2] << 8));
+        if (record + 3 + record_len > end ||
+            record[0] == KVSPACE_XVALUE_ATTR_TAG_RETIRED_REALLEN)
+            return -1;
+        record += 3 + record_len;
+    }
+    *out = h->bodylen;
     return 0;
 }
-

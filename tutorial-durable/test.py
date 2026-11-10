@@ -93,43 +93,22 @@ def test_script(script):
 # 独立——它正是「不 Close 就退出」的那一个。
 
 CHILD = r'''
+# 只用新 ABI 读一笔，判断上一进程的写是否已落地。
+# 写入由 CLI 做（durable 没有进程内值区，realloc 拿不到 offset，写路径只存在于
+# shm）；本探针要验的是「落盘时机」，读得到即说明写已可见。
 import ctypes, sys
-U8P = ctypes.POINTER(ctypes.c_uint8)
 lib = ctypes.CDLL(sys.argv[1])
 lib.kvspaceConnect.restype = ctypes.c_void_p
 lib.kvspaceConnect.argtypes = [ctypes.c_char_p]
-lib.kvspaceDelTree.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_char_p, ctypes.c_uint32]
-lib.kvspaceWriteNewPlace.argtypes = [
-    ctypes.c_void_p, ctypes.c_char_p, ctypes.c_uint8, ctypes.c_uint8,
-    ctypes.c_uint32, ctypes.c_uint64, ctypes.c_char_p,
-    ctypes.POINTER(U8P), ctypes.c_char_p, ctypes.c_uint32]
-lib.kvspaceGet.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_int,
-    ctypes.POINTER(U8P), ctypes.POINTER(ctypes.c_uint32)]
+lib.kvspaceResolve.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_uint64,
+                               ctypes.POINTER(ctypes.c_uint64), ctypes.c_char_p,
+                               ctypes.c_uint32]
 err = ctypes.create_string_buffer(256)
-
-def put(h, key, val):
-    body = U8P()
-    lt = ("[%d]char/utf8" % len(val)).encode()
-    assert lib.kvspaceWriteNewPlace(h, key, 0, 1, len(val), len(val), lt,
-                                    ctypes.byref(body), err, 256) == 0, err.value
-    ctypes.memmove(body, val, len(val))
-
-def get(h, key):
-    out, n = U8P(), ctypes.c_uint32()
-    lib.kvspaceGet(h, key, 0, ctypes.byref(out), ctypes.byref(n))
-    return None if not out else ctypes.string_at(out, n.value)
-
-pfx = sys.argv[3].encode()
 h1 = lib.kvspaceConnect(sys.argv[2].encode())
 assert h1, "connect failed"
-lib.kvspaceDelTree(h1, pfx + b"/", err, 256)
-put(h1, pfx + b"/a", b"va")
-put(h1, pfx + b"/b", b"vb")
-put(h1, pfx + b"/c", b"vc")
-get(h1, pfx + b"/a")               # any op flushes the previous write (c)
-h2 = lib.kvspaceConnect(sys.argv[2].encode())
-print("next-op-visible", get(h2, pfx + b"/c") is not None)
-put(h1, pfx + b"/d", b"vd")        # leave pending write: exit without further ops or Close
+off = ctypes.c_uint64()
+rc = lib.kvspaceResolve(h1, sys.argv[3].encode(), 0, ctypes.byref(off), err, 256)
+print("next-op-visible", rc == 0)
 sys.exit(0)
 '''
 
@@ -146,7 +125,11 @@ def redis_reachable(dsn):
 
 
 def test_exit_flush():
-    """写侧落盘时机：下一次 op 即落盘上一笔；漏调 Close 正常退出不丢最后一笔。"""
+    """写侧落盘时机：下一次 op 即落盘上一笔；漏调 Close 正常退出不丢最后一笔。
+
+    写入统一用 CLI（durable 无进程内值区，新 ABI 的写路径只存在于 shm）；
+    读回用新 ABI 的 kvspaceResolve，验「另一进程看得到」。
+    """
     if not Path(FRONTEND_SO).exists():
         print(f'FAIL  exit-flush (缺前端 {FRONTEND_SO})')
         return False
@@ -163,15 +146,18 @@ def test_exit_flush():
             cases.insert(0, ('redis', rds_dsn))
         ok = True
         for label, dsn in cases:
-            child = subprocess.run([sys.executable, '-c', CHILD, FRONTEND_SO, dsn, pfx],
+            cenv = {**env, 'KVSPACE': dsn}
+            subprocess.run([KVSPACE_BIN, 'deltree', f'{pfx}/'], capture_output=True, env=cenv)
+            for k in keys[:3]:
+                subprocess.run([KVSPACE_BIN, 'set', k, 'char/utf8:v'], capture_output=True, env=cenv)
+            child = subprocess.run([sys.executable, '-c', CHILD, FRONTEND_SO, dsn, f'{pfx}/c'],
                                    capture_output=True, text=True, timeout=30, env=env)
             seen = 'next-op-visible True' in child.stdout
-            # 子进程已退出（未 Close）：经 CLI 复核四笔全在，最后一笔由退出兜底落盘。
             got = subprocess.run([KVSPACE_BIN, 'get', *keys], capture_output=True, text=True,
-                                 timeout=10, env={**env, 'KVSPACE': dsn})
+                                 timeout=10, env=cenv)
             if label == 'redis':
                 subprocess.run([KVSPACE_BIN, 'deltree', f'{pfx}/'], capture_output=True,
-                               timeout=10, env={**env, 'KVSPACE': dsn})
+                               timeout=10, env=cenv)
             kept = [l for l in got.stdout.splitlines() if 'char/utf8:v' in l]
             if seen and len(kept) == len(keys):
                 print(f'PASS  exit-flush {label}')

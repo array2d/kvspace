@@ -1,7 +1,11 @@
-#include "kvspace/kvspace.h"
-#include <kvspace/xvalue_head.h>
+/* 旧 `<kvspace/kvspace.h>` 已删除。本文件导出的 `kvspaceNew*` 系列是旧 ABI 的
+ * 遗留符号（仍在 .so 里到 P4/P5），它们的声明随公共头一起消失，只能在这里
+ * 私有维持一份。这不是「把删掉的头搬回来」——它只覆盖本 TU 自己要定义的函数。 */
+#include <kvspace/kvspace_xvalue.h>
+#include <kvspace/kvlang_xvalue.h>
 
 #include <limits.h>
+#include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -41,7 +45,7 @@ int kvspaceNewChar(const uint8_t *bytes, uint32_t len, const char *langtype,
         return 1;
     uint8_t *value = NULL;
     uint64_t total = 0;
-    if (kvspaceXvalueHeadNewSlack(bytes, len, len, langtype, &value, &total) != 0)
+    if (kvspaceXvalueHeadNewSlack(bytes, len, langtype, &value, &total) != 0)
         return 1;
     return finish(value, total, out, out_len);
 }
