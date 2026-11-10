@@ -47,6 +47,24 @@ typedef enum kvspace_status {
 } kvspace_status_t;
 
 /* 生命周期（与旧 ABI 同签名）。 */
+
+/* 打开一个存储，返回不透明句柄；失败返回 NULL。
+ *
+ * **只接受 `shm://`, 其余 scheme 一律 NULL。** 判定是字面比较：`dsn` 前 3 个字符必须
+ * 是 `shm` 且紧接 `://`，其后整段是文件路径（`shm:///tmp/x.shm` → `/tmp/x.shm`）。
+ * `redis://`、`fs://`、`s3://` 都返回 NULL，**不是「连上之后才发现不支持」**。
+ *
+ * **为什么没有运行期 dispatch**：后端由**链接期**选择——链哪个 libkvspace，就是哪个
+ * 后端。这里不 dlopen、不按 DSN 装载任何插件。运行期探测能力再降级的写法，是单库化
+ * 要消灭的那条分支：它把「这个部署支持什么」从编译期常量变成运行期惊喜。
+ *
+ * **失败原因走 `errno`**（与 `fopen`/`malloc` 同一族惯例）：返回 NULL 时必设
+ * `errno`——DSN 不合法为 `EINVAL`，文件打不开/映射失败为对应系统 errno。成功返回
+ * 非 NULL 时不改动 `errno`，调用方不得用「成功路径上 errno 有值」判断失败。
+ *
+ * 这条契约写在这里而不是只留在实现里：契约只存在于实现里等于没有契约——换人重写
+ * shm 引擎时，这条约束会跟着那 8 行一起消失。只说「返回 NULL」等于让调用方去猜是
+ * 格式错、路径不可写、还是布局不匹配——三种故障的修法完全不同。 */
 void *kvspaceConnect(const char *dsn);
 void kvspaceClose(void *h);
 

@@ -74,7 +74,7 @@
 | 垃圾环 | 换 box 前 `garb_reserve`，成功 `garb_commit`、失败 `garb_cancel`；退役点不拿分配器锁 | `:395-440`、`:422` |
 | 异步回收 | 累计退役字节 ≥ 64MiB 触发维护线程；单写者写 head/tail | `:133`、`:353-363` |
 
-**测量**（`bench/results/2026-10-08-existing-writes`，Xeon Gold 6418H，13 对交替，单位 ns/setter）：
+**测量**（历史测量，已随 kvspace-c 归档（样本不入库，见 `workspace/52/bench-history/`）；Xeon Gold 6418H，13 对交替，单位 ns/setter）：
 
 | 场景 | main | 候选 | 加速 |
 |---|---:|---:|---:|
@@ -103,7 +103,7 @@
 | 每 handle List 缓存 | 缓存 `(prefix, ex, resolve, target, ext)` + `list_gen`；ListLen 与 ListAt 共享一次扫描 | `:3894-3960` |
 | 跨进程失效 | 任何 key 出现/消失都 bump `hdr->list_gen`；缓存命中要求代次不变 | `:164-168`、`:254`、`:869`、`:3204` |
 
-**测量**（`bench/README.md`，9 对交替，单位 µs/call）：
+**测量**（历史测量，已随 kvspace-c 归档（样本不入库，见 `workspace/52/bench-history/`）；9 对交替，单位 µs/call）：
 
 | 场景 | main | 候选 | 加速 |
 |---|---:|---:|---:|
@@ -141,11 +141,13 @@
 
 | 来源 | 内容 | 备注 |
 |---|---|---|
-| `bench/results/2026-10-08-existing-writes` | 覆盖写 1.42× / 1.25× | 后端微基准，非端到端 |
-| `bench/results/2026-10-08` | 直接子项枚举 24,187× / 2,496× / 1.31× / 2.11× | 同上 |
+| 覆盖写历史样本 | 1.42× / 1.25× | 后端微基准，非端到端；历史测量，已随 kvspace-c 归档（样本不入库，见 `workspace/52/bench-history/`） |
+| 直接子项枚举历史样本 | 24,187× / 2,496× / 1.31× / 2.11× | 同上 |
 | `README.md` | 两套 API、16B head、格式版本 | 文档 |
 
-所有数字都来自上表目录的样本与 metadata；跨版本比较前先核对编译器、CPU、依赖版本。
+所有数字都是**历史测量**：测量程序（`overwrite.c`、`compare_direct_children.py`）已随
+kvspace-c 归档，不在本仓，因此这些数字不能在本仓复现。跨版本比较前先核对编译器、
+CPU、依赖版本。
 
 ## 十、跨进程合法性判定
 
@@ -183,13 +185,9 @@
 
 ## 十三、复现
 
-```sh
-# 覆盖写
-cc -O3 -Isrc bench/overwrite.c -o /tmp/kvspace-overwrite -ldl
-taskset -c 25 /tmp/kvspace-overwrite "$LIB" update-one 400000
-
-# 直接子项枚举
-python3 bench/compare_direct_children.py BASE CANDIDATE OUT --cpu 24 --pairs 9
-```
+**不可在本仓复现**。测量程序（`bench/overwrite.c`、`bench/compare_direct_children.py`）
+随 kvspace-c 一并归档，不在仓内；归档副本见 `workspace/52/bench-history/`（不入库）。
+本节原先是两条可复制粘贴的命令——留着比没有更坏：它们指向的源文件已不存在，跑起来
+只会得到「文件不存在」，而读者会以为是自己环境的问题。
 
 依赖版本固定见 `kvspace-c/deps.json`；跨版本比较前先对齐编译器与 CPU。

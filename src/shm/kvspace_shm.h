@@ -11,7 +11,6 @@
 #ifndef KVSPACE_SHM_H
 #define KVSPACE_SHM_H
 
-#include "coord.h"
 #include <kvspace/kvspace.h>
 #include <stdbool.h>
 #include <stddef.h>
@@ -115,23 +114,23 @@ int kvspaceShmCptree(kvspace_t *kv, const char *src,
                      const char *dst); // 递归子树拷贝
 int kvspaceShmCplist(kvspace_t *kv, const char *src,
                      const char *dst); // 浅拷贝：base 值 + 一层 · 成员，不递归
-int kvspaceShmMkindex(
-    kvspace_t *kv, const char *path,
-    uint32_t capacity); // 递归创建目录，capacity 预留叶 index 容量（减少扩容）
 
-/* ================================================================
- * ExtIndex
- * ================================================================ */
-
-int kvspaceShmExtindex(kvspace_t *kv, const char *path, const char *extpath,
-                       char *err, uint32_t err_cap);
-int kvspaceShmDelextindex(kvspace_t *kv, const char *path); // 移除 extindex
+/* Mkindex / ExtIndex 已删除（TASK-082）：它们造的是带 langtype 的语言层 wire。
+   建目录位置用公共的 `kvspaceStorageMakeindex`（0 字节 body + 0 attr），值由上层填。 */
 
 #ifdef P2_TEST_HOOKS
 /* 对齐/格式验收（仅测试构建）：返回 -1=通过，>=0=首个坏块 id，-2=块头宽度
  * 不是 8；SetFormatVersion 用于构造"旧 store 必须拒绝"的用例。 */
 int64_t kvspaceShmArtAlignCheck(kvspace_t *kv);
 void kvspaceShmTestSetFormatVersion(kvspace_t *kv, uint32_t v);
+/* 注入开关（仅测试构建）。从前是 P2_* 环境变量；现在是进程级 setter，由测试在
+ * setup 里显式调用——环境是隐式的，忘了设就静默走生产默认值。传 0 / false 关闭。 */
+void kvspaceShmTestSetGarbageThresholdMegabytes(uint32_t megabytes);
+void kvspaceShmTestSetBarrierMilliseconds(int milliseconds);
+void kvspaceShmTestSetHoldDrainMilliseconds(uint32_t milliseconds);
+void kvspaceShmTestSetHoldReserveMilliseconds(uint32_t milliseconds);
+void kvspaceShmTestSetFailAlloc(bool enabled);
+void kvspaceShmTestSetFailArtInsert(bool enabled);
 /* benchmark-only：给已存在的父节点 key，反算它在 ART key 区的公共 int64 偏移，
  * 即 `kvspaceResolve` 的 `parent_key_anchor` 可接受的值。节点不存在 / 值槽为空 /
  * 偏移反算不到合法块 → 失败，不造值。 */

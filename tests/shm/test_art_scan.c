@@ -2,7 +2,7 @@
 
 #define _GNU_SOURCE
 #include "kvspace_shm.h"
-#include <kvspace/kvlang_xvalue.h>
+#include "test_wire.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -43,11 +43,19 @@ static int set_int32(kvspace_t *kv, const char *key, int32_t v) {
                     (uint8_t)(v >> 24)};
   uint8_t *xv;
   uint64_t n = 0;
-  if (kvspaceXvalueHeadNewScalar(raw, 4, "", &xv, &n) != 0)
+  if (kvspace_test_wire_scalar(raw, 4, "", &xv, &n) != 0)
     return -1;
   int rc = kvspaceShmSet(kv, key, xv, (int32_t)n);
   free(xv);
   return rc;
+}
+
+/* 建目录位置 = 写一条 0 字节 body + 0 attr 的值。这正是公共 `kvspaceMkindex` 走
+   `kvspaceShmStorageMakeindex` 的语义（见 kvspace.h：「只保证位置存在」）。早先测试
+   调的是 `kvspaceShmMkindex`（造 HeadNewNone wire），那个 helper 已随 TASK-082 删除
+   ——它让存储层造语言层的值。 */
+static int mkindex(kvspace_t *kv, const char *key) {
+  return kvspaceShmStorageMakeindex(kv, key);
 }
 
 static int32_t get_int32(kvspace_t *kv, const char *key) {
@@ -102,7 +110,7 @@ static void t_correct(const char *db) {
   uint8_t raw[4] = {7};
   uint8_t *permitted = NULL;
   uint64_t permitted_len = 0;
-  CHECK(kvspaceXvalueHeadNewScalar(raw, 4, "", &permitted, &permitted_len) == 0 &&
+  CHECK(kvspace_test_wire_scalar(raw, 4, "", &permitted, &permitted_len) == 0 &&
             kvspaceShmSetValue(kv, "/private", permitted,
                                (int32_t)permitted_len) == 0,
         "set permitted value");
@@ -113,7 +121,7 @@ static void t_correct(const char *db) {
 
   uint8_t *ptr = NULL;
   uint64_t ptr_len = 0;
-  CHECK(kvspaceXvalueHeadNewPtr((const uint8_t *)"/private", 8, "",
+  CHECK(kvspace_test_wire_ptr((const uint8_t *)"/private", 8, "",
                                 &ptr, &ptr_len) == 0 &&
             kvspaceShmSetValue(kv, "/link", ptr, (int32_t)ptr_len) == 0,
         "set pointer");
@@ -161,7 +169,7 @@ static void t_correct(const char *db) {
   CHECK(!list_has(ns, n, ".kvspace-meta"), "hide metadata root");
   list_free(ns, n);
 
-  CHECK(kvspaceShmMkindex(kv, "/frames/[1]/", 0) == 0, "frame directory");
+  CHECK(mkindex(kv, "/frames/[1]/") == 0, "frame directory");
   CHECK(set_int32(kv, "/frames/[1]/value", 7) == 0, "frame child");
   REQUIRE(do_list(kv, "/frames/", &ns, &n) == 0, "list frames");
   CHECK(n == 1 && list_has(ns, n, "[1]/"), "deduplicate directory child");
@@ -177,7 +185,7 @@ static void t_correct(const char *db) {
 
   permitted = NULL;
   permitted_len = 0;
-  CHECK(kvspaceXvalueHeadNewScalar(raw, 4, "",
+  CHECK(kvspace_test_wire_scalar(raw, 4, "",
                                    &permitted, &permitted_len) == 0 &&
             kvspaceShmSetValue(kv, "/tree/a", permitted,
                                (int32_t)permitted_len) == 0,
@@ -188,8 +196,24 @@ static void t_correct(const char *db) {
   CHECK(kvspaceShmDeltree(kv, "/tree_copy") == 0,
         "delete copied tree");
 
-  CHECK(kvspaceShmMkindex(kv, "/lib/", 0) == 0, "new directory value");
-  CHECK(kvspaceShmExtindex(kv, "/e/", "/lib/", NULL, 0) == 0, "extindex");
+  /* 挂载 = 在挂载点写一条 **Ext wire**，body 是目标目录。
+   *
+   * 早先这里是 `kvspaceShmExtindex(kv, "/e/", "/lib/", ...)`：那个 helper 读 `/lib/`
+   * 的 langtype，再 `HeadNewExt` 造 `@` 前缀的 wire —— 两步都在造语言层的值，存储层
+   * 不该干，TASK-082 把它删了。语义没变：存储层要的只是「这条 wire 的 langtype 以
+   * `@` 开头、body 是目标目录」（`kvspace_c_reference_of` 与 `dir_ext_path` 判的就是
+   * 这两件），造 wire 这件事现在由测试自己用语言层的构造器完成，正如真实调用方那样。 */
+  CHECK(mkindex(kv, "/lib/") == 0, "new directory value");
+  {
+    uint8_t *ext_wire = NULL;
+    uint64_t ext_len = 0;
+    CHECK(kvspace_test_wire_ext((const uint8_t *)"/lib/", 5, "", &ext_wire,
+                                 &ext_len) == 0,
+          "build ext wire");
+    CHECK(kvspaceShmSetValue(kv, "/e/", ext_wire, (int32_t)ext_len) == 0,
+          "mount /lib/ at /e/");
+    free(ext_wire);
+  }
   REQUIRE(kvspaceShmList(kv, "/e/", true, 0, &ns, &n) == 0, "list /e/ ex");
   CHECK(list_has(ns, n, "a") && list_has(ns, n, "b") && list_has(ns, n, "mod"),
         "extindex children");
@@ -312,6 +336,22 @@ static void expect_children(kvspace_t *kv, const char *prefix, bool ex,
         "%s ListLen %d, expected %d", prefix, length, count);
 }
 
+/* 集合比对：子项集合必须**恰好**等于 expected（名字逐一出现一次），不看顺序。
+ * 与 `expect_children` 的区别就是「顺序算不算契约」——List 不算。 */
+static void expect_children_set(kvspace_t *kv, const char *prefix, bool ex,
+                                const char **expected, int32_t count) {
+  char **names = NULL;
+  int32_t n = 0;
+  REQUIRE(kvspaceShmList(kv, prefix, ex, 0, &names, &n) == 0, "list %s", prefix);
+  CHECK(n == count, "%s count %d, expected %d", prefix, n, count);
+  /* 双项核对（不是只查「expected 都在」）：多出一个意料外的子项同样算错。 */
+  for (int32_t i = 0; i < count; i++) {
+    CHECK(list_has(names, n, expected[i]), "%s missing child %s", prefix,
+          expected[i]);
+  }
+  list_free(names, n);
+}
+
 static void t_direct_children(const char *db) {
   printf("[children] markers, tombstones, split UTF-8, fanout, extindex, reopen\n");
   kvspace_t *kv = kvspaceShmOpen(db, SBO_DATA_SIZE);
@@ -322,7 +362,7 @@ static void t_direct_children(const char *db) {
   expect_children(kv, "/abc/", false, utf8, 1);
   CHECK(set_int32(kv, "/case/a", 1) == 0, "scalar child");
   CHECK(set_int32(kv, "/case/ab", 2) == 0, "shared name prefix");
-  CHECK(kvspaceShmMkindex(kv, "/case/a/", 0) == 0, "directory marker");
+  CHECK(mkindex(kv, "/case/a/") == 0, "directory marker");
   CHECK(set_int32(kv, "/case/a/deep/value", 3) == 0, "nested child");
   CHECK(set_int32(kv, "/case/a·field", 4) == 0, "attribute child");
   const char *marked[] = {"a/", "ab"};
@@ -338,18 +378,49 @@ static void t_direct_children(const char *db) {
   CHECK(set_int32(kv, "/coords/[10]/x", 10) == 0, "coord 10");
   CHECK(set_int32(kv, "/coords/[2]/x", 2) == 0, "coord 2");
   CHECK(set_int32(kv, "/coords/[-1]/x", -1) == 0, "coord -1");
-  CHECK(kvspaceShmMkindex(kv, "/coords/[10]/", 0) == 0, "coord marker");
+  CHECK(mkindex(kv, "/coords/[10]/") == 0, "coord marker");
+  /* **集合断言，不是顺序断言**：`kvspaceList` 的契约是「后端顺序、不排序」（见
+   * kvspace.h），坐标序是上层的事。这里只验「三个子项都在、名字都对」。
+   * 早先这个用例按 `{"[-1]", "[2]", "[10]/"}` 逐项比顺序，靠的是存储层内部那份
+   * `qsort(child_cmp)`——那让注释成了假话，也把排序责任留在了存储层。排序本身由
+   * `kvlangCoordCmp` 保证，规格在 kvlang/tests/test_coord.c。 */
   const char *coords[] = {"[-1]", "[2]", "[10]/"};
-  expect_children(kv, "/coords/", false, coords, 3);
+  expect_children_set(kv, "/coords/", false, coords, 3);
 
-  CHECK(kvspaceShmMkindex(kv, "/remote/", 0) == 0, "remote index");
-  CHECK(kvspaceShmMkindex(kv, "/remote/a/", 0) == 0, "remote marker");
+  CHECK(mkindex(kv, "/remote/") == 0, "remote index");
+  CHECK(mkindex(kv, "/remote/a/") == 0, "remote marker");
   CHECK(set_int32(kv, "/remote/a/deep/value", 7) == 0, "remote child");
   CHECK(set_int32(kv, "/remote/z/value", 8) == 0, "remote z");
   CHECK(set_int32(kv, "/local/a/value", 9) == 0, "local child");
-  CHECK(kvspaceShmExtindex(kv, "/local/", "/remote/", NULL, 0) == 0, "extend index");
+  {
+    uint8_t *ext_wire = NULL;
+    uint64_t ext_len = 0;
+    CHECK(kvspace_test_wire_ext((const uint8_t *)"/remote/", 8, "", &ext_wire,
+                                 &ext_len) == 0,
+          "build ext wire for /local/");
+    CHECK(kvspaceShmSetValue(kv, "/local/", ext_wire, (int32_t)ext_len) == 0,
+          "mount /remote/ at /local/");
+    free(ext_wire);
+  }
+  /* **跨段同名去重**：`/local/a` 是值形态（主段），`/remote/a/` 是目录形态
+   * （ext 段）。两段各自扫出来后必须合成一项，且留目录形态。这是唯一不能靠
+   * 「同一段内相邻」办到、也不能靠「两段各自有序」办到的那种冲突——集合查重
+   * 才对它成立。 */
   const char *extended[] = {"a/", "z"};
   expect_children(kv, "/local/", true, extended, 2);
+  {
+    char **names = NULL;
+    int32_t n = 0;
+    REQUIRE(kvspaceShmList(kv, "/local/", true, 0, &names, &n) == 0,
+            "list /local/ ext");
+    CHECK(n == 2, "/local/ ext 只有 a 与 z 两项（a 的两个形态合成一项），实得 %d",
+          n);
+    /* 留下来的是**目录形态**那个：合并判等只看去尾 `/` 的名字，但保留策略是
+       「目录形态优先」——目录有子项，丢掉它等于丢掉 `a/deep/value` 这条路。 */
+    CHECK(list_has(names, n, "a/"), "跨段冲突应保留目录形态 a/");
+    CHECK(!list_has(names, n, "a"), "跨段冲突不应同时留下值形态 a");
+    list_free(names, n);
+  }
   const char *local[] = {"a"};
   expect_children(kv, "/local/", false, local, 1);
 
@@ -381,7 +452,7 @@ static void t_direct_children(const char *db) {
     REQUIRE(kvspaceShmDel(kv, key) == 0, "delete descendant %d", i);
   }
   expect_children(kv, "/many/", false, NULL, 0);
-  CHECK(kvspaceShmMkindex(kv, "/many/child/", 0) == 0, "marker on dead branch");
+  CHECK(mkindex(kv, "/many/child/") == 0, "marker on dead branch");
   const char *marker_only[] = {"child/"};
   expect_children(kv, "/many/", false, marker_only, 1);
   kvspaceShmClose(kv);

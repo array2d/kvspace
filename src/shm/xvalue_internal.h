@@ -10,12 +10,12 @@
 #ifndef KVSPACE_C_XVALUE_INTERNAL_H
 #define KVSPACE_C_XVALUE_INTERNAL_H
 
-#include <kvspace/kvlang_xvalue.h>
+#include <kvspace/kvspace_xvalue.h>
 
 /* 引用性 —— 从 langtype 的**首字节**判定。
  *
  * 旧布局把「是不是引用」放在 head 的 `ptr` 字节里；新布局没有这个字段，
- * 它由 langtype 前缀 `*`（Ptr）与 `@`（Ext）表达（见 `kvlang_xvalue.h` 里
+ * 它由 langtype 前缀 `*`（Ptr）与 `@`（Ext）表达（见 `kvlang/xvalue.h` 里
  * `NewPtr`/`NewExt` 的注释：它们是唯一知道「这个值是引用」的构造点，
  * 构造器补前缀）。
  *
@@ -34,6 +34,15 @@
  * 拒绝它，故在此重复一次。**重复的不是格式知识，是一条拒绝规则**——
  * 值必须与上游一致（2）。 */
 #define KVSPACE_C_ATTR_TAG_RETIRED_REALLEN 2u
+
+/* tag 1 = langtype 只在这一个内部头里重复一次。语义（langtype 是类型、`*`/`@`
+ * 前缀表示引用）属语言层，定义在 `kvlang/include/kvlang/xvalue.h` 的
+ * `KVLANG_XVALUE_ATTR_TAG_LANGTYPE`；存储层不该 include 那个头。
+ *
+ * 本文件确实要读它——`kvspace_c_reference_of` 靠 langtype 首字节判引用。
+ * 这处语言知识是**既有遗留**（vthread 帧操作数判据需要它），TASK-082 只搬走了
+ * 构造器与坐标比较器，没有搬它；值是编号，必须与语言层一致（1）。 */
+#define KVSPACE_C_ATTR_TAG_LANGTYPE 1u
 
 /* 扫完整条 attr 区并取出 tag 1（langtype）：返回 0 成功，-1 畸形。
  *
@@ -69,7 +78,7 @@ static inline int kvspace_c_scan_attrs(const uint8_t *wire, uint64_t wire_len,
             return -1;
         if (tag == KVSPACE_C_ATTR_TAG_RETIRED_REALLEN)
             return -1; /* 已删除的格式：出现即拒，不猜 */
-        if (tag == KVSPACE_XVALUE_ATTR_TAG_LANGTYPE && !langtype) {
+        if (tag == KVSPACE_C_ATTR_TAG_LANGTYPE && !langtype) {
             langtype = p + 3;
             langtype_len = rlen;
         }

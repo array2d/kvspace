@@ -9,7 +9,7 @@
 
 #define _GNU_SOURCE
 #include "kvspace_shm.h"
-#include <kvspace/kvlang_xvalue.h>
+#include "test_wire.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -27,7 +27,7 @@
 
 static uint8_t *slack(const char *s, uint64_t *n) {
     uint8_t *v = NULL;
-    if (kvspaceXvalueHeadNewSlack((const uint8_t *)s, strlen(s), "", &v, n) != 0)
+    if (kvspace_test_wire_slack((const uint8_t *)s, strlen(s), "", &v, n) != 0)
         return NULL;
     return v;
 }

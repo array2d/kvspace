@@ -11,8 +11,15 @@ jobs:
       GH_TOKEN: ${{ github.token }}
     steps:
       - uses: actions/checkout@v4
+      # 单库：kvspace 自己就是标准实现，不再有 kvspace-c 后端库，也不 dlopen。
+      # 打包面因此收敛为一个 libkvspace.so。
+      - name: 下载 ABI 依赖
+        run: ./ci/deps.sh
       - name: 构建
-        run: cmake -B build -DCMAKE_BUILD_TYPE=Release && cmake --build build
+        run: |
+          set -euo pipefail
+          cmake -B build -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=OFF
+          cmake --build build -j"$(nproc)"
       - name: Verify CLI RUNPATH (built by cmake kvspace-cli target)
         run: |
           set -euo pipefail
@@ -25,8 +32,33 @@ jobs:
           mkdir -p "$d/include" "$d/lib" "$d/bin"
           # 头：递归整目录（保持层级）
           cp -R include/. "$d/include/"
-          # 库：扫构建目录的所有 .so*/.dylib（-P 保符号链接）
-          find build -maxdepth 3 \( -name 'lib*.so*' -o -name 'lib*.dylib' \) -exec cp -P {} "$d/lib/" \;
+          # 头也要按名字断言：`cp -R include/.` 会把工作树里任何残留一起打进去。
+          # 实际发生过一次——早已迁走的 `kvlang_xvalue.h`（语言层）被某个还原动作
+          # 复活，并跟着进了 tarball。存储层的包里不该有语言层的头。
+          for f in kvspace.h kvspace_xvalue.h const.h; do
+            test -f "$d/include/kvspace/$f"
+          done
+          unexpected=$(ls -1 "$d/include/kvspace" | grep -vE '^(kvspace\.h|kvspace_xvalue\.h|const\.h)$' || true)
+          if [ -n "$unexpected" ]; then
+            echo "include/kvspace 里有意外文件: $unexpected" >&2
+            exit 1
+          fi
+          # 库：只取单库及其 SONAME 链。**不用 `find ... lib*.so*` 全扫**——那样会把
+          # 构建目录里任何残留（旧 libkvspace-c、测试假后端）一起打进去，那些正是
+          # 「装载到错误库」类故障的来源。按名字取，只打该打的。
+          for f in libkvspace.so libkvspace.so.1 libkvspace.so.1.0.0; do
+            [ -e "build/$f" ] && cp -P "build/$f" "$d/lib/"
+          done
+          # 断言：产物里恰好是一个库的三个名字，没有第二个库
+          n=$(ls -1 "$d/lib" | wc -l)
+          echo "lib 目录: $(ls -1 "$d/lib" | tr '\n' ' ')"
+          test "$n" -eq 3
+          for f in "$d"/lib/*; do
+            case "$(basename "$f")" in
+              libkvspace.so|libkvspace.so.1|libkvspace.so.1.0.0) ;;
+              *) echo "意外的库文件: $f" >&2; exit 1 ;;
+            esac
+          done
           # 可执行：本仓 CLI（cli/ 是独立 Cargo 项目）
           cp cli/target/release/kvspace "$d/bin/"
           printf '{"abi":"%s"}\n' "$v" > "$d/abi-manifest.json"
