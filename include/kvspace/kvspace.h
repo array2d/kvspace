@@ -6,18 +6,18 @@
  *   shm://...      → libkvspace-c.so.1
  *   其余（redis/fs/s3）→ libkvspace_durable.so.1
  *
- * Wire: [bodylen:u64 LE@0][attrslen:u16 LE@8][reserved:u16 LE@10]
- *       [layout:u8@12][padding:3@13-15][body@16][attr records].
- * `reserved` 必须为零（旧格式 attrslen 的高 2 字节）。
+ * Wire: [bodylen:u64 LE@0][attrslen:u16 LE@8][padding:6@10-15]
+ *       [body@16][attr records].
+ * padding 必须为零（10-15 六个字节）。
  * Head is fixed 16 bytes, so the body offset equals the head length — never a
- * literal; read it from kvspaceXvalueHeadLen / the `headlen` field below.
- * `layout` 0 = bodylen is the effective length; 1 = bodylen is capacity and the
- * effective length lives in attr tag 2. There is no storetype/ptr field: the
- * storage form and reference-ness are carried by the langtype text (`*`/`@`).
+ * literal; read it from kvspaceXvalueHeadLen.
+ * bodylen 恒为有效字节数；容量是存储后端的物理分配属性，不进入 wire。
+ * There is no storetype/ptr field: the storage form and reference-ness are carried
+ * by the langtype text (`*`/`@`).
  * The attr region carries NO length prefix: its size is attrslen in the head,
  * so a second prefix would be a second source of truth. Records are
  * [tag:u8][len:u16 LE][data]; tag 1 = langtype (plaintext UTF-8, incl. leading
- * [dims] and `*`/`@` prefix), tag 2 = reallen (layout=1 only).
+ * [dims] and `*`/`@` prefix); tag 2（旧 reallen）已删除，出现即拒绝.
  * Empty attr = attrslen 0. Single-key write — no attr key.
  * Total length = 16 + bodylen + attrslen.
  * See kvspace/xvalue_head.h for the authoritative layout and helpers.
@@ -169,7 +169,7 @@ int kvspaceWriteInPlace(void *h, const char *key, int resolve, uint32_t body_len
  * langtype (empty/NULL = untyped) is written with the header/attr in a single-key write.
  *
  * `storetype` carries no information in the current XValue model: the storage form is
- * derived from langtype and `layout` is derived from `body_cap > body_len`. The
+ * derived from langtype; `body_cap` only controls physical allocation, not the wire. The
  * parameter stays only because the frontend dispatches through a function-pointer
  * table, so every backend export must keep the exact argument list. Implementations
  * must not branch on it and must not validate its value; `ref` is still meaningful

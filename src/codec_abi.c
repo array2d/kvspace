@@ -41,7 +41,7 @@ int kvspaceNewChar(const uint8_t *bytes, uint32_t len, const char *langtype,
         return 1;
     uint8_t *value = NULL;
     uint64_t total = 0;
-    if (kvspaceXvalueHeadNewSlack(bytes, len, len, langtype, &value, &total) != 0)
+    if (kvspaceXvalueHeadNewSlack(bytes, len, langtype, &value, &total) != 0)
         return 1;
     return finish(value, total, out, out_len);
 }

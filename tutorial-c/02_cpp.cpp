@@ -1,7 +1,8 @@
 /*
  * 02_cpp — C++ RAII 封装：extern "C" 直接调用 libkvspace dispatch 前端
  *
- * #571: Fixed 8-byte header (body offset is always 8); langtype in inline attr region.
+ * head 固定 16 字节 [bodylen:u64@0][attrslen:u16@8][padding:6@10-15]，body 偏移恒 16，
+ * langtype 在 body 之后的 attr 区。bodylen 恒为有效字节数，容量归存储后端。
  *
  * 编译: g++ -std=c++17 02_cpp.cpp -lkvspace
  */
@@ -32,8 +33,8 @@ struct KV {
     ~KV() { kvspaceClose(kv); ::unlink(path.c_str()); }
 
     // Write into returned body pointer; WriteNewPlace writes langtype with the header/attr region.
-    // body 长度用 `kvspaceXvalueHeadEffectiveLen` 取（layout=1 时有效长度在 attr tag 2，
-    // 不是 bodylen）；`ref` 由 langtype 的 `*`/`@` 前缀隐含，调用方不再单独给 head 位。
+    // 有效长度 = bodylen（head 里没有 layout，也没有 tag 2）；`ref` 由 langtype 的
+    // `*`/`@` 前缀隐含，调用方不再单独给 head 位。
     void set(const char *key, const char *langtype, const uint8_t *val, uint32_t len) {
         if (!val || len < KVSPACE_XVALUE_HEAD_LEN) return;
         uint64_t effective = 0;
@@ -58,7 +59,7 @@ struct KV {
         const uint8_t *lt = nullptr;
         uint16_t lt_len = 0;
         uint64_t effective = 0;
-        if (kvspaceXvalueHeadScan(out, len, &lt, &lt_len, nullptr) != 0) return false;
+        if (kvspaceXvalueHeadScan(out, len, &lt, &lt_len) != 0) return false;
         if (kvspaceXvalueHeadEffectiveLen(out, len, &effective) != 0) return false;
         const char *k = (const char *)(const void *)lt;
         uint16_t k_len = lt_len;

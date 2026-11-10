@@ -5,12 +5,11 @@ use std::env;
 use std::os::raw::{c_char, c_int, c_void};
 use std::process::exit;
 
-/* 固定 head 16 字节（见 kvspace/xvalue_head.h）：body 偏移恒 16。 */
-const KVSPACE_XVALUE_HEAD_LEN: usize = 16;
-/* head 只有 layout@12：0=bodylen 是有效长度，1=容量（有效长度在 attr tag 2）。
+/* 固定 head 16 字节（见 kvspace/xvalue_head.h）：[bodylen:u64@0][attrslen:u16@8]
+   [padding:6@10-15]，body 偏移恒 16。bodylen 是容量还是有效长度由 langtype 判；
    指针/扩展性**不在 head**，看 langtype 首字符 `*`/`@`。 */
-const KVSPACE_XVALUE_LAYOUT_CAPACITY: u8 = 1;
-/* 后端写侧 storage class（由 layout/dims 推出，传给 kvspaceWriteNewPlace）。 */
+const KVSPACE_XVALUE_HEAD_LEN: usize = 16;
+/* 后端写侧 storage class（由 langtype 推出，传给 kvspaceWriteNewPlace）。 */
 const KVSPACE_STORETYPE_FIXED_SMALL: u8 = 0;
 const KVSPACE_STORETYPE_SLACK: u8 = 1;
 const KVSPACE_STORETYPE_FIXED_LARGE: u8 = 2;
@@ -176,10 +175,10 @@ struct Value {
     body: Vec<u8>,
 }
 
-/* head 固定 16 字节 [bodylen:u64@0][attrslen:u16@8][reserved:u16@10]
-   [layout@12][padding@13-15]，body 偏移恒 16，attr 区紧随 body 且无自带长度前缀
-   （长度只在 head 里）；langtype 作为 attr 记录 tag=1 置于 body 之后（值内，非独立 key）。
-   值自描述：直接解 wire（取头函数已删除；它对 Ptr 穿透，读不到本体）。 */
+/* head 固定 16 字节 [bodylen:u64@0][attrslen:u16@8][padding:6@10-15]，body 偏移恒 16，
+   attr 区紧随 body 且无自带长度前缀（长度只在 head 里）；langtype 作为 attr 记录 tag=1
+   置于 body 之后（值内，非独立 key）。值自描述：直接解 wire（取头函数已删除；它对 Ptr
+   穿透，读不到本体）。head 里没有 layout / reserved / storetype / ptr。 */
 fn from_wire(data: &[u8]) -> Value {
     if data.len() < KVSPACE_XVALUE_HEAD_LEN {
         return Value {
@@ -199,9 +198,9 @@ fn from_wire(data: &[u8]) -> Value {
         _ => (0u8, &raw_langtype[..]),
     };
     let (dims, kind) = parse_langtype(langtype_body);
-    /* 后端 storage class 不在 head 里：layout=1 即按容量存（slack），
+    /* 后端 storage class 不在 head 里，只由 langtype 推：bufferarray 按容量存（slack），
        有 dims 的定长张量是 fixed-large，其余 fixed-small。 */
-    let storetype = if data[12] == KVSPACE_XVALUE_LAYOUT_CAPACITY {
+    let storetype = if is_bufferarray(langtype_body) {
         KVSPACE_STORETYPE_SLACK
     } else if !dims.is_empty() {
         KVSPACE_STORETYPE_FIXED_LARGE
@@ -232,15 +231,8 @@ fn wire_len(data: &[u8]) -> u64 {
 /// 扫 attr 区取 tag=1（langtype）；无记录/坏 attr → 空串。
 fn wire_langtype(data: &[u8], body_len: usize) -> String {
     let base = KVSPACE_XVALUE_HEAD_LEN.saturating_add(body_len);
-    /* attrslen:u16 @8-9；reserved:u16 @10-11 与 padding @13-15 非零视为非法。
-       attr 区无自带前缀。 */
-    if data.len() < KVSPACE_XVALUE_HEAD_LEN
-        || data[10] != 0
-        || data[11] != 0
-        || data[13] != 0
-        || data[14] != 0
-        || data[15] != 0
-    {
+    /* attrslen:u16 @8-9；padding @10-15 六字节非零视为非法。attr 区无自带前缀。 */
+    if data.len() < KVSPACE_XVALUE_HEAD_LEN || data[10..16].iter().any(|&b| b != 0) {
         return String::new();
     }
     let alen = (data[8] as usize) | ((data[9] as usize) << 8);
@@ -279,6 +271,29 @@ fn parse_langtype(lt: &str) -> (Vec<i32>, String) {
         }
     }
     (Vec::new(), lt.to_string())
+}
+
+/// 是否 bufferarray：`char/<enc>` 基种类，或轴写成 `[]` / `[.]` 等运行期长度
+/// （见 spec [[compact形态]]）。bufferarray 的 bodylen 是容量，其余是有效长度。
+fn is_bufferarray(lt: &str) -> bool {
+    let base = match lt.strip_prefix('[') {
+        Some(rest) => match rest.find(']') {
+            Some(end) => &rest[end + 1..],
+            None => lt,
+        },
+        None => lt,
+    };
+    if base.starts_with("char/") {
+        return true;
+    }
+    /* 运行期轴：`[]` / `[.]` / `[,]` —— 轴内容里没有十进制数字。 */
+    match lt.strip_prefix('[') {
+        Some(rest) => match rest.find(']') {
+            Some(end) => !rest[..end].contains(|c: char| c.is_ascii_digit()),
+            None => false,
+        },
+        None => false,
+    }
 }
 
 fn fmt_float(v: f64) -> String {

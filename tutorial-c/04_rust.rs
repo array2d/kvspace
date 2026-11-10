@@ -1,5 +1,6 @@
 // 04_rust — Rust FFI 直调 libkvspace（dispatch 前端），shm:// 后端
-// #571: Fixed 8-byte header (body offset is always 8); langtype in inline attr region.
+// head 固定 16 字节 [bodylen:u64@0][attrslen:u16@8][padding:6@10-15]，body 偏移恒 16，
+// langtype 在 body 之后的 attr 区。bodylen 恒为有效字节数，容量归存储后端。
 // 编译: rustc 04_rust.rs -l kvspace
 
 use std::convert::TryInto;
@@ -7,61 +8,50 @@ use std::ffi::{c_char, c_int, c_void, CString};
 use std::ptr;
 
 const KVSPACE_XVALUE_HEAD_LEN: usize = 16;
-const KVSPACE_XVALUE_LAYOUT_CAPACITY: u8 = 1;
 const KVSPACE_XVALUE_ATTR_TAG_LANGTYPE: u8 = 1;
-const KVSPACE_XVALUE_ATTR_TAG_REALLEN: u8 = 2;
 
-/// 扫描 16 字节 head + attr 区，返回 (langtype, reallen)。
+/// 扫描 16 字节 head + attr 区，返回 langtype（无记录/坏 wire → 空）。
 /// 与 C 的 `kvspaceXvalueHeadScan` 同语义；Rust 侧没有 inline 头可用，
 /// 这里按线格式直接解，**不复制 C 的结构体字段**（那是第二份字段真相）。
-/// wire: [bodylen:u64][attrslen:u16][reserved:u16][layout:u8][padding:3][body][attrs]
-fn xvalue_head_scan(wire: &[u8]) -> (Vec<u8>, Option<u64>) {
+/// wire: [bodylen:u64][attrslen:u16][padding:6][body][attrs]
+fn xvalue_head_scan(wire: &[u8]) -> Vec<u8> {
     if wire.len() < KVSPACE_XVALUE_HEAD_LEN {
-        return (vec![], None);
+        return vec![];
     }
     let bodylen = u64::from_le_bytes(wire[0..8].try_into().unwrap()) as usize;
     let attrslen = u16::from_le_bytes(wire[8..10].try_into().unwrap()) as usize;
-    if wire[10..12] != [0u8, 0] || wire[13..16] != [0u8, 0, 0] {
-        return (vec![], None);
+    if wire[10..16] != [0u8; 6] {
+        return vec![];
     }
     if KVSPACE_XVALUE_HEAD_LEN + bodylen + attrslen > wire.len() {
-        return (vec![], None);
+        return vec![];
     }
     let mut p = KVSPACE_XVALUE_HEAD_LEN + bodylen;
     let mut left = attrslen;
-    let (mut langtype, mut reallen) = (vec![], None);
+    let mut langtype = vec![];
     while left >= 3 {
         let tag = wire[p];
         let rlen = u16::from_le_bytes([wire[p + 1], wire[p + 2]]) as usize;
         if left < 3 + rlen {
-            return (vec![], None);
+            return vec![];
         }
         match tag {
             KVSPACE_XVALUE_ATTR_TAG_LANGTYPE => langtype = wire[p + 3..p + 3 + rlen].to_vec(),
-            KVSPACE_XVALUE_ATTR_TAG_REALLEN => {
-                if rlen == 8 {
-                    reallen = Some(u64::from_le_bytes(
-                        wire[p + 3..p + 11].try_into().unwrap()));
-                }
-            }
+            2 => return vec![], // 旧 reallen tag 已删除，出现即拒
             _ => {}
         }
         p += 3 + rlen;
         left -= 3 + rlen;
     }
-    (langtype, reallen)
+    langtype
 }
 
-/// 有效长度：layout=0 是 bodylen；layout=1 是 attr tag 2 的 reallen。
+/// 有效长度 = bodylen（head 里没有 layout，也没有 tag 2）。
 fn xvalue_head_effective_len(wire: &[u8]) -> Option<u64> {
     if wire.len() < KVSPACE_XVALUE_HEAD_LEN {
         return None;
     }
-    let bodylen = u64::from_le_bytes(wire[0..8].try_into().unwrap());
-    if wire[12] != KVSPACE_XVALUE_LAYOUT_CAPACITY {
-        return Some(bodylen);
-    }
-    xvalue_head_scan(wire).1
+    Some(u64::from_le_bytes(wire[0..8].try_into().unwrap()))
 }
 
 extern "C" {
@@ -119,7 +109,7 @@ fn new_str(s: &str) -> Vec<u8> {
 // kind 与 body 长度都从**同一条 wire**解出（kvspaceGet 的返回值），
 // 不再调已删除的 kvspaceGetHead，也不维护第二份 head 结构体。
 fn read_kind(_kv: *mut c_void, _key: &str, data: &[u8]) -> (String, Vec<u8>) {
-    let (langtype, _) = xvalue_head_scan(data);
+    let langtype = xvalue_head_scan(data);
     let klen = langtype.iter().position(|&b| b == 0).unwrap_or(langtype.len());
     let mut kx = String::from_utf8_lossy(&langtype[..klen]).into_owned();
     if kx.starts_with('*') || kx.starts_with('@') { kx.drain(..1); }

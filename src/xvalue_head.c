@@ -3,13 +3,12 @@
 #include <stdlib.h>
 #include <string.h>
 
-/* Layout: fixed 16-byte header [bodylen:u64@0][attrslen:u16@8][reserved:u16@10]
-   [layout@12][padding@13,16), body at offset 16, attr region right after the body with NO length
-   prefix (attrslen is in the head — a second prefix would be a second truth).
+/* Layout: fixed 16-byte header [bodylen:u64@0][attrslen:u16@8][padding@10,16),
+   body at offset 16, attr region right after the body with NO length prefix
+   (attrslen is in the head — a second prefix would be a second truth).
    Single-key atomic write — no separate attr key. Empty langtype = empty attr.
-   layout=1 时 bodylen 是容量：body 区按容量分配、有效长度写进 attr tag 2。 */
-
-#define REALLEN_RECORD_LEN 11u /* [tag:u8][len:u16][reallen:u64] */
+   bodylen 恒为有效字节数；容量是存储后端的物理分配属性，不进入 wire。
+   head 没有 layout / reserved 字段，attr 区没有 reallen tag。 */
 
 /* Failure helper: clear *out per header contract. */
 static int fail(uint8_t **out) {
@@ -19,47 +18,35 @@ static int fail(uint8_t **out) {
 }
 
 /* Single wire builder. Zero-fills the body when body is NULL (Reserve
-   placeholder); public entry points validate whether non-zero effective_len
+   placeholder); public entry points validate whether non-zero body_len
    requires non-NULL body.
    langtype_prefix 只由 NewPtr/NewExt 传入 '*' 或 '@'，构造成 langtype 记录的前缀。 */
-static int build(uint8_t layout, const uint8_t *body, uint64_t region_len,
-                 uint64_t effective_len, char langtype_prefix,
+static int build(const uint8_t *body, uint64_t body_len, char langtype_prefix,
                  const char *langtype, uint8_t **out, uint64_t *out_len) {
     if (!out || !out_len)
         return fail(out);
     *out = NULL;
-    if (layout == KVSPACE_XVALUE_LAYOUT_LENGTH) {
-        if (effective_len != region_len)
-            return -1;
-    } else if (layout == KVSPACE_XVALUE_LAYOUT_CAPACITY) {
-        if (effective_len > region_len)
-            return -1;
-    } else {
-        return -1;
-    }
     const uint64_t ltl = langtype ? (uint64_t)strlen(langtype) : 0;
     const uint64_t record_len = ltl + (langtype_prefix ? 1u : 0u);
-    uint64_t alen = record_len ? 3 + record_len : 0;
-    if (layout == KVSPACE_XVALUE_LAYOUT_CAPACITY)
-        alen += REALLEN_RECORD_LEN;
+    const uint64_t alen = record_len ? 3 + record_len : 0;
     if (alen > UINT16_MAX)
         return -1;
-    if (region_len > UINT64_MAX - KVSPACE_XVALUE_HEAD_LEN ||
-        alen > UINT64_MAX - KVSPACE_XVALUE_HEAD_LEN - region_len)
+    if (body_len > UINT64_MAX - KVSPACE_XVALUE_HEAD_LEN ||
+        alen > UINT64_MAX - KVSPACE_XVALUE_HEAD_LEN - body_len)
         return -1;
-    const uint64_t n = (uint64_t)KVSPACE_XVALUE_HEAD_LEN + region_len + alen;
+    const uint64_t n = (uint64_t)KVSPACE_XVALUE_HEAD_LEN + body_len + alen;
     if (n > SIZE_MAX)
         return -1;
     uint8_t *p = (uint8_t *)calloc(1, (size_t)n);
     if (!p)
         return -1;
-    kvspaceXvalueHead h = {.layout = layout, .padding = {0u, 0u, 0u}};
-    kvspaceXvalueHeadSetLen(&h, region_len);
+    kvspaceXvalueHead h = {.padding = {0u, 0u, 0u, 0u, 0u, 0u}};
+    kvspaceXvalueHeadSetLen(&h, body_len);
     kvspaceXvalueHeadSetAttrsLen(&h, (uint16_t)alen);
     memcpy(p, &h, sizeof h);
-    if (body && effective_len)
-        memcpy(p + KVSPACE_XVALUE_HEAD_LEN, body, effective_len);
-    uint8_t *a = p + KVSPACE_XVALUE_HEAD_LEN + region_len;
+    if (body && body_len)
+        memcpy(p + KVSPACE_XVALUE_HEAD_LEN, body, body_len);
+    uint8_t *a = p + KVSPACE_XVALUE_HEAD_LEN + body_len;
     if (record_len) {
         a[0] = KVSPACE_XVALUE_ATTR_TAG_LANGTYPE;
         a[1] = (uint8_t)record_len;
@@ -69,14 +56,6 @@ static int build(uint8_t layout, const uint8_t *body, uint64_t region_len,
             a[at++] = (uint8_t)langtype_prefix;
         if (ltl)
             memcpy(a + at, langtype, ltl);
-        a += 3 + record_len;
-    }
-    if (layout == KVSPACE_XVALUE_LAYOUT_CAPACITY) {
-        a[0] = KVSPACE_XVALUE_ATTR_TAG_REALLEN;
-        a[1] = 8;
-        a[2] = 0;
-        for (int i = 0; i < 8; i++)
-            a[3 + i] = (uint8_t)(effective_len >> (8 * i));
     }
     *out = p;
     *out_len = n;
@@ -84,8 +63,7 @@ static int build(uint8_t layout, const uint8_t *body, uint64_t region_len,
 }
 
 int kvspaceXvalueHeadNewNone(uint8_t **out, uint64_t *out_len) {
-    return build(KVSPACE_XVALUE_LAYOUT_LENGTH, NULL, 0, 0, 0, NULL, out,
-                 out_len);
+    return build(NULL, 0, 0, NULL, out, out_len);
 }
 
 int kvspaceXvalueHeadNewScalar(const uint8_t *raw, uint32_t raw_len,
@@ -93,18 +71,15 @@ int kvspaceXvalueHeadNewScalar(const uint8_t *raw, uint32_t raw_len,
                                uint8_t **out, uint64_t *out_len) {
     if (raw_len && !raw)
         return fail(out);
-    return build(KVSPACE_XVALUE_LAYOUT_LENGTH, raw, raw_len, raw_len, 0,
-                 langtype, out, out_len);
+    return build(raw, raw_len, 0, langtype, out, out_len);
 }
 
 int kvspaceXvalueHeadNewSlack(const uint8_t *data, uint64_t data_len,
-                              uint64_t cap, const char *langtype,
+                              const char *langtype,
                               uint8_t **out, uint64_t *out_len) {
-    if (cap < data_len || (data_len && !data))
+    if (data_len && !data)
         return fail(out);
-    const uint8_t layout = cap > data_len ? KVSPACE_XVALUE_LAYOUT_CAPACITY
-                                          : KVSPACE_XVALUE_LAYOUT_LENGTH;
-    return build(layout, data, cap, data_len, 0, langtype, out, out_len);
+    return build(data, data_len, 0, langtype, out, out_len);
 }
 
 int kvspaceXvalueHeadNewTensor(const uint64_t *dims, uint32_t ndim,
@@ -114,8 +89,7 @@ int kvspaceXvalueHeadNewTensor(const uint64_t *dims, uint32_t ndim,
     /* Shape lives in leading [dims] of langtype; body byte length is raw_len. */
     if (!dims || ndim == 0 || ndim > 64 || (raw_len && !raw))
         return fail(out);
-    return build(KVSPACE_XVALUE_LAYOUT_LENGTH, raw, raw_len, raw_len, 0,
-                 langtype, out, out_len);
+    return build(raw, raw_len, 0, langtype, out, out_len);
 }
 
 /* path_len == 0 是合法的 None 指针：`*T` + 空 body。 */
@@ -126,8 +100,7 @@ int kvspaceXvalueHeadNewPtr(const uint8_t *path, uint32_t path_len,
         return fail(out);
     if (langtype && (langtype[0] == '*' || langtype[0] == '@'))
         return fail(out);
-    return build(KVSPACE_XVALUE_LAYOUT_LENGTH, path, path_len, path_len, '*',
-                 langtype, out, out_len);
+    return build(path, path_len, '*', langtype, out, out_len);
 }
 
 int kvspaceXvalueHeadNewExt(const uint8_t *locator, uint32_t locator_len,
@@ -137,39 +110,29 @@ int kvspaceXvalueHeadNewExt(const uint8_t *locator, uint32_t locator_len,
         return fail(out);
     if (langtype && (langtype[0] == '*' || langtype[0] == '@'))
         return fail(out);
-    return build(KVSPACE_XVALUE_LAYOUT_LENGTH, locator, locator_len, locator_len,
-                 '@', langtype, out, out_len);
+    return build(locator, locator_len, '@', langtype, out, out_len);
 }
 
 int kvspaceXvalueHeadNewCode(const uint8_t *body, uint64_t body_len,
-                             uint64_t cap, const char *langtype,
-                             uint8_t **out, uint64_t *out_len) {
-    return kvspaceXvalueHeadNewSlack(body, body_len, cap, langtype, out,
-                                     out_len);
-}
-
-int kvspaceXvalueHeadReserve(uint64_t body_len, uint64_t cap,
                              const char *langtype,
                              uint8_t **out, uint64_t *out_len) {
-    /* 预留 = 产 cap 字节零 body 的占位（后由调用方填充前 body_len 字节），
-       attr 区（含 langtype 与 reallen）一并写入。 */
-    if (cap < body_len)
-        return fail(out);
-    const uint8_t layout = cap > body_len ? KVSPACE_XVALUE_LAYOUT_CAPACITY
-                                          : KVSPACE_XVALUE_LAYOUT_LENGTH;
-    return build(layout, NULL, cap, body_len, 0, langtype, out, out_len);
+    return kvspaceXvalueHeadNewSlack(body, body_len, langtype, out, out_len);
+}
+
+int kvspaceXvalueHeadReserve(uint64_t body_len, const char *langtype,
+                             uint8_t **out, uint64_t *out_len) {
+    /* 预留 = 产 body_len 字节零 body 的占位（后由调用方填充），
+       attr 区只含 langtype；容量由存储后端另行保留。 */
+    return build(NULL, body_len, 0, langtype, out, out_len);
 }
 
 int kvspaceXvalueHeadScan(const uint8_t *wire, uint64_t wire_len,
-                                        const uint8_t **out_langtype,
-                                        uint16_t *out_langtype_len,
-                                        uint64_t *out_reallen) {
+                          const uint8_t **out_langtype,
+                          uint16_t *out_langtype_len) {
     if (out_langtype)
         *out_langtype = NULL;
     if (out_langtype_len)
         *out_langtype_len = 0;
-    if (out_reallen)
-        *out_reallen = 0;
     if (!wire || wire_len < KVSPACE_XVALUE_HEAD_LEN)
         return -1;
     const kvspaceXvalueHead *h = (const kvspaceXvalueHead *)(const void *)wire;
@@ -180,8 +143,6 @@ int kvspaceXvalueHeadScan(const uint8_t *wire, uint64_t wire_len,
     const uint8_t *end = p + kvspaceXvalueHeadAttrsLen(h);
     const uint8_t *langtype = NULL;
     uint16_t langtype_len = 0;
-    uint64_t reallen = 0;
-    int seen_reallen = 0;
     while (p + 3 <= end) {
         uint8_t tag = p[0];
         uint16_t rlen = (uint16_t)((uint16_t)p[1] | ((uint16_t)p[2] << 8));
@@ -192,42 +153,31 @@ int kvspaceXvalueHeadScan(const uint8_t *wire, uint64_t wire_len,
                 langtype = p + 3;
                 langtype_len = rlen;
             }
-        } else if (tag == KVSPACE_XVALUE_ATTR_TAG_REALLEN) {
-            if (h->layout != KVSPACE_XVALUE_LAYOUT_CAPACITY || seen_reallen ||
-                rlen != 8)
-                return -1;
-            for (int i = 0; i < 8; i++)
-                reallen |= (uint64_t)p[3 + i] << (8 * i);
-            seen_reallen = 1;
+        } else if (tag == 2u) {
+            /* 旧 reallen tag 已删除：出现即拒绝，避免把旧容量 wire 误读成
+               有效长度。 */
+            return -1;
         }
         p += 3 + rlen;
     }
-    if (h->layout == KVSPACE_XVALUE_LAYOUT_CAPACITY &&
-        (!seen_reallen || reallen > h->bodylen))
-        return -1;
     if (out_langtype)
         *out_langtype = langtype;
     if (out_langtype_len)
         *out_langtype_len = langtype_len;
-    if (out_reallen)
-        *out_reallen = reallen;
     return 0;
 }
 
-/* 有效长度：layout=0 时是 bodylen；layout=1 时是 attr tag 2 的 reallen。
-   返回 0 成功，-1 失败（*out 置 0；0 本身是合法长度，故错误不走长度值）。 */
-int kvspaceXvalueHeadEffectiveLen(const uint8_t *wire,
-                                                uint64_t wire_len,
-                                                uint64_t *out) {
+/* 有效长度 = bodylen；保留入口给调用方统一走 accessor。
+   仍完整 Scan 一次，确保 tag 2 / 畸形 attr 不会被静默接受。 */
+int kvspaceXvalueHeadEffectiveLen(const uint8_t *wire, uint64_t wire_len,
+                                  uint64_t *out) {
     if (out)
         *out = 0;
     if (!out)
         return -1;
-    uint64_t reallen = 0;
-    if (kvspaceXvalueHeadScan(wire, wire_len, NULL, NULL, &reallen) != 0)
+    if (kvspaceXvalueHeadScan(wire, wire_len, NULL, NULL) != 0)
         return -1;
     const kvspaceXvalueHead *h = (const kvspaceXvalueHead *)(const void *)wire;
-    *out = h->layout == KVSPACE_XVALUE_LAYOUT_CAPACITY ? reallen : h->bodylen;
+    *out = h->bodylen;
     return 0;
 }
-

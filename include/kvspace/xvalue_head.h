@@ -1,14 +1,14 @@
-/* Wire: [bodylen:u64 LE@0][attrslen:u16 LE@8][reserved:u16 LE@10]
-   [layout:u8@12][padding:3@13-15]
+/* Wire: [bodylen:u64 LE@0][attrslen:u16 LE@8][padding:6@10-15]
    [body @16..16+bodylen][attr @16+bodylen..16+bodylen+attrslen].
    Head is fixed 16 bytes; body offset is always 16.
-   head 只描述「字节怎么读」：bodylen 是 body 区字节数，layout 说它是不是容量。
-   「这个值是什么」全在 langtype（attr tag 1，含 [dims] 与 * / @ 前缀），head 不承载。
+   head 只描述「字节怎么读」：bodylen 恒为 body 区有效字节数；容量是存储后端的
+   物理分配属性，不进入 wire，也不改变 bodylen 的含义。
    The attr region carries NO length prefix — attrslen is in the head, so a second
    prefix would be a second source of truth. Total = 16 + bodylen + attrslen,
    computed from the head alone.
    Type rides in the same single-key value — no attr key. attr record =
-   [tag:u8][len:u16 LE][data]; tag 1 = langtype, tag 2 = reallen, tags 3+ reserved.
+   [tag:u8][len:u16 LE][data]; tag 1 = langtype, tags 3+ reserved. tag 2
+   (旧 reallen) 已删除，出现即拒绝。
    Wire is little-endian. Current platforms are LE, so a straight memcpy of the
    struct equals the wire; a big-endian target must convert at the boundary. */
 #ifndef XVALUE_HEAD_H
@@ -32,29 +32,19 @@ extern "C" {
 
 #define KVSPACE_XVALUE_HEAD_LEN 16u
 
-/* layout：bodylen 的语义。没有 storetype/ptr 字段——存储形态与引用性都从
-   langtype 推出；唯一推不出的是「body 区是容量而非有效长度」，故只保留这一标志。 */
-#define KVSPACE_XVALUE_LAYOUT_LENGTH   0u /* bodylen = 有效长度 */
-#define KVSPACE_XVALUE_LAYOUT_CAPACITY 1u /* bodylen = 容量；有效长度在 attr tag 2 */
-
 /* Fixed 16-byte layout (direct memcpy struct + body + attrs).
-   wire: bodylen:u64@0, attrslen:u16@8, reserved:u16@10, layout@12,
-   padding@13-15. */
+   wire: bodylen:u64@0, attrslen:u16@8, padding@10-15. */
 typedef struct kvspaceXvalueHead {
-    uint64_t bodylen;      /* body 区字节数：有效长度，或容量（见 layout） */
+    uint64_t bodylen;      /* body 区有效字节数；容量是存储后端分配属性 */
     uint16_t attrslen;     /* attr 区字节数（不含任何前缀）；上限 UINT16_MAX */
-    uint16_t reserved;     /* 必须为零；旧格式的 attrslen 高 2 字节落在这里 */
-    uint8_t  layout;       /* KVSPACE_XVALUE_LAYOUT_*；其它值非法 */
-    uint8_t  padding[3];   /* 必须为零；读取方遇到非零按非法处理 */
+    uint8_t  padding[6];   /* 必须为零；读取方遇到非零按非法处理 */
 } kvspaceXvalueHead;
 
 KVSPACE_STATIC_ASSERT(sizeof(kvspaceXvalueHead) == KVSPACE_XVALUE_HEAD_LEN,
                "XValue head must be exactly 16 bytes");
 KVSPACE_STATIC_ASSERT(offsetof(kvspaceXvalueHead, bodylen) == 0U, "bodylen@0");
 KVSPACE_STATIC_ASSERT(offsetof(kvspaceXvalueHead, attrslen) == 8U, "attrslen@8");
-KVSPACE_STATIC_ASSERT(offsetof(kvspaceXvalueHead, reserved) == 10U, "reserved@10");
-KVSPACE_STATIC_ASSERT(offsetof(kvspaceXvalueHead, layout) == 12U, "layout@12");
-KVSPACE_STATIC_ASSERT(offsetof(kvspaceXvalueHead, padding) == 13U, "padding@13");
+KVSPACE_STATIC_ASSERT(offsetof(kvspaceXvalueHead, padding) == 10U, "padding@10");
 
 /* 字段的唯一定义点：读/写一律走这些 inline 方法，禁止各处直接取字段或手写偏移。 */
 static inline uint64_t kvspaceXvalueHeadLen(const kvspaceXvalueHead *h) {
@@ -69,29 +59,16 @@ static inline uint16_t kvspaceXvalueHeadAttrsLen(const kvspaceXvalueHead *h) {
 static inline void kvspaceXvalueHeadSetAttrsLen(kvspaceXvalueHead *h, uint16_t v) {
     h->attrslen = v;
 }
-static inline uint8_t kvspaceXvalueHeadLayout(const kvspaceXvalueHead *h) {
-    return h->layout;
-}
-static inline void kvspaceXvalueHeadSetLayout(kvspaceXvalueHead *h, uint8_t v) {
-    h->layout = v;
-}
-static inline int kvspaceXvalueHeadLayoutIsValid(const kvspaceXvalueHead *h) {
-    return h->layout == KVSPACE_XVALUE_LAYOUT_LENGTH ||
-           h->layout == KVSPACE_XVALUE_LAYOUT_CAPACITY;
-}
-/* reserved 与 padding 都是 ABI 的一部分：非零即非法，读取路径必须先过这一关。 */
-static inline int kvspaceXvalueHeadReservedIsZero(const kvspaceXvalueHead *h) {
-    return h->reserved == 0u;
-}
+/* padding 是 ABI 的一部分：非零即非法，读取路径必须先过这一关。 */
 static inline int kvspaceXvalueHeadPaddingIsZero(const kvspaceXvalueHead *h) {
-    return h->padding[0] == 0u && h->padding[1] == 0u && h->padding[2] == 0u;
+    return h->padding[0] == 0u && h->padding[1] == 0u &&
+           h->padding[2] == 0u && h->padding[3] == 0u &&
+           h->padding[4] == 0u && h->padding[5] == 0u;
 }
-/* 总长 = 16 + bodylen + attrslen；非法 layout、非零 reserved/padding、溢出都
-   返回 0（0 不是合法总长）。 */
+/* 总长 = 16 + bodylen + attrslen；非零 padding、溢出都返回 0
+   （0 不是合法总长）。 */
 static inline uint64_t kvspaceXvalueHeadTotalLen(const kvspaceXvalueHead *h) {
-    if (!kvspaceXvalueHeadReservedIsZero(h) ||
-        !kvspaceXvalueHeadPaddingIsZero(h) ||
-        !kvspaceXvalueHeadLayoutIsValid(h))
+    if (!kvspaceXvalueHeadPaddingIsZero(h))
         return 0;
     uint64_t body = kvspaceXvalueHeadLen(h);
     uint64_t attrs = kvspaceXvalueHeadAttrsLen(h);
@@ -106,21 +83,15 @@ static inline const uint8_t *kvspaceXvalueHeadAttrs(const uint8_t *wire) {
     return wire + KVSPACE_XVALUE_HEAD_LEN + (uint64_t)h->bodylen;
 }
 
-/* attr 区常量：record tag 1 = langtype；tag 2 = reallen；其余预留。 */
+/* attr 区常量：record tag 1 = langtype；tag 2 是已删除的 reallen，读取时拒绝。 */
 #define KVSPACE_XVALUE_ATTR_TAG_LANGTYPE 1u
-/* tag 2 的归属是**排他**的：layout=1 必须恰有一条、layout=0 必须不带。
-   未知 tag 一般忽略以保持前向兼容；tag 2 例外——它已分配给 reallen，而 reallen
-   只在 layout=1 下有定义。「有定义但在此 layout 下无意义」说明写读双方对格式
-   理解不一致，必须拒绝；「我不认识这个 tag」才该忽略。
-   data 恒 8 字节 u64 LE。 */
-#define KVSPACE_XVALUE_ATTR_TAG_REALLEN 2u
 
-/* attr 扫描的唯一入口：校验 reserved、padding、layout、总长与 tag 2 归属，
-   取出 tag 1 与 tag 2。输出参数都可为 NULL。返回 0 成功，-1 失败。 */
+/* attr 扫描的唯一入口：校验 padding 与总长，取出 tag 1。
+   输出参数都可为 NULL。返回 0 成功，-1 失败。
+   tag 2（旧 reallen）已删除，出现即拒绝，避免把旧容量 wire 误读成有效长度。 */
 int kvspaceXvalueHeadScan(const uint8_t *wire, uint64_t wire_len,
                            const uint8_t **out_langtype,
-                           uint16_t *out_langtype_len,
-                           uint64_t *out_reallen);
+                           uint16_t *out_langtype_len);
 
 int kvspaceXvalueHeadEffectiveLen(const uint8_t *wire, uint64_t wire_len,
                                     uint64_t *out);
@@ -139,14 +110,14 @@ static inline uint16_t kvspaceXvalueHeadLangtype(const uint8_t *wire,
         return 0;
     const uint8_t *langtype = NULL;
     uint16_t langtype_len = 0;
-    if (kvspaceXvalueHeadScan(wire, total, &langtype, &langtype_len, NULL) != 0)
+    if (kvspaceXvalueHeadScan(wire, total, &langtype, &langtype_len) != 0)
         return 0;
     if (out)
         *out = langtype;
     return langtype_len;
 }
 
-/* Bounded variant: verifies the head fits, padding is zero, layout is valid and
+/* Bounded variant: verifies the head fits, padding is zero and
    16+bodylen+attrslen <= wire_len before scanning records.
    Returns 0 and sets *out=NULL on missing/malformed/truncated values. */
 static inline uint16_t kvspaceXvalueHeadLangtypeBounded(const uint8_t *wire,
@@ -156,7 +127,7 @@ static inline uint16_t kvspaceXvalueHeadLangtypeBounded(const uint8_t *wire,
         *out = NULL;
     const uint8_t *langtype = NULL;
     uint16_t langtype_len = 0;
-    if (kvspaceXvalueHeadScan(wire, wire_len, &langtype, &langtype_len, NULL) != 0)
+    if (kvspaceXvalueHeadScan(wire, wire_len, &langtype, &langtype_len) != 0)
         return 0;
     if (out)
         *out = langtype;
@@ -167,9 +138,8 @@ static inline uint16_t kvspaceXvalueHeadLangtypeBounded(const uint8_t *wire,
    Empty/NULL langtype omits the langtype record (attrslen = 0).
    Returns 0 on success, -1 and clears *out on failure (when out is non-NULL).
 
-   layout 判据：只有「容量 > 有效长度」才是 LAYOUT_CAPACITY（此时 body 区按容量
-   分配、有效长度写进 attr tag 2）；其余一律 LAYOUT_LENGTH。NewScalar/NewTensor
-   没有容量参数，恒为 LAYOUT_LENGTH。NewSlack/NewCode/NewReserve 以 cap > len 判定。
+   `bodylen` 恒为有效字节数；容量是存储后端的物理分配属性，不进入 wire。
+   构造器不再有 capacity 参数，也不再写 attr tag 2。
 
    NewPtr/NewExt 是唯一知道「这个值是引用」的构造点：调用方传 pointed-to 的
    基 kindexpr（不带 * / @），构造器补前缀（空 langtype → 裸 "*"/"@"）。
@@ -182,7 +152,7 @@ int kvspaceXvalueHeadNewScalar(const uint8_t *raw, uint32_t raw_len,
                                const char *langtype,
                                uint8_t **out, uint64_t *out_len);
 int kvspaceXvalueHeadNewSlack(const uint8_t *data, uint64_t data_len,
-                              uint64_t cap, const char *langtype,
+                              const char *langtype,
                               uint8_t **out, uint64_t *out_len);
 int kvspaceXvalueHeadNewTensor(const uint64_t *dims, uint32_t ndim,
                                const uint8_t *raw, uint64_t raw_len,
@@ -195,11 +165,10 @@ int kvspaceXvalueHeadNewExt(const uint8_t *locator, uint32_t locator_len,
                             const char *langtype,
                             uint8_t **out, uint64_t *out_len);
 int kvspaceXvalueHeadNewCode(const uint8_t *body, uint64_t body_len,
-                             uint64_t cap, const char *langtype,
-                             uint8_t **out, uint64_t *out_len);
-/* 预留 = body 区 cap 字节零填；有效长度 body_len（cap > body_len 时 layout=1）。 */
-int kvspaceXvalueHeadReserve(uint64_t body_len, uint64_t cap,
                              const char *langtype,
+                             uint8_t **out, uint64_t *out_len);
+/* 预留 = body 区 body_len 字节零填；容量由存储后端的 reserve 参数承担。 */
+int kvspaceXvalueHeadReserve(uint64_t body_len, const char *langtype,
                              uint8_t **out, uint64_t *out_len);
 
 #ifdef __cplusplus
