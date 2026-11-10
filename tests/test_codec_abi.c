@@ -1,5 +1,6 @@
 #include <kvspace/kvspace.h>
-#include <kvspace/xvalue_head.h>
+#include <kvspace/kvspace_xvalue.h>
+#include <kvspace/kvlang_xvalue.h>
 
 #include <stdint.h>
 #include <stdio.h>

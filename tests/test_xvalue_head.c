@@ -1,4 +1,5 @@
-#include <kvspace/xvalue_head.h>
+#include <kvspace/kvspace_xvalue.h>
+#include <kvspace/kvlang_xvalue.h>
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -230,7 +231,10 @@ static void test_tag_two_rejected(void) {
     kvspaceXvalueHeadSetAttrsLen(&h,
                                  (uint16_t)(kvspaceXvalueHeadAttrsLen(&h) + extra));
     memcpy(wire, &h, sizeof h);
-    uint8_t *a = wire + base_len;
+    /* attr 区起点是 16 + bodylen，不是整条 wire 的长度 base_len。早先这里写成
+     * `wire + base_len`，把 tag 2 记录写到了 wire 末尾之外的位置——旧 Scan 的
+     * 循环条件宽松，恰好没读到那段，测试于是「通过」了但什么也没验到。 */
+    uint8_t *a = wire + KVSPACE_XVALUE_HEAD_LEN + kvspaceXvalueHeadLen(&h);
     a[0] = 2;
     a[1] = 8;
     a[2] = 0;
@@ -246,6 +250,64 @@ static void test_tag_two_rejected(void) {
           "tag 2 rejected by effective len");
     free(wire);
     free(base);
+}
+
+/* tag 2 的位置无关：它在目标 tag **之前**或**之后**都必须让 GetAttr 返回 -1。
+ *
+ * 这条专门钉住一个真实缺陷：早先 GetAttr 命中目标 tag 后就 return，于是
+ * 「tag 1 在前、tag 2 在后」的 wire 被当成合法读出来——tag 2 是退役编号，
+ * 见到它就说明写读双方理解不一致，整条 wire 都不能采信，与它在哪无关。
+ *
+ * 只测一个位置不够：缺陷恰恰只在「tag 2 排在目标之后」时出现。 */
+static void test_tag_two_position_independent(void) {
+    /* 手工构造 wire：body 3 字节 + 两条 attr 记录，顺序可调。 */
+    const uint8_t lt_data[] = "[]char/utf8";
+    const uint16_t lt_len = (uint16_t)(sizeof lt_data - 1);
+    const uint16_t lt_record = (uint16_t)(3 + lt_len);
+    const uint16_t tag2_record = 3 + 8;
+
+    for (int tag2_first = 0; tag2_first <= 1; tag2_first++) {
+        const uint16_t attrs = (uint16_t)(lt_record + tag2_record);
+        const uint64_t total = KVSPACE_XVALUE_HEAD_LEN + 3 + attrs;
+        uint8_t *wire = (uint8_t *)calloc(1, (size_t)total);
+        CHECK(wire != NULL, "tag2-position allocation");
+        if (!wire)
+            return;
+        kvspaceXvalueHead h = {.padding = {0}};
+        kvspaceXvalueHeadSetLen(&h, 3);
+        kvspaceXvalueHeadSetAttrsLen(&h, attrs);
+        memcpy(wire, &h, sizeof h);
+        wire[KVSPACE_XVALUE_HEAD_LEN + 0] = 'a';
+        wire[KVSPACE_XVALUE_HEAD_LEN + 1] = 'b';
+        wire[KVSPACE_XVALUE_HEAD_LEN + 2] = 'c';
+
+        uint8_t *a = wire + KVSPACE_XVALUE_HEAD_LEN + 3;
+        if (tag2_first) {
+            a[0] = 2; a[1] = 8; a[2] = 0;
+            a += tag2_record;
+        }
+        a[0] = KVSPACE_XVALUE_ATTR_TAG_LANGTYPE;
+        a[1] = (uint8_t)lt_len;
+        a[2] = 0;
+        memcpy(a + 3, lt_data, lt_len);
+        a += lt_record;
+        if (!tag2_first) {
+            a[0] = 2; a[1] = 8; a[2] = 0;
+        }
+
+        const uint8_t *data = NULL;
+        uint16_t data_len = 0;
+        const int rc = kvspaceXvalueGetAttr(wire, total,
+                                            KVSPACE_XVALUE_ATTR_TAG_LANGTYPE,
+                                            &data, &data_len);
+        CHECK(rc == -1,
+              "tag 2 位于 langtype %s 时仍须拒绝（rc=%d）",
+              tag2_first ? "之前" : "之后", rc);
+        CHECK(data == NULL && data_len == 0,
+              "拒绝时输出必须清零（tag2 在 %s）",
+              tag2_first ? "之前" : "之后");
+        free(wire);
+    }
 }
 
 static void test_bounded_and_truncated(void) {
@@ -312,6 +374,7 @@ int main(void) {
     test_code_reserve();
     test_padding_rejected();
     test_tag_two_rejected();
+    test_tag_two_position_independent();
     test_bounded_and_truncated();
     test_attrslen_limit();
     if (failures != 0) {

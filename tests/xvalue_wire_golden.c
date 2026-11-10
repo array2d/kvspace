@@ -8,7 +8,8 @@
  * 输出格式：每行 `<case-name> <total-len> <hex>`，顺序固定，便于 diff。
  */
 
-#include <kvspace/xvalue_head.h>
+#include <kvspace/kvspace_xvalue.h>
+#include <kvspace/kvlang_xvalue.h>
 
 #include <stdio.h>
 #include <stdlib.h>
