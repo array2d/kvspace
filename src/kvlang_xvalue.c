@@ -63,11 +63,11 @@ static int build(const uint8_t *body, uint64_t body_len, char langtype_prefix,
     return 0;
 }
 
-int kvspaceXvalueHeadNewNone(uint8_t **out, uint64_t *out_len) {
+KVSPACE_PUBLIC int kvspaceXvalueHeadNewNone(uint8_t **out, uint64_t *out_len) {
     return build(NULL, 0, 0, NULL, out, out_len);
 }
 
-int kvspaceXvalueHeadNewScalar(const uint8_t *raw, uint32_t raw_len,
+KVSPACE_PUBLIC int kvspaceXvalueHeadNewScalar(const uint8_t *raw, uint32_t raw_len,
                                const char *langtype,
                                uint8_t **out, uint64_t *out_len) {
     if (raw_len && !raw)
@@ -75,7 +75,7 @@ int kvspaceXvalueHeadNewScalar(const uint8_t *raw, uint32_t raw_len,
     return build(raw, raw_len, 0, langtype, out, out_len);
 }
 
-int kvspaceXvalueHeadNewSlack(const uint8_t *data, uint64_t data_len,
+KVSPACE_PUBLIC int kvspaceXvalueHeadNewSlack(const uint8_t *data, uint64_t data_len,
                               const char *langtype,
                               uint8_t **out, uint64_t *out_len) {
     if (data_len && !data)
@@ -83,7 +83,7 @@ int kvspaceXvalueHeadNewSlack(const uint8_t *data, uint64_t data_len,
     return build(data, data_len, 0, langtype, out, out_len);
 }
 
-int kvspaceXvalueHeadNewTensor(const uint64_t *dims, uint32_t ndim,
+KVSPACE_PUBLIC int kvspaceXvalueHeadNewTensor(const uint64_t *dims, uint32_t ndim,
                                const uint8_t *raw, uint64_t raw_len,
                                const char *langtype,
                                uint8_t **out, uint64_t *out_len) {
@@ -94,7 +94,7 @@ int kvspaceXvalueHeadNewTensor(const uint64_t *dims, uint32_t ndim,
 }
 
 /* path_len == 0 是合法的 None 指针：`*T` + 空 body。 */
-int kvspaceXvalueHeadNewPtr(const uint8_t *path, uint32_t path_len,
+KVSPACE_PUBLIC int kvspaceXvalueHeadNewPtr(const uint8_t *path, uint32_t path_len,
                             const char *langtype,
                             uint8_t **out, uint64_t *out_len) {
     if (path_len && !path)
@@ -104,7 +104,7 @@ int kvspaceXvalueHeadNewPtr(const uint8_t *path, uint32_t path_len,
     return build(path, path_len, '*', langtype, out, out_len);
 }
 
-int kvspaceXvalueHeadNewExt(const uint8_t *locator, uint32_t locator_len,
+KVSPACE_PUBLIC int kvspaceXvalueHeadNewExt(const uint8_t *locator, uint32_t locator_len,
                             const char *langtype,
                             uint8_t **out, uint64_t *out_len) {
     if (!locator_len || !locator)
@@ -114,13 +114,13 @@ int kvspaceXvalueHeadNewExt(const uint8_t *locator, uint32_t locator_len,
     return build(locator, locator_len, '@', langtype, out, out_len);
 }
 
-int kvspaceXvalueHeadNewCode(const uint8_t *body, uint64_t body_len,
+KVSPACE_PUBLIC int kvspaceXvalueHeadNewCode(const uint8_t *body, uint64_t body_len,
                              const char *langtype,
                              uint8_t **out, uint64_t *out_len) {
     return kvspaceXvalueHeadNewSlack(body, body_len, langtype, out, out_len);
 }
 
-int kvspaceXvalueHeadReserve(uint64_t body_len, const char *langtype,
+KVSPACE_PUBLIC int kvspaceXvalueHeadReserve(uint64_t body_len, const char *langtype,
                              uint8_t **out, uint64_t *out_len) {
     /* 预留 = 产 body_len 字节零 body 的占位（后由调用方填充），
        attr 区只含 langtype；容量由存储后端另行保留。 */

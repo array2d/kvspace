@@ -28,6 +28,20 @@
 #include <stdint.h>
 #include <string.h>
 
+/* 公开符号的导出标注：生产构建用 `-fvisibility=hidden`，只有标了它的符号
+ * 才会出现在动态符号表里。不标 = 内部实现（kvspaceShm* 等），测试构建
+ * （不留 hidden）可直接链接。
+ *
+ * 定义在字节层头里是因为三个公开头都要用，而 kvspace_xvalue.h 是最底层、
+ * 被另外两个包含的那一个。 */
+#if defined(_WIN32)
+#define KVSPACE_PUBLIC __declspec(dllexport)
+#elif defined(__GNUC__)
+#define KVSPACE_PUBLIC __attribute__((visibility("default")))
+#else
+#define KVSPACE_PUBLIC
+#endif
+
 /* C++ 不认 `_Static_assert`（C11 关键字）；同一份断言给两种语言用。 */
 #if defined(__cplusplus)
 #define KVSPACE_STATIC_ASSERT(condition, message) static_assert(condition, message)
