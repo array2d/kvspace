@@ -7,40 +7,86 @@ set(CMAKE_C_EXTENSIONS ON)
 
 include(GNUInstallDirs)
 
-# 默认 prefix=/usr（与 kvspace-c 对齐），前端与后端同装 <prefix>/lib/kvspace。
+# 默认 prefix=/usr；库装 <prefix>/lib/kvspace，与历史安装布局一致（已装的消费者不用改链接路径）。
 if(CMAKE_INSTALL_PREFIX_INITIALIZED_TO_DEFAULT)
     set(CMAKE_INSTALL_PREFIX "/usr" CACHE PATH "" FORCE)
 endif()
 
-# frontend_storage.c 是新存储 ABI（storage.h）的 dispatch，独立 TU：新旧两份 ABI 头
-# 在 kvspaceConnect/kvspaceClose/kvspaceCp 上同名、在 ListLen/Listlen 等上只差大小写，
-# 同一个编译单元里无法共存。
-# kvspace 就是标准实现本身：不再有 adapter/dispatch 层，也不 dlopen 任何后端。
-# 单库直接包含 shm 引擎 + 值编解码 + 构造器。
+# kvspace 就是标准实现本身：没有 adapter/dispatch 层，也不 dlopen 任何后端。
+# 单库直接包含 shm 引擎 + 字节层（head/attr）+ 存储常量。
+# 语言层（构造器、langtype、坐标比较）不在本仓，见 <kvlang/xvalue.h>。
 add_library(kvspace SHARED
-    src/shm/coord.c
     src/shm/kvspace.c
-    src/codec_abi.c
     src/xvalue_head.c
-    src/kvlang_xvalue.c)
+    src/const.c)
 target_include_directories(kvspace PRIVATE src/shm)
+
+# ── header-only ABI 依赖 ────────────────────────────────────────────
+# src/shm/kvspace.c 直接 include 两个头（`#define *_IMPLEMENTATION` 后把实现体编进
+# 本 TU）。从前 CMakeLists 一个字没提它们，全靠 `/usr/include` 隐式命中——于是换 pod
+# 之后得到的是 `fatal error: blockmalloc/blockmalloc.h: No such file or directory`，
+# 报错里看不出缺哪个仓、哪个版本、怎么修。
+#
+# **版本不写在这里**：pin 的唯一事实源是 `ci/deps.sh` 的两行。CMake 里再写一份就是
+# 第二个真相，下次升级必漏一个。
+#
+# **默认假定兄弟仓不存在。** 候选只有三个，全是「装好的 pin」：
+#
+#   1. /usr/local/include     ci/deps.sh 的目标（macOS 也是这里）
+#   2. /usr/include           ci/deps.sh 的目标（Linux）
+#
+# **兄弟仓不进候选，一个都不留。** 三条理由：
+#   - 兄弟布局是开发者本地的偶然状态，不是契约。契约是「装好的 pin」。
+#   - 默认值一旦存在，正确路径就变成「没被默认值遮住的那条」，而没有人会去验它——
+#     验的永远是侥幸命中的那条。
+#   - 它已经造成过实际事故：兄弟仓排在前面时，构建用的其实不是 `ci/deps.sh` pin 的
+#     版本，而是某个检出；两者恰好同 tag 时完全看不出来。
+#
+# 需要本地仓时用 `-DKVSPACE_<name>_INCLUDE_DIRECTORY=<dir>` 显式指定。显式即留痕：
+# 构建日志里能看到这个决定，而默认兜底是看不见的。
+#
+# `NO_DEFAULT_PATH` 是必须的：不加的话 find_path 还会去编译器默认目录里扫，命中一个
+# 同名但版本不符的目录时，症状是链接期或运行期才炸，而不是配置期点名。
+foreach(header IN ITEMS blockmalloc/blockmalloc.h slotsboxmalloc/slotsboxobj.h)
+    string(REGEX REPLACE "/[^/]+$" "" header_directory "${header}")
+    set(pin_candidates
+        "/usr/local/include"
+        "/usr/include")
+    find_path(KVSPACE_${header_directory}_INCLUDE_DIRECTORY
+        NAMES ${header}
+        PATHS ${pin_candidates}
+        NO_DEFAULT_PATH)
+    if(NOT KVSPACE_${header_directory}_INCLUDE_DIRECTORY)
+        # 候选逐行列出。写成 `${pin_candidates}` 会被 CMake 用 `;` 拼成一行
+        # （`/usr/local/include;/usr/include`），一眼看不出是几个目录。
+        set(candidate_lines "")
+        set(candidate_index 1)
+        foreach(candidate IN LISTS pin_candidates)
+            string(APPEND candidate_lines "    ${candidate_index}. ${candidate}\n")
+            math(EXPR candidate_index "${candidate_index} + 1")
+        endforeach()
+        message(FATAL_ERROR
+            "找不到 <${header}>。\n"
+            "  候选目录（均未命中，按优先级）：\n"
+            "${candidate_lines}"
+            "  修复（二选一）：\n"
+            "    1. 跑 ./ci/deps.sh —— 版本 pin 在它里面（本文件不重复写版本号）；\n"
+            "    2. 用 -DKVSPACE_${header_directory}_INCLUDE_DIRECTORY=<包含 ${header_directory}/ 的目录> 显式指定。")
+    endif()
+    message(STATUS "kvspace: <${header}> → ${KVSPACE_${header_directory}_INCLUDE_DIRECTORY}")
+    target_include_directories(kvspace PRIVATE
+        "${KVSPACE_${header_directory}_INCLUDE_DIRECTORY}")
+endforeach()
+
+# **kvspace 不依赖 kvlang**——这条是分层的方向，不是偏好：语言层依赖存储层，
+# 反过来不行。测试造值也不借用语言层的构造器：它们用 `tests/shm/test_wire.h` 里
+# 那几个本地拼 wire 的 inline（格式知识重复，由同一组测试矩阵约束，含与 kvlang
+# 金标准的逐字节比对）。共享符号会把两个仓编译期绑死，那是更贵的耦合。
 
 include(CTest)
 if(BUILD_TESTING)
-    add_executable(test_xvalue_head tests/test_xvalue_head.c)
-    target_include_directories(test_xvalue_head PRIVATE src include)
-    target_link_libraries(test_xvalue_head PRIVATE kvspace)
-    add_test(NAME xvalue_head COMMAND test_xvalue_head)
-    add_executable(test_codec_abi tests/test_codec_abi.c)
-    target_include_directories(test_codec_abi PRIVATE src include)
-    target_link_libraries(test_codec_abi PRIVATE kvspace)
-    add_test(NAME codec_abi COMMAND test_codec_abi)
-    # wire 金标准：打印同一批操作的字节，供 kvspace-c / kvspace-durable 逐字节比对
-    # （tests/compare_wire_golden.sh）。它不做断言，只产出可比对的文本。
-    add_executable(xvalue_wire_golden tests/xvalue_wire_golden.c)
-    target_include_directories(xvalue_wire_golden PRIVATE src include)
-    target_link_libraries(xvalue_wire_golden PRIVATE kvspace)
-
+    # XValue 构造器与 codec 的测试随实现迁往 kvlang（`kvlang/xvalue/tests/`）。
+    # kvspace 侧只保留字节层与存储契约的测试。
 
     # 存储契约 smoke：单库就是标准实现，直接链接即可，不再有「真/假后端」之分，
     # 也就不再需要独立构建目录与 dlopen 搜索路径。
@@ -61,12 +107,11 @@ if(BUILD_TESTING)
         "art_scan|test_art_scan"
         "art_alignment|test_art_alignment"
         "anchor_hook|test_anchor_hook"
-        "new_wire_shm|test_new_wire_shm"
         "shm_split|test_shm_split"
         "storage_abi|test_storage_abi"
-        "xvalue_head|test_xvalue_head"
-        # 该源文件不带 test_ 前缀。
-        "xvalue_wire_golden|xvalue_wire_golden")
+        # xvalue_head / new_wire_shm / xvalue_wire_golden 造的是语言层 wire，
+        # 随构造器一起迁往 kvlang（`kvlang/xvalue/tests/`）。
+        )
     foreach(pair IN LISTS KVSPACE_SHM_TEST_PAIRS)
         string(FIND "${pair}" "|" pair_sep)
         string(SUBSTRING "${pair}" 0 ${pair_sep} shm_name)
@@ -97,10 +142,9 @@ target_include_directories(kvspace
         $<INSTALL_INTERFACE:include>
 )
 
-# 活跃句柄表（退出兜底落盘）用 pthread 互斥；dlopen/dlsym 的宿主库 Linux 为 libdl，
-# macOS 在 libSystem 内（CMAKE_DL_LIBS 两者皆正确）。
+# 活跃句柄表（退出兜底落盘）用 pthread 互斥。单库后没有 dlopen/dlsym，不再链 libdl。
 find_package(Threads REQUIRED)
-target_link_libraries(kvspace PRIVATE ${CMAKE_DL_LIBS} Threads::Threads)
+target_link_libraries(kvspace PRIVATE Threads::Threads)
 
 # 生产库只导出公开头声明的符号；内部实现（kvspaceShm*、测试钩子）不是 API。
 # 测试构建需要直接链接内部函数，故保持默认可见。
@@ -145,6 +189,10 @@ install(FILES ${CMAKE_CURRENT_BINARY_DIR}/kvspace.pc DESTINATION ${CMAKE_INSTALL
 #   $ORIGIN/../<libdir>/kvspace         -- cmake --install (<prefix>/<libdir>/kvspace)
 # Use @loader_path on macOS; escape $ as $$ for CMake.
 # release.yml packages this binary directly without rebuilding.
+#
+# CLI 只做**存储**子命令（del/deltree/cp/cpdir/mkindex/clear/list/tree/head/attr），
+# 因此只链 libkvspace，**不依赖 kvlang**。语言层命令（get/set/list --kind/tree --kind）
+# 在 kvlang 仓自己的 CLI 里，那个 CLI 才同时链 libkvspace + libkvlang_xvalue。
 find_program(CARGO_EXECUTABLE cargo)
 if(CARGO_EXECUTABLE)
   set(KVSPACE_CLI_BIN "${CMAKE_CURRENT_SOURCE_DIR}/cli/target/release/kvspace")

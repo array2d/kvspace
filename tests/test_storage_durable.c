@@ -15,13 +15,13 @@
  * ---------------------------------
  *
  * DSN 用独立 fs:// 目录（带 pid），不碰共享 redis/6379，不 flush。
- * 本文件 include kvspace.h 与 kvspace_xvalue.h / kvlang_xvalue.h
+ * 本文件 include kvspace.h 与 kvspace_xvalue.h + tests/shm/test_wire.h
  * （与 storage.h 在 Connect/Close/Cp 上重名），故旧接口 kvspaceSetValue 的
  * 声明在此手写，仅用于构造 fixture（见下）。 */
 
 #include <kvspace/kvspace.h>
 #include <kvspace/kvspace_xvalue.h>
-#include <kvspace/kvlang_xvalue.h>
+#include "shm/test_wire.h"
 
 #include <stdint.h>
 #include <stdio.h>
@@ -350,7 +350,7 @@ int main(void) {
         clear_err();
         const uint8_t *langtype = NULL;
         uint16_t langtype_len = 0;
-        (void)kvspaceXvalueHeadLangtypeBounded(NULL, 0, &langtype);
+        (void)kvlangXvalueHeadLangtypeBounded(NULL, 0, &langtype);
         int64_t probe_count = 0;
         uint32_t probe_max = 0;
         const int probe_rc =

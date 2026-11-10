@@ -14,7 +14,6 @@
 #include "slotsboxmalloc/slotsboxobj.h"
 #include "kvspace_shm.h"
 #include <kvspace/kvspace.h>
-#include <kvspace/kvlang_xvalue.h>
 #include "xvalue_internal.h"
 #include <errno.h>
 #include <fcntl.h>
@@ -328,15 +327,30 @@ static int p2_maint_start(kvspace_t *kv);   /* 懒启动（阈值触发） */
 static bool p2_claim_alive(kvspace_t *kv, uint32_t claim);
 static int kv_sync(kvspace_t *kv);
 
-/* 阈值：生产固定 64MiB；测试构建可用 P2_TEST_GARB_THRESHOLD_MB 调低。 */
+/* ── 测试注入开关 ──────────────────────────────────────────────────
+ * 曾用 `P2_*` 环境变量。改成进程级 setter：**输入来源不能是环境**——环境是隐式的，
+ * 测试里看不出来、并行跑会互相污染、生产环境误设还会改变行为。功能一个没删，只是
+ * 从「读环境」变成「调用方显式给值」。
+ *
+ * 只在测试构建（`P2_TEST_HOOKS`）存在；生产构建里这些字段不参与任何判断。
+ *
+ * 单位约定：`_ms` 后缀是毫秒，`_megabytes` 是 MiB。0 = 关闭（不注入）。 */
+#ifdef P2_TEST_HOOKS
+static struct {
+    uint32_t garb_threshold_megabytes; /* 垃圾环回收阈值，0 = 用生产的 64MiB */
+    int barrier_ms;                    /* 0 = 用 P2_BARRIER_MS_DEFAULT */
+    uint32_t hold_drain_ms;            /* 崩溃窗口：head 已推进、box 未 free */
+    uint32_t hold_reserve_ms;          /* 崩溃窗口：reserve 之后、alloc 之前 */
+    bool fail_alloc;                   /* reserve 成功后强制失败 */
+    bool fail_art_insert;              /* alloc 成功后、ART 插入前强制失败 */
+} g_p2_test_knobs;
+#endif
+
+/* 阈值：生产固定 64MiB；测试构建可由 setter 调低。 */
 static uint64_t p2_garb_threshold(void) {
 #ifdef P2_TEST_HOOKS
-    const char *v = getenv("P2_TEST_GARB_THRESHOLD_MB");
-    if (v) {
-        unsigned long mb = strtoul(v, NULL, 10);
-        if (mb)
-            return (uint64_t)mb << 20;
-    }
+    if (g_p2_test_knobs.garb_threshold_megabytes)
+        return (uint64_t)g_p2_test_knobs.garb_threshold_megabytes << 20;
 #endif
     return GARB_THRESHOLD;
 }
@@ -670,8 +684,13 @@ static long long p2_now_ms(void) {
 }
 
 static int p2_barrier_ms(void) {
-    const char *v = getenv("P2_BARRIER_MS");
-    int ms = v ? atoi(v) : P2_BARRIER_MS_DEFAULT;
+#ifdef P2_TEST_HOOKS
+    int ms = g_p2_test_knobs.barrier_ms;
+    if (ms == 0)
+        ms = P2_BARRIER_MS_DEFAULT;
+#else
+    int ms = P2_BARRIER_MS_DEFAULT;
+#endif
     return ms < 1 ? 1 : (ms > 5000 ? 5000 : ms);
 }
 
@@ -841,11 +860,9 @@ static int p2_drain(kvspace_t *kv, uint32_t r) {
         __atomic_store_n(&e->meta, GE_EMPTY, __ATOMIC_RELEASE);
         __atomic_store_n(&kv->hdr->garb_head, i + 1, __ATOMIC_RELEASE);
 #ifdef P2_TEST_HOOKS
-        {   /* 崩溃窗口：head 已推进、box 未 free —— 只漏不双 free */
-            const char *v = getenv("P2_TEST_HOLD_DRAIN_MS");
-            if (v && atoi(v) > 0)
-                usleep((useconds_t)atoi(v) * 1000);
-        }
+        /* 崩溃窗口：head 已推进、box 未 free —— 只漏不双 free */
+        if (g_p2_test_knobs.hold_drain_ms)
+            usleep((useconds_t)g_p2_test_knobs.hold_drain_ms * 1000);
 #endif
         kv_sbo_free(kv, off);
         __atomic_store_n(&kv->hdr->freed_bytes,
@@ -971,6 +988,38 @@ static void p2_maint_stop(kvspace_t *kv) {
 /* Q2：显式静默声明。on 只接受 0/1；幂等；状态变化唤醒 leader。
  * 前置：调用线程已作废本进程全部 view token。声明期间 View* 一律 -1。 */
 #ifdef P2_TEST_HOOKS
+/* ── 测试注入 setter ───────────────────────────────────────────────
+ * 与 `kvspaceShmTestSetFormatVersion` 同一族：只在测试构建存在，由测试在 setup 里
+ * 调用。每个 setter 直接改进程级字段，所以是**进程级**作用：并行跑测试要各自起进程
+ * （ctest 本来就是）。传 0 / false 即关闭。
+ *
+ * 从前它们是 6 个 `P2_*` 环境变量。改成函数是因为环境是隐式的：测试代码里看不出
+ * 依赖，跑之前必须记得设，忘了就静默走生产默认值——这类「忘了也没报错」的开关，
+ * 比没有开关更难查。 */
+void kvspaceShmTestSetGarbageThresholdMegabytes(uint32_t megabytes) {
+    g_p2_test_knobs.garb_threshold_megabytes = megabytes;
+}
+
+void kvspaceShmTestSetBarrierMilliseconds(int milliseconds) {
+    g_p2_test_knobs.barrier_ms = milliseconds;
+}
+
+void kvspaceShmTestSetHoldDrainMilliseconds(uint32_t milliseconds) {
+    g_p2_test_knobs.hold_drain_ms = milliseconds;
+}
+
+void kvspaceShmTestSetHoldReserveMilliseconds(uint32_t milliseconds) {
+    g_p2_test_knobs.hold_reserve_ms = milliseconds;
+}
+
+void kvspaceShmTestSetFailAlloc(bool enabled) {
+    g_p2_test_knobs.fail_alloc = enabled;
+}
+
+void kvspaceShmTestSetFailArtInsert(bool enabled) {
+    g_p2_test_knobs.fail_art_insert = enabled;
+}
+
 /* 对齐验收：块头 8、stride 8 倍数，且每个块的 val（偏移 16）不跨 64B 行。
  * 返回 -1 = 通过；>=0 = 第一个坏块 id；-2 = 块头宽度不是 8。 */
 int64_t kvspaceShmArtAlignCheck(kvspace_t *kv) {
@@ -1348,7 +1397,7 @@ static int32_t art_find(kvspace_t *kv, int32_t nid, const uint8_t *key,
     return art_find2(kv, nid, key, klen, NULL, NULL);
 }
 
-/* Last path '/' or kvlang member '·' (U+00B7, utf-8 C2 B7). */
+/* Last path / or member separator '·' (U+00B7, utf-8 C2 B7). */
 static int last_key_sep(const uint8_t *key, int klen, int *seplen) {
     int slash = -1, mid = -1;
     for (int i = 0; i < klen; i++) {
@@ -2642,12 +2691,9 @@ static int shm_set_local(kvspace_t *kv, const char *key, const uint8_t *val,
         if (garb_reserve(kv, &gidx) != 0)
             return -1;
 #ifdef P2_TEST_HOOKS
-        {
-            const char *v = getenv("P2_TEST_HOLD_RESERVE_MS");
-            if (v && atoi(v) > 0)
-                usleep((useconds_t)atoi(v) * 1000);
-        }
-        if (getenv("P2_TEST_FAIL_ALLOC")) {
+        if (g_p2_test_knobs.hold_reserve_ms)
+            usleep((useconds_t)g_p2_test_knobs.hold_reserve_ms * 1000);
+        if (g_p2_test_knobs.fail_alloc) {
             garb_cancel(kv, gidx);
             return -1;
         }
@@ -2661,7 +2707,7 @@ static int shm_set_local(kvspace_t *kv, const char *key, const uint8_t *val,
     }
     memcpy(kv->sbo_data + off, val, val_len);
 #ifdef P2_TEST_HOOKS
-    if (retiring && getenv("P2_TEST_FAIL_ARTINS")) {
+    if (retiring && g_p2_test_knobs.fail_art_insert) {
         garb_cancel(kv, gidx);
         kv_sbo_free(kv, off);
         return -1;
@@ -2765,9 +2811,10 @@ static int shm_set_validated(kvspace_t *kv, const char *key,
      * 拦住它们），那是**放宽**，不是迁移。 */
     if (is_vthread_status_key(kbuf)) {
         const uint8_t *status_langtype = NULL;
-        const uint16_t status_langtype_len =
-            kvspaceXvalueHeadLangtypeBounded(val, (uint64_t)val_len,
-                                             &status_langtype);
+        uint16_t status_langtype_len = 0;
+        if (kvspace_c_scan_attrs(val, (uint64_t)val_len, &status_langtype,
+                                 &status_langtype_len) != 0)
+            return -1;
         uint64_t effective = 0;
         if (kvspaceXvalueHeadEffectiveLen(val, (uint64_t)val_len, &effective) != 0 ||
             effective > KVSPACE_STATUS_MAX_LEN ||
@@ -2780,9 +2827,10 @@ static int shm_set_validated(kvspace_t *kv, const char *key,
             /* 旧 store 的不合规 status 槽（形状/容量任一不符）：
              * 不自动升级、不 realloc——写入硬错，需重建/重置。 */
             const uint8_t *old_langtype = NULL;
-            const uint16_t old_langtype_len =
-                kvspaceXvalueHeadLangtypeBounded(old_raw, (uint64_t)old_sz,
-                                                 &old_langtype);
+            uint16_t old_langtype_len = 0;
+            if (kvspace_c_scan_attrs(old_raw, (uint64_t)old_sz, &old_langtype,
+                                     &old_langtype_len) != 0)
+                return -1;
             uint64_t old_effective = 0;
             if (head_of(old_raw, (int32_t)old_sz, &old) != 0 ||
                 kvspaceXvalueHeadEffectiveLen(old_raw, (uint64_t)old_sz,
@@ -3096,37 +3144,10 @@ int kvspaceShmCplist(kvspace_t *kv, const char *src, const char *dst) {
     return rc;
 }
 
-int kvspaceShmMkindex(kvspace_t *kv, const char *path, uint32_t capacity) {
-    if (!kv || !path)
-        return -1;
-    (void)capacity;
-    char *d = edir(path);
-    int32_t existing_len = 0;
-    if (kvspaceShmGet(kv, d, 0, &existing_len)) {
-        free(d);
-        return 0;
-    }
-    uint8_t *v = NULL;
-    uint64_t vl = 0;
-    int r = kvspaceXvalueHeadNewNone(&v, &vl);
-    if (r == 0)
-        r = kvspaceShmSetValue(kv, d, v, (int32_t)vl);
-    free(v);
-    free(d);
-    return r;
-}
-
-static int child_cmp(const void *a, const void *b) {
-    const char *x = *(const char *const *)a;
-    const char *y = *(const char *const *)b;
-    size_t nx = strlen(x), ny = strlen(y);
-    char *tx = nx && x[nx - 1] == '/' ? strndup(x, nx - 1) : NULL;
-    char *ty = ny && y[ny - 1] == '/' ? strndup(y, ny - 1) : NULL;
-    int c = kvspaceCoordCmp(tx ? tx : x, ty ? ty : y);
-    free(tx);
-    free(ty);
-    return c ? c : strcmp(x, y);
-}
+/* `kvspaceShmMkindex` 已删除（TASK-082）：它造的是 `HeadNewNone` —— 一条带语言层
+ * 语义的 wire，而存储层不该知道 langtype。生产路径本来就不走它：公共的
+ * `kvspaceMkindex` → `kvspaceShmStorageMakeindex` 写的是 0 字节 body + 0 attr，
+ * 只保证位置存在，值由上层用 Realloc 填。留着它是「两套 Mkindex 语义」。 */
 
 static int same_child(const char *a, const char *b) {
     size_t na = strlen(a), nb = strlen(b);
@@ -3180,34 +3201,100 @@ static int list_scan(kvspace_t *kv, const char *pfx, const char *ext,
     if (ext[0] && art_scan_pfx(kv, ext, (int)strlen(ext), buf, (int)sizeof buf,
                                &children) != 0)
         goto fail;
-    if (children.count > 1)
-        qsort(children.keys, (size_t)children.count, sizeof *children.keys,
-              child_cmp);
-    int32_t unique = 0;
-    for (int32_t i = 0; i < children.count; i++) {
-        if (strcmp(pfx, "/") == 0 &&
-            strcmp(children.keys[i], ".kvspace-meta") == 0) {
-            free(children.keys[i]);
-            continue;
+    /* **不排序**：`kvspaceList` 的契约是「后端顺序、不排序」（见 kvspace.h），
+     * 输出顺序就是 art_scan 给的原序。坐标序归上层（`kvlangCoordCmp`），不要在这里
+     * 加回 qsort。
+     *
+     * 去重**不假设任何顺序**。同名两项（`a` 与 `a/`，值形态与目录形态）保留目录
+     * 形态那个。两条错路都试过，都不成立：
+     *   - 相邻比较要求同名项挨着，而 ART 不保证顺序（`art_add` 的 N4 分支是 append，
+     *     只有 N4→N16 扩容才冒泡），实测 `/p/a`、`/p/a!`、`/p/a/` 的产出就是
+     *     `a`, `a!`, `a/` —— `a` 与 `a/` 中间隔着 `a!`；
+     *   - 「在已收集合里线性扫」能对，但是 O(n²)：10k 直接子项实测 193 ms/call。
+     *
+     * 这里用**哈希集合**：判据只看名字本身（`same_child` 的归一规则：去尾 `/`），
+     * 与产出顺序无关，期望 O(n)。输出顺序仍是 ART 原序 —— 集合只回答「见没见过」，
+     * 不参与排队。
+     *
+     * 表大小取 count 的两倍向上取 2 的幂：负载因子 ≤ 0.5，链长期望 O(1)。
+     * 表里存的是 children.keys 的下标（int32），不是指针 —— 保留目录形态时要原地
+     * 换掉那个槽，下标让这件事直接可做。 */
+    int32_t keep = 0;
+    if (children.count > 1) {
+        uint32_t buckets = 8u;
+        while (buckets < (uint32_t)children.count * 2u)
+            buckets <<= 1u;
+        int32_t *table = (int32_t *)malloc((size_t)buckets * sizeof *table);
+        if (!table)
+            goto fail;
+        /* -1 = 空槽；链用 keys 里的下标串起来，另开一个 next 数组。 */
+        int32_t *next = (int32_t *)malloc((size_t)children.count * sizeof *next);
+        if (!next) {
+            free(table);
+            goto fail;
         }
-        /* Child names containing U+2025 (\xE2\x80\xA5) are runtime system keys
-           (e.g. status, pc); hide from List to match the durable backend. */
-        if (strstr(children.keys[i], "\xE2\x80\xA5")) {
-            free(children.keys[i]);
-            continue;
-        }
-        if (unique && same_child(children.keys[unique - 1], children.keys[i])) {
-            if (children.keys[i][strlen(children.keys[i]) - 1] == '/') {
-                free(children.keys[unique - 1]);
-                children.keys[unique - 1] = children.keys[i];
+        for (uint32_t b = 0; b < buckets; b++)
+            table[b] = -1;
+        for (int32_t i = 0; i < children.count; i++) {
+            const char *name = children.keys[i];
+            /* 系统项不进集合：`.` 开头的保留区与 U+2025 的运行期字段（status/pc）
+               对调用方不可见，隐藏规则与去重无关，所以放在建集合之前。 */
+            if ((strcmp(pfx, "/") == 0 && strcmp(name, ".kvspace-meta") == 0) ||
+                strstr(name, "\xE2\x80\xA5") != NULL) {
+                free(children.keys[i]);
                 continue;
             }
+            const size_t name_len = strlen(name);
+            /* 归一：去掉尾 `/`（目录形态与值形态同判）。名字非空由 art_scan 保证。 */
+            size_t base_len = name_len;
+            if (base_len && name[base_len - 1] == '/')
+                base_len--;
+            uint32_t hash = 2166136261u; /* FNV-1a */
+            for (size_t c = 0; c < base_len; c++)
+                hash = (hash ^ (unsigned char)name[c]) * 16777619u;
+            const uint32_t bucket = hash & (buckets - 1u);
+            int32_t twin = -1;
+            for (int32_t slot = table[bucket]; slot >= 0; slot = next[slot]) {
+                if (same_child(children.keys[slot], name)) {
+                    twin = slot;
+                    break;
+                }
+            }
+            if (twin >= 0) {
+                /* 同名：只留目录形态。目录形态到来时替换掉已收的值形态。 */
+                if (name[name_len - 1] == '/') {
+                    free(children.keys[twin]);
+                    children.keys[twin] = children.keys[i];
+                } else {
+                    free(children.keys[i]);
+                }
+                continue;
+            }
+            children.keys[keep] = children.keys[i];
+            next[keep] = table[bucket];
+            table[bucket] = keep;
+            keep++;
+        }
+        free(next);
+        free(table);
+        children.count = keep;
+        *on = children.keys;
+        *oc = children.count;
+        return 0;
+    }
+    /* count <= 1：没有可去重的对象，但仍要过滤系统项。 */
+    for (int32_t i = 0; i < children.count; i++) {
+        const char *name = children.keys[i];
+        const int hidden = (strcmp(pfx, "/") == 0 &&
+                            strcmp(name, ".kvspace-meta") == 0) ||
+                           strstr(name, "\xE2\x80\xA5") != NULL;
+        if (hidden) {
             free(children.keys[i]);
             continue;
         }
-        children.keys[unique++] = children.keys[i];
+        children.keys[keep++] = children.keys[i];
     }
-    children.count = unique;
+    children.count = keep;
     *on = children.keys;
     *oc = children.count;
     return 0;
@@ -3251,56 +3338,10 @@ int kvspaceShmListLen(kvspace_t *kv, const char *prefix, bool ex, int resolve,
     *out_count = count;
     return 0;
 }
-int kvspaceShmExtindex(kvspace_t *kv, const char *p, const char *ep,
-                       char *err, uint32_t err_cap) {
-    if (!kv || !p || !ep)
-        return -1;
-    /* Match durable ext_index: path and ext_path must be directory keys ('/' or U+00B7 suffix). */
-    if (bad_dir_prefix(p) || bad_dir_prefix(ep)) {
-        if (err && err_cap)
-            snprintf(err, err_cap,
-                     "kvspace: index must end with /: ExtIndex path=%s extpath=%s",
-                     p, ep);
-        return -1;
-    }
-    int32_t source_len = 0;
-    uint8_t *source = kvspaceShmGet(kv, ep, 0, &source_len);
-    if (!source || source_len <= 0) {
-        if (err && err_cap)
-            snprintf(err, err_cap, "ExtIndex target missing: %s", ep);
-        return -1;
-    }
-    /* source 类型在 ep 值 attr 区（明文事实源）；ext 句柄同样携带。 */
-    char lt[256];
-    const uint8_t *ltd = NULL;
-    uint16_t ltl = 0;
-    if (source_len >= (int32_t)KVSPACE_XVALUE_HEAD_LEN) {
-        kvspaceXvalueHead sh;
-        memcpy(&sh, source, sizeof sh);
-        /* 合法性只剩「head 自洽」：`TotalLen` 一并校验 padding 与总长。 */
-        if (kvspaceXvalueHeadTotalLen(&sh) != 0) {
-            const uint64_t stotal = kvspaceXvalueHeadTotalLen(&sh);
-            if (stotal != 0 && stotal <= (uint64_t)source_len)
-                ltl = kvspaceXvalueHeadLangtype(source, &ltd);
-        }
-    }
-    if (ltl > (uint16_t)(sizeof lt - 1))
-        ltl = (uint16_t)(sizeof lt - 1);
-    if (ltl)
-        memcpy(lt, ltd, ltl);
-    lt[ltl] = 0;
-    uint8_t *v = NULL;
-    uint64_t vl = 0;
-    int r = kvspaceXvalueHeadNewExt((const uint8_t *)ep, (uint32_t)strlen(ep),
-                                    lt, &v, &vl);
-    if (r == 0)
-        r = kvspaceShmSetValue(kv, p, v, (int32_t)vl);
-    free(v);
-    return r;
-}
-int kvspaceShmDelextindex(kvspace_t *kv, const char *p) {
-    return kvspaceShmDel(kv, p);
-}
+/* `kvspaceShmExtindex` / `kvspaceShmDelextindex` 已删除（TASK-082）。它们做的事是
+ * 「读 ep 的 langtype，再 `HeadNewExt` 造一条带 `@` 前缀的 wire 写进 p」——两步都在
+ * 造语言层的值，存储层不该干。生产路径本来也不用它们：`kvspace.h` 的 12 个存储符号
+ * 里没有 Extindex，只剩测试在调。挂载语义若恢复，应由上层用 Realloc 写好 wire 再落。 */
 
 /* ============ 存储层 ABI 原语（<kvspace/kvspace.h>） ============
  *
@@ -3826,10 +3867,24 @@ static int kvspace_fail(int status, char *err, uint32_t err_cap,
 }
 
 KVSPACE_PUBLIC void *kvspaceConnect(const char *dsn) {
+    /* 成功时把 errno 恢复成入口值：契约是「返回非 NULL 就不碰 errno」，否则内部
+     * 某次试探性调用留下的旧值会被上层误判成失败。 */
+    int entry_errno = errno;
     char path[1024];
-    if (kvspace_dsn_path(dsn, path, sizeof path) != 0)
+    if (kvspace_dsn_path(dsn, path, sizeof path) != 0) {
+        /* 失败必设 errno（见 kvspace.h）：调用方要能区分「scheme 不合法」与
+         * 「路径打不开」，这两者的修法完全不同。 */
+        errno = EINVAL;
         return NULL;
-    return (void *)kvspaceShmOpen(path, KVSPACE_SHM_DEFAULT_SIZE);
+    }
+    void *handle = (void *)kvspaceShmOpen(path, KVSPACE_SHM_DEFAULT_SIZE);
+    if (handle != NULL) {
+        errno = entry_errno;
+        return handle;
+    }
+    if (errno == 0)
+        errno = EIO;
+    return NULL;
 }
 
 KVSPACE_PUBLIC void kvspaceClose(void *handle) {

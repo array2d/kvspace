@@ -17,3 +17,6 @@ cli/smoke*
 
 # 工作文档（审计/规划/调查，不入库）
 workspace/
+
+# 构建目录（README 用 build / build-test；防止构建产物被提交）
+/build*/

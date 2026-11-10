@@ -4,7 +4,7 @@
 #include <string.h>
 
 /* 存储层的字节读写：只认 head 布局与 attr 记录，不解释任何 tag 的语义。
-   构造器（写 langtype）在 kvlang_xvalue.c。 */
+   构造器（写 langtype）在 kvlang 仓的 `src/xvalue.c`，不在本仓。 */
 
 #define KVSPACE_XVALUE_ATTR_TAG_RETIRED_REALLEN 2u
 

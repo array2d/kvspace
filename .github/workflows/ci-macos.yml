@@ -5,10 +5,12 @@ jobs:
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
-      - name: 构建依赖 blockmalloc / slotsboxmalloc / kvspace-c（macOS 无预编译 ABI，源码装 /usr/local）
+      # 两个 header-only 依赖仍要从源码装（macOS 无预编译 ABI）。
+      # **kvspace-c 不再装**：它的 shm 引擎已并入本仓 src/shm，本仓自己就是标准实现。
+      - name: 构建依赖 blockmalloc / slotsboxmalloc（macOS 无预编译 ABI，源码装 /usr/local）
         run: |
           set -euo pipefail
-          for repo in blockmalloc slotsboxmalloc kvspace-c; do
+          for repo in blockmalloc slotsboxmalloc; do
             git clone --depth 1 "https://github.com/array2d/$repo.git" "/tmp/$repo"
             cmake -S "/tmp/$repo" -B "/tmp/$repo/build" \
               -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/usr/local
@@ -17,11 +19,22 @@ jobs:
           done
       - name: 构建
         run: |
-          cmake -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/usr/local
-          cmake --build build
+          cmake -B build -DCMAKE_BUILD_TYPE=Release \
+                -DBUILD_TESTING=ON -DCMAKE_INSTALL_PREFIX=/usr/local
+          cmake --build build -j
+      - name: 单元测试
+        run: ctest --test-dir build --output-on-failure
+      # ctest 找不到测试时退出码为 0，与「全过」不可区分，故断言测试数 > 0。
+      - name: 断言测试数非零
+        run: |
+          n=$(ctest --test-dir build -N | grep -cE "^ *Test +#")
+          echo "ctest 发现 $n 个测试"
+          test "$n" -gt 0
       - name: 安装（验证安装规则）
         run: sudo cmake --install build
-      - name: 后端装载冒烟（frontend 的 dlopen 真能加载后端）
+      # 单库后没有 dlopen：直接链 libkvspace 调 connect 即可，不需要
+      # DYLD_FALLBACK_LIBRARY_PATH 去「找后端」——根本没有后端可找。
+      - name: 连通性冒烟（单库直调，无 dlopen）
         run: |
           cat > /tmp/conn.c <<'EOF'
           #include <kvspace/kvspace.h>
@@ -34,5 +47,6 @@ jobs:
           }
           EOF
           cc /tmp/conn.c -o /tmp/conn -I/usr/local/include -L/usr/local/lib/kvspace -lkvspace
-          # libkvspace 在 /usr/local/lib/kvspace；后端依赖 libblockmalloc 在 /usr/local/lib
           DYLD_FALLBACK_LIBRARY_PATH=/usr/local/lib:/usr/local/lib/kvspace /tmp/conn
+      # tutorial-c / py / rust 已迁往 kvlang 仓（TASK-085）：它们用 wire 构造器，
+      # 属语言层。本仓 CI 只验存储层。

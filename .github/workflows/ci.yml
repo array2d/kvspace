@@ -5,7 +5,38 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          submodules: false
+      # kvspace 的 shm 引擎依赖两个 header-only 库（blockmalloc、
+      # slotsboxmalloc）。它们不在包里，必须先从 release 拉头装到 /usr/include，
+      # 否则编译期直接找不到 <blockmalloc/blockmalloc.h>。
+      - name: 下载 ABI 依赖
+        env: { GH_TOKEN: "${{ secrets.GITHUB_TOKEN }}" }
+        run: ./ci/deps.sh
+      # 测试必须显式开：BUILD_TESTING 默认 OFF，`ctest` 在没编译测试时会
+      # 输出 "No tests were found" 且**退出码为 0**——那是假绿。
+      # 本仓**不依赖 kvlang**：测试造值用 tests/shm/test_wire.h 里的本地 inline，
+      # 不链 libkvlang_xvalue.a。方向是语言层依赖存储层，反过来不行。
       - name: 构建
-        run: cmake -B build && cmake --build build
-      - name: Run unit tests
+        run: cmake -B build -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=ON
+      - name: 构建产物
+        run: cmake --build build -j"$(nproc)"
+      - name: 单元测试
         run: ctest --test-dir build --output-on-failure
+      # ctest 找不到测试时退出码是 0，与「全过」不可区分，故断言测试数 > 0。
+      - name: 断言测试数非零
+        run: |
+          n=$(ctest --test-dir build -N | grep -cE "^ *Test +#")
+          echo "ctest 发现 $n 个测试"
+          test "$n" -gt 0
+      # tutorial-c / py / rust 已迁往 kvlang 仓（TASK-085）：它们是语言层示例，
+      # 要用 wire 构造器与 langtype 访问器。留在本仓就等于 kvspace 依赖 kvlang，
+      # 方向反了。本仓 CI 只验存储层：生产+测试构建、ctest、CLI smoke。
+      - name: CLI smoke
+        run: |
+          set -euo pipefail
+          d=$(mktemp -d)
+          export KVSPACE="shm://$d/smoke.shm"
+          ./cli/target/release/kvspace mkindex /d/
+          ./cli/target/release/kvspace list /
+          ./cli/target/release/kvspace tree /
