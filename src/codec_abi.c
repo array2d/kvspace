@@ -19,7 +19,7 @@ static int finish(uint8_t *value, uint64_t len, uint8_t **out, uint32_t *out_len
     return 0;
 }
 
-int kvspaceNewPtr(const char *target_kindexpr, const char *target,
+KVSPACE_PUBLIC int kvspaceNewPtr(const char *target_kindexpr, const char *target,
                   uint8_t **out, uint32_t *out_len) {
     if (!target_kindexpr || !target || !out || !out_len)
         return 1;
@@ -39,7 +39,7 @@ int kvspaceNewPtr(const char *target_kindexpr, const char *target,
     return finish(value, total, out, out_len);
 }
 
-int kvspaceNewChar(const uint8_t *bytes, uint32_t len, const char *langtype,
+KVSPACE_PUBLIC int kvspaceNewChar(const uint8_t *bytes, uint32_t len, const char *langtype,
                    uint8_t **out, uint32_t *out_len) {
     if (!out || !out_len || (len && !bytes))
         return 1;
@@ -50,7 +50,7 @@ int kvspaceNewChar(const uint8_t *bytes, uint32_t len, const char *langtype,
     return finish(value, total, out, out_len);
 }
 
-int kvspaceNewBool(uint8_t v, const char *langtype,
+KVSPACE_PUBLIC int kvspaceNewBool(uint8_t v, const char *langtype,
                    uint8_t **out, uint32_t *out_len) {
     if (!out || !out_len)
         return 1;
@@ -62,7 +62,7 @@ int kvspaceNewBool(uint8_t v, const char *langtype,
     return finish(value, total, out, out_len);
 }
 
-int kvspaceNewInt64(int64_t v, const char *langtype,
+KVSPACE_PUBLIC int kvspaceNewInt64(int64_t v, const char *langtype,
                     uint8_t **out, uint32_t *out_len) {
     if (!out || !out_len)
         return 1;
@@ -76,7 +76,7 @@ int kvspaceNewInt64(int64_t v, const char *langtype,
     return finish(value, total, out, out_len);
 }
 
-int kvspaceNewFloat64(double v, const char *langtype,
+KVSPACE_PUBLIC int kvspaceNewFloat64(double v, const char *langtype,
                       uint8_t **out, uint32_t *out_len) {
     if (!out || !out_len)
         return 1;

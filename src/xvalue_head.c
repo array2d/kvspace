@@ -12,7 +12,7 @@ static int tag_is_writable(uint8_t tag) {
     return tag != KVSPACE_XVALUE_ATTR_TAG_RETIRED_REALLEN && tag != 0u;
 }
 
-int kvspaceXvalueGetAttr(const uint8_t *wire, uint64_t wire_len, uint8_t tag,
+KVSPACE_PUBLIC int kvspaceXvalueGetAttr(const uint8_t *wire, uint64_t wire_len, uint8_t tag,
                           const uint8_t **out_data, uint16_t *out_len) {
     if (out_data)
         *out_data = NULL;
@@ -55,7 +55,7 @@ int kvspaceXvalueGetAttr(const uint8_t *wire, uint64_t wire_len, uint8_t tag,
     return 0;
 }
 
-int kvspaceXvalueSetAttr(uint8_t *wire, uint64_t wire_capacity, uint8_t tag,
+KVSPACE_PUBLIC int kvspaceXvalueSetAttr(uint8_t *wire, uint64_t wire_capacity, uint8_t tag,
                           const uint8_t *data, uint16_t len,
                           uint64_t *out_new_length) {
     if (out_new_length)
@@ -132,7 +132,7 @@ int kvspaceXvalueSetAttr(uint8_t *wire, uint64_t wire_capacity, uint8_t tag,
 /* 有效长度 = bodylen；保留入口给调用方统一走 accessor。
    读之前必须确认整条 wire 自洽（padding 为零、总长不越界、attr 区无 tag 2），
    否则「长度」这个数字是从一条坏 wire 上读出来的，不该被采信。 */
-int kvspaceXvalueHeadEffectiveLen(const uint8_t *wire, uint64_t wire_len,
+KVSPACE_PUBLIC int kvspaceXvalueHeadEffectiveLen(const uint8_t *wire, uint64_t wire_len,
                                   uint64_t *out) {
     if (out)
         *out = 0;

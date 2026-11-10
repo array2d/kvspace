@@ -104,6 +104,33 @@ int kvspaceXvalueHeadNewCode(const uint8_t *body, uint64_t body_len,
 int kvspaceXvalueHeadReserve(uint64_t body_len, const char *langtype,
                              uint8_t **out, uint64_t *out_len);
 
+/* ── 便利构造器（codec_abi.c）─────────────────────────────────────────
+ * 与上面的 `kvspaceXvalueHeadNew*` 是**两条路**：上面那条接受任意 langtype 串，
+ * 这条接受强类型实参（int64/double/bool/字节串）并自己拼 langtype。
+ * 两者产出的 wire 必须逐字节相同——差异只在调用姿势。
+ *
+ * 曾经它们只在实现里导出、头里没有声明：调用方靠隐式声明调，参数类型全靠
+ * 自己记，错了不会编译报错。`-Werror=implicit-function-declaration` 抓到的
+ * 正是这个缺口。 */
+int kvspaceNewPtr(const char *target_kindexpr, const char *target,
+                  uint8_t **out, uint32_t *out_len);
+int kvspaceNewChar(const uint8_t *bytes, uint32_t len, const char *langtype,
+                   uint8_t **out, uint32_t *out_len);
+int kvspaceNewBool(uint8_t v, const char *langtype, uint8_t **out,
+                   uint32_t *out_len);
+int kvspaceNewInt64(int64_t v, const char *langtype, uint8_t **out,
+                    uint32_t *out_len);
+int kvspaceNewFloat64(double v, const char *langtype, uint8_t **out,
+                      uint32_t *out_len);
+
+/* ── 坐标段工具（coord.c）─────────────────────────────────────────────
+ * `cmp_coord` 是「排序上移」后的共享比较器：存储层只给后端顺序的名字，
+ * 排序由上层做，而**只能有一份比较器**——runtimec/layout/CLI 各写一套就是
+ * 让同一排序在不同实现里漂移。这三个函数就是那一份。 */
+int kvspaceCoordIsCoord(const char *name);
+int kvspaceParseCoord(const char *name, int64_t *coords, int maxn);
+int kvspaceCoordCmp(const char *a, const char *b);
+
 #ifdef __cplusplus
 }
 #endif
