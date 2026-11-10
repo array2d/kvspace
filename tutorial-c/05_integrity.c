@@ -15,16 +15,14 @@
 #define MAX_VAL_SZ  1024
 
 static int check(void *kv, const char *key, int64_t expected, int round) {
-    uint32_t len; uint8_t *v = kv_get(kv, key, &len);
-    if (!v || len == 0) { printf("ROUND%d MISS  %s\n", round, key); return 0; }
-    char kind[32]; const uint8_t *body; uint32_t bl;
-    read_kind(v, len, kind, sizeof(kind), &body, &bl);
-    if (bl < 8 || strcmp(kind, "int64") != 0) {
-        printf("ROUND%d CORRUPT %s: bad kind=%s bl=%u\n", round, key, kind, bl);
-        free(v); return 0;
+    kv_value v; char kind[32];
+    if (kv_read(kv, key, &v) != 0) { printf("ROUND%d MISS  %s\n", round, key); return 0; }
+    kv_kind(&v, kind, sizeof kind);
+    if (v.body_len < 8 || strcmp(kind, "int64") != 0) {
+        printf("ROUND%d CORRUPT %s: bad kind=%s bl=%u\n", round, key, kind, v.body_len);
+        return 0;
     }
-    int64_t got = *(const int64_t *)body;
-    free(v);
+    int64_t got = *(const int64_t *)v.body;
     if (got != expected) {
         printf("ROUND%d MISMATCH %s: got=%ld expected=%ld\n", round, key, got, expected);
         return 0;
@@ -33,16 +31,14 @@ static int check(void *kv, const char *key, int64_t expected, int round) {
 }
 
 static int check_str(void *kv, const char *key, const char *expected, int round) {
-    uint32_t len; uint8_t *v = kv_get(kv, key, &len);
-    if (!v || len == 0) { printf("ROUND%d MISS  %s\n", round, key); return 0; }
-    char kind[32]; const uint8_t *body; uint32_t bl;
-    read_kind(v, len, kind, sizeof(kind), &body, &bl);
+    kv_value v; char kind[32];
+    if (kv_read(kv, key, &v) != 0) { printf("ROUND%d MISS  %s\n", round, key); return 0; }
+    kv_kind(&v, kind, sizeof kind);
     if (strcmp(kind, "char/utf8") != 0) {
-        printf("ROUND%d CORRUPT %s: bad kind\n", round, key); free(v); return 0;
+        printf("ROUND%d CORRUPT %s: bad kind\n", round, key); return 0;
     }
-    int ok = bl == strlen(expected) && memcmp(body, expected, bl) == 0;
-    free(v);
-    if (!ok) printf("ROUND%d MISMATCH %s: got=%.*s expected=%s\n", round, key, (int)bl, body, expected);
+    int ok = v.body_len == strlen(expected) && memcmp(v.body, expected, v.body_len) == 0;
+    if (!ok) printf("ROUND%d MISMATCH %s: got=%.*s expected=%s\n", round, key, (int)v.body_len, v.body, expected);
     return ok;
 }
 
@@ -52,7 +48,7 @@ int main(void) {
 
     void *kv = kv_open_shm(path);
     if (!kv) { printf("FAIL: open\n"); return 1; }
-    kvspaceMkindex(kv, "/it/", 0, NULL, 0);
+    kvspaceMkindex(kv, "/it/", NULL, 0);
 
     srand((unsigned)time(NULL));
     char keys[N_KEYS][64];
@@ -66,8 +62,7 @@ int main(void) {
     for (int i = 0; i < n_keys; i++) {
         snprintf(keys[i], sizeof(keys[i]), "/it/k%d", i);
         values[i] = ((int64_t)rand() << 32) | (int64_t)rand();
-        uint32_t len; uint8_t *v = new_int64(values[i], &len);
-        kv_set(kv, keys[i], "int64", v, len); free(v); n++;
+        kv_set_int(kv, keys[i], values[i]); n++;
     }
     printf("  wrote %d keys\n", n);
 
@@ -85,8 +80,7 @@ int main(void) {
         int idx = n + i;
         snprintf(keys[idx], sizeof(keys[idx]), "/it/new_k%d", i);
         values[idx] = (int64_t)i * 1000;
-        uint32_t len; uint8_t *v = new_int64(values[idx], &len);
-        kv_set(kv, keys[idx], "int64", v, len); free(v);
+        kv_set_int(kv, keys[idx], values[idx]);
     }
     n += del_count;
 
@@ -99,8 +93,7 @@ int main(void) {
         int i = rand() % n;
         if (!keys[i][0]) continue;
         values[i] = ((int64_t)rand() << 32) | (int64_t)rand();
-        uint32_t len; uint8_t *v = new_int64(values[i], &len);
-        kv_set(kv, keys[i], "int64", v, len); free(v);
+        kv_set_int(kv, keys[i], values[i]);
     }
     for (int i = 0; i < n; i++)
         if (keys[i][0] && !check(kv, keys[i], values[i], 3)) errors++;
@@ -110,8 +103,7 @@ int main(void) {
     for (int i = 0; i < 100; i++) {
         snprintf(keys[str_base + i], sizeof(keys[0]), "/it/s%d", i);
         snprintf(strvals[i], sizeof(strvals[0]), "val_%d_%d", i, rand() % 1000);
-        uint32_t len; uint8_t *v = new_str(strvals[i], &len);
-        kv_set(kv, keys[str_base + i], "char/utf8", v, len); free(v);
+        kv_set_str(kv, keys[str_base + i], strvals[i]);
     }
     for (int i = 0; i < 100; i++) {
         char k[64]; snprintf(k, sizeof(k), "/it/s%d", i);
@@ -123,26 +115,21 @@ int main(void) {
     for (int i = 0; i < 20; i++) {
         for (int j = 0; j < MAX_VAL_SZ; j++) big_vals[i][j] = (uint8_t)(rand() & 0xFF);
         char k[64]; snprintf(k, sizeof(k), "/it/big%d", i);
-        uint32_t len; uint8_t *v = new_bytes(big_vals[i], MAX_VAL_SZ, &len);
-        kv_set(kv, k, "", v, len); free(v);
+        kv_set_bytes(kv, k, big_vals[i], MAX_VAL_SZ, NULL);
     }
     for (int i = 0; i < 10; i++) {
         char k[64]; snprintf(k, sizeof(k), "/it/big%d", i);
         kv_del(kv, k);
         snprintf(k, sizeof(k), "/it/reuse%d", i);
-        uint32_t len; uint8_t *v = new_int64((int64_t)i, &len);
-        kv_set(kv, k, "int64", v, len); free(v);
+        kv_set_int(kv, k, (int64_t)i);
     }
     for (int i = 10; i < 20; i++) {
         char k[64]; snprintf(k, sizeof(k), "/it/big%d", i);
-        uint32_t len; uint8_t *v = kv_get(kv, k, &len);
-        if (!v || len == 0) { printf("ROUND5 MISS  big%d\n", i); errors++; continue; }
-        char kind[32]; const uint8_t *body; uint32_t bl;
-        read_kind(v, len, kind, sizeof(kind), &body, &bl);
-        if (bl != MAX_VAL_SZ || memcmp(body, big_vals[i], MAX_VAL_SZ) != 0) {
+        kv_value v;
+        if (kv_read(kv, k, &v) != 0) { printf("ROUND5 MISS  big%d\n", i); errors++; continue; }
+        if (v.body_len != MAX_VAL_SZ || memcmp(v.body, big_vals[i], MAX_VAL_SZ) != 0) {
             printf("ROUND5 CORRUPT big%d\n", i); errors++;
         }
-        free(v);
     }
     for (int i = 0; i < 10; i++) {
         char k[64]; snprintf(k, sizeof(k), "/it/reuse%d", i);

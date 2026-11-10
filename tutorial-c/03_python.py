@@ -22,7 +22,7 @@ KVSPACE_XVALUE_ATTR_TAG_LANGTYPE = 1
 def xvalue_head_scan(wire):
     """扫描 16 字节 head + attr 区，返回 langtype_bytes（无记录/坏 wire → b""）。
 
-    与 C 的 `kvspaceXvalueHeadScan` 同语义；Python 侧没有 inline 头可用，
+    与 C 的 `kvspaceXvalueGetAttr` 同语义；Python 侧没有 inline 头可用，
     这里按线格式直接解，**不复制 C 的结构体字段**（那是第二份字段真相）。
     wire: [bodylen:u64][attrslen:u16][padding:6][body][attrs]
     """
@@ -63,60 +63,32 @@ def bind(fn, args, restype):
 
 bind(lib.kvspaceConnect, [ctypes.c_char_p], ctypes.c_void_p)
 bind(lib.kvspaceClose, [ctypes.c_void_p], None)
-# 借用读：out 指向 kvspace 常驻空间，string_at 拷出后不 free。resolve 穿透 link。
-bind(lib.kvspaceGet, [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_int, ctypes.POINTER(U8P), U32P], ctypes.c_int)
-# 写即构造：就地/新位置二选一原语，往返回的 body 偏移指针写字节。
-bind(lib.kvspaceWriteInPlace, [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_int, ctypes.c_uint32, ctypes.POINTER(U8P), ctypes.c_char_p, ctypes.c_uint32], ctypes.c_int)
-# Signature matches kvspace.h: (h, key, ref, storetype, body_len, body_cap, langtype, body, err, err_cap).
-bind(lib.kvspaceWriteNewPlace, [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_uint8, ctypes.c_uint8,
-                                ctypes.c_uint32, ctypes.c_uint64, ctypes.c_char_p,
-                                ctypes.POINTER(U8P), ctypes.c_char_p, ctypes.c_uint32], ctypes.c_int)
-# 前缀枚举：ListLen 定计数 + 逐 idx ListAt 借用取名。
-bind(lib.kvspaceListLen, [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_int, ctypes.c_int, ctypes.POINTER(ctypes.c_int32)], ctypes.c_int)
-bind(lib.kvspaceListAt, [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_int, ctypes.c_int, ctypes.c_int32,
-                         U8P, ctypes.c_uint32, U32P], ctypes.c_int)
-bind(lib.kvspaceDel, [ctypes.c_void_p, CCHARPP, ctypes.c_uint32, ctypes.c_char_p, ctypes.c_uint32], ctypes.c_int)
-bind(lib.kvspaceDelTree, [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_char_p, ctypes.c_uint32], ctypes.c_int)
-bind(lib.kvspaceMkindex, [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_uint32, ctypes.c_char_p, ctypes.c_uint32], ctypes.c_int)
-# New*: langtype is stored in inline attr (empty/None = untyped).
-bind(lib.kvspaceNewInt64, [ctypes.c_int64, ctypes.c_char_p, ctypes.POINTER(U8P), U32P], ctypes.c_int)
-bind(lib.kvspaceNewChar, [U8P, ctypes.c_uint32, ctypes.c_char_p, ctypes.POINTER(U8P), U32P], ctypes.c_int)
-bind(lib.free, [ctypes.c_void_p], None)
+# 新 ABI 三个动作：resolve 拿 offset / realloc 拿写入位置 / listlen+list 枚举目录。
+bind(lib.kvspaceResolve, [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_uint64,
+                          U64P, ctypes.c_char_p, ctypes.c_uint32], ctypes.c_int)
+bind(lib.kvspaceRealloc, [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_uint64,
+                          ctypes.c_uint64, U64P, ctypes.c_char_p,
+                          ctypes.c_uint32], ctypes.c_int)
+bind(lib.kvspaceFree, [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_char_p,
+                       ctypes.c_uint32], ctypes.c_int)
+bind(lib.kvspaceDeltree, [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_char_p,
+                          ctypes.c_uint32], ctypes.c_int)
+bind(lib.kvspaceMkindex, [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_char_p,
+                          ctypes.c_uint32], ctypes.c_int)
+bind(lib.kvspaceListlen, [ctypes.c_void_p, ctypes.c_char_p,
+                          ctypes.POINTER(ctypes.c_int64), U32P,
+                          ctypes.c_char_p, ctypes.c_uint32], ctypes.c_int)
+bind(lib.kvspaceList, [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_char_p,
+                       ctypes.c_uint32, U32P, U32P, U64P, ctypes.c_char_p,
+                       ctypes.c_uint32], ctypes.c_int)
+# 值区基址：offset 只有加上它才是地址。
+bind(lib.kvspaceXvalueInProcessAddress, [ctypes.c_void_p], U8P)
+
+ERR = ctypes.create_string_buffer(256)
 
 
-def enc_int(v):
-    out, n = U8P(), ctypes.c_uint32()
-    if lib.kvspaceNewInt64(v, b"int64", ctypes.byref(out), ctypes.byref(n)) != 0:
-        raise RuntimeError("kvspaceNewInt64 failed")
-    data = ctypes.string_at(out, n.value)
-    lib.free(out)  # allocated by frontend malloc
-    return data
-
-
-def new_str(s):
-    b = s.encode()
-    buf = (ctypes.c_uint8 * len(b)).from_buffer_copy(b)
-    out, n = U8P(), ctypes.c_uint32()
-    if lib.kvspaceNewChar(buf, len(b), b"char/utf8", ctypes.byref(out), ctypes.byref(n)) != 0:
-        raise RuntimeError("kvspaceNewChar failed")
-    data = ctypes.string_at(out, n.value)
-    lib.free(out)  # allocated by frontend malloc
-    return data
-
-
-# kind 与 body 长度都从**同一条 wire**解出（`kvspaceGet` 的返回值），
-# 不再调已删除的 kvspaceGetHead，也不维护第二份 head 结构体。
-def read_kind(kv, key, data):
-    if not data:
-        return "", b""
-    langtype = xvalue_head_scan(data)
-    kx = langtype.split(b"\0", 1)[0].decode()
-    if kx.startswith(("*", "@")):
-        kx = kx[1:]
-    if kx.startswith("["):
-        kx = kx[kx.index("]") + 1:]
-    bl = xvalue_head_effective_len(data) or 0
-    return kx, data[KVSPACE_XVALUE_HEAD_LEN:KVSPACE_XVALUE_HEAD_LEN + bl]
+def err_text(buf):
+    return buf.value.decode(errors="replace")
 
 
 class KV:
@@ -129,6 +101,9 @@ class KV:
         self.kv = lib.kvspaceConnect(f"shm://{path}".encode())
         if not self.kv:
             raise RuntimeError(f"connect shm://{path} failed")
+        self.base = lib.kvspaceXvalueInProcessAddress(self.kv)
+        if not self.base:
+            raise RuntimeError("no in-process address space (shm backend expected)")
 
     def close(self):
         lib.kvspaceClose(self.kv)
@@ -143,68 +118,108 @@ class KV:
     def __exit__(self, *a):
         self.close()
 
-    # Write into returned body pointer; WriteNewPlace writes langtype with the header/attr region.
-    def set(self, key, langtype, val):
-        if len(val) < KVSPACE_XVALUE_HEAD_LEN:
-            return
-        bl = xvalue_head_effective_len(val)
-        if bl is None:
-            raise RuntimeError(f"write {key}: value head is not well-formed")
-        # ref 由 langtype 的 * / @ 前缀隐含，不再从 head 位取。
-        ref = 1 if langtype.startswith("*") else (2 if langtype.startswith("@") else 0)
-        buf = (ctypes.c_uint8 * len(val)).from_buffer_copy(val)
-        dst = U8P()
+    def _addr(self, offset):
+        # 必须是 base.contents 而不是 base：base 本身是「指向基址的指针变量」，
+        # byref(base, off) 偏移的是那个指针变量的地址（栈上），不是它指向的值区。
+        # 这个错法不会崩在所有平台上——偏移小的时候恰好落进可读写区，读出来是
+        # 垃圾；偏移大就直接段错。用 .contents 才是「基址 + offset」。
+        return ctypes.byref(self.base.contents, offset)
+
+    def set(self, key, langtype, body):
+        """realloc 出 body+attr 空间，再直接写 base+offset。"""
+        lt = langtype.encode() if langtype else b""
+        attr_len = 3 + len(lt) if lt else 0
+        off = ctypes.c_uint64()
         err = ctypes.create_string_buffer(256)
-        if lib.kvspaceWriteInPlace(self.kv, key.encode(), 1, bl, ctypes.byref(dst), err, 256) != 0:
-            if lib.kvspaceWriteNewPlace(self.kv, key.encode(), ref, 0,
-                                        bl, bl, langtype.encode(), ctypes.byref(dst), err, 256) != 0:
-                raise RuntimeError(f"write {key}: {err.value.decode(errors='replace')}")
-        if bl > 0 and dst:
-            ctypes.memmove(dst, ctypes.byref(buf, KVSPACE_XVALUE_HEAD_LEN), bl)
+        rc = lib.kvspaceRealloc(self.kv, key.encode(), len(body), attr_len,
+                                ctypes.byref(off), err, 256)
+        if rc != 0:
+            raise RuntimeError(f"realloc {key}: {err_text(err)}")
+        if body:
+            ctypes.memmove(self._addr(off.value + KVSPACE_XVALUE_HEAD_LEN),
+                           body, len(body))
+        if lt:
+            a = off.value + KVSPACE_XVALUE_HEAD_LEN + len(body)
+            ctypes.memmove(self._addr(a), bytes([KVSPACE_XVALUE_ATTR_TAG_LANGTYPE,
+                                                 len(lt) & 0xFF, len(lt) >> 8]), 3)
+            ctypes.memmove(self._addr(a + 3), lt, len(lt))
 
     def get(self, key):
-        out, n = U8P(), ctypes.c_uint32()
-        lib.kvspaceGet(self.kv, key.encode(), 0, ctypes.byref(out), ctypes.byref(n))
-        if not out or n.value == 0:
+        """resolve 拿 offset，在 base+offset 处解 head/body/attr。
+
+        返回 (kind, body)；不存在或 wire 不合法返回 None。"""
+        off = ctypes.c_uint64()
+        err = ctypes.create_string_buffer(256)
+        rc = lib.kvspaceResolve(self.kv, key.encode(), 0, ctypes.byref(off),
+                                err, 256)
+        if rc != 0:
             return None
-        return ctypes.string_at(out, n.value)
+        wire = ctypes.string_at(self._addr(off.value),
+                                KVSPACE_XVALUE_HEAD_LEN)
+        attrs_len = int.from_bytes(wire[8:10], "little")
+        body_len = int.from_bytes(wire[0:8], "little")
+        total = KVSPACE_XVALUE_HEAD_LEN + body_len + attrs_len
+        full = ctypes.string_at(self._addr(off.value), total)
+        langtype = xvalue_head_scan(full)
+        kind = langtype.decode(errors="replace")
+        if kind[:1] in ("*", "@"):
+            kind = kind[1:]
+        if kind.startswith("["):
+            kind = kind[kind.index("]") + 1:]
+        body = full[KVSPACE_XVALUE_HEAD_LEN:KVSPACE_XVALUE_HEAD_LEN + body_len]
+        return kind, body
 
     def delete(self, key):
-        keys = (ctypes.c_char_p * 1)(key.encode())
-        lib.kvspaceDel(self.kv, keys, 1, None, 0)
+        err = ctypes.create_string_buffer(256)
+        lib.kvspaceFree(self.kv, key.encode(), err, 256)
 
     def deltree(self, prefix):
-        lib.kvspaceDelTree(self.kv, prefix.encode(), None, 0)
+        err = ctypes.create_string_buffer(256)
+        lib.kvspaceDeltree(self.kv, prefix.encode(), err, 256)
 
     def mkindex(self, path):
-        lib.kvspaceMkindex(self.kv, path.encode(), 0, None, 0)
+        err = ctypes.create_string_buffer(256)
+        lib.kvspaceMkindex(self.kv, path.encode(), err, 256)
 
     def list(self, prefix):
-        count = ctypes.c_int32()
-        if lib.kvspaceListLen(self.kv, prefix.encode(), 0, 1, ctypes.byref(count)) != 0 or count.value <= 0:
+        """listlen 给 N/M，list 一次取全部名字（NUL 分隔）。"""
+        count = ctypes.c_int64()
+        max_name = ctypes.c_uint32()
+        err = ctypes.create_string_buffer(256)
+        rc = lib.kvspaceListlen(self.kv, prefix.encode(), ctypes.byref(count),
+                                ctypes.byref(max_name), err, 256)
+        if rc != 0 or count.value <= 0:
+            return []
+        cap = count.value * (max_name.value + 1)
+        buf = ctypes.create_string_buffer(cap)
+        length = ctypes.c_uint32()
+        listed = ctypes.c_uint32()
+        gen = ctypes.c_uint64()
+        rc = lib.kvspaceList(self.kv, prefix.encode(), buf, cap,
+                             ctypes.byref(length), ctypes.byref(listed),
+                             ctypes.byref(gen), err, 256)
+        if rc != 0:
             return []
         names = []
-        for i in range(count.value):
-            out = (ctypes.c_uint8 * 1024)()
-            n = ctypes.c_uint32()
-            if lib.kvspaceListAt(self.kv, prefix.encode(), 0, 1, i, out, 1024, ctypes.byref(n)) == 0 and n.value > 0:
-                names.append(ctypes.string_at(out, n.value).decode())
+        for name in buf.raw[:length.value].split(b"\0"):
+            if name:
+                names.append(name.decode())
         return names
 
 
 with KV("/tmp/kvspace_py.shm") as kv:
     kv.mkindex("/py/")
 
-    kv.set("/py/a", "int64", enc_int(42))
-    kv.set("/py/b", "char/utf8", new_str("你好"))
+    kv.set("/py/a", "int64", struct.pack("<q", 42))
+    kv.set("/py/b", "char/utf8", "你好".encode())
 
     for k in ["/py/a", "/py/b"]:
-        kind, raw = read_kind(kv.kv, k, kv.get(k))
-        if kind == "int64":
-            val = struct.unpack("<q", raw)[0]
-        else:
-            val = raw.decode()
-        print(f"{k}\t{kind}:{val}")
+        got = kv.get(k)
+        if got is None:
+            print(f"{k}\t(nil)")
+            continue
+        kind, raw = got
+        print(f"{k}\t{kind}:{raw.decode() if kind != 'int64' else struct.unpack('<q', raw)[0]}")
 
     ns = kv.list("/py/")
     print(f"list /py/: {sorted(ns)} (count={len(ns)})")

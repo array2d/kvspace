@@ -8,8 +8,10 @@
  */
 
 extern "C" {
-    #include "kvspace/kvspace.h"
-    #include <kvspace/xvalue_head.h>
+    #include <kvspace/kvspace.h>
+    #include <kvspace/kvspace_xvalue.h>
+    #include <kvspace/kvlang_xvalue.h>
+#include <kvspace/kvlang_xvalue.h>
 }
 
 #include <cstdio>
@@ -32,70 +34,80 @@ struct KV {
     }
     ~KV() { kvspaceClose(kv); ::unlink(path.c_str()); }
 
-    // Write into returned body pointer; WriteNewPlace writes langtype with the header/attr region.
-    // 有效长度 = bodylen（head 里没有 layout，也没有 tag 2）；`ref` 由 langtype 的
-    // `*`/`@` 前缀隐含，调用方不再单独给 head 位。
-    void set(const char *key, const char *langtype, const uint8_t *val, uint32_t len) {
-        if (!val || len < KVSPACE_XVALUE_HEAD_LEN) return;
-        uint64_t effective = 0;
-        if (kvspaceXvalueHeadEffectiveLen(val, len, &effective) != 0) return;
-        if (effective > UINT32_MAX) return;
-        const uint32_t bl = (uint32_t)effective;
-        const uint8_t ref = (langtype[0] == '*')   ? 1U
-                          : (langtype[0] == '@')   ? 2U
-                                                   : 0U;
-        uint8_t *dst = nullptr; char err[256];
-        if (kvspaceWriteInPlace(kv, key, 1, bl, &dst, err, sizeof(err)) != 0)
-            kvspaceWriteNewPlace(kv, key, ref, 0U, bl, bl, langtype, &dst, err,
-                                 sizeof(err));
-        if (bl && dst) memcpy(dst, val + KVSPACE_XVALUE_HEAD_LEN, (size_t)bl);
+    // 写入：realloc 出 body+attr 空间，再直接写 base+offset。
+    void set(const char *key, const char *langtype, const uint8_t *body, uint32_t len) {
+        const uint16_t lt_len = (langtype && langtype[0]) ? (uint16_t)strlen(langtype) : 0;
+        const uint64_t attr_len = lt_len ? 3ull + lt_len : 0ull;
+        uint64_t offset = 0; char err[256];
+        if (kvspaceRealloc(kv, key, len, attr_len, &offset, err, sizeof(err)) != KVSPACE_OK)
+            throw std::runtime_error(std::string("set ") + key + ": " + err);
+        uint8_t *base = kvspaceXvalueInProcessAddress(kv);
+        if (!base) throw std::runtime_error("no in-process address space");
+        uint8_t *wire = base + offset;
+        if (len && body) memcpy(wire + KVSPACE_XVALUE_HEAD_LEN, body, len);
+        if (lt_len) {
+            uint8_t *a = wire + KVSPACE_XVALUE_HEAD_LEN + len;
+            a[0] = KVSPACE_XVALUE_ATTR_TAG_LANGTYPE;
+            a[1] = (uint8_t)lt_len;
+            a[2] = (uint8_t)(lt_len >> 8);
+            memcpy(a + 3, langtype, lt_len);
+        }
     }
-    // Borrowed read: kind 与 body 长度都从**同一条 wire**解出，不经第二套头结构。
-    // `kvspaceGet` 拿整条 wire；`xvalue_head.h` 的 inline 访问器读它。
+    // 读：resolve 拿 offset，在 base+offset 处解 head/body/attr。
     bool get(const char *key, std::string &kind, std::string &raw) {
-        uint8_t *out = nullptr; uint32_t len = 0;
-        kvspaceGet(kv, key, 0, &out, &len);
-        if (!out || len < KVSPACE_XVALUE_HEAD_LEN) return false;
+        uint64_t offset = 0; char err[256];
+        if (kvspaceResolve(kv, key, 0, &offset, err, sizeof(err)) != KVSPACE_OK)
+            return false;
+        const uint8_t *base = kvspaceXvalueInProcessAddress(kv);
+        if (!base) return false;
+        const uint8_t *wire = base + offset;
+        const auto *h = reinterpret_cast<const kvspaceXvalueHead *>(wire);
+        const uint64_t total = kvspaceXvalueHeadTotalLen(h);
+        if (total == 0) return false;
         const uint8_t *lt = nullptr;
-        uint16_t lt_len = 0;
-        uint64_t effective = 0;
-        if (kvspaceXvalueHeadScan(out, len, &lt, &lt_len) != 0) return false;
-        if (kvspaceXvalueHeadEffectiveLen(out, len, &effective) != 0) return false;
-        const char *k = (const char *)(const void *)lt;
+        /* 返回字节数；0 表示没有 langtype。早先这里把返回值丢掉了，lt_len 一直
+         * 是 0，于是 kind 永远为空——「取到了却不用」比取不到更难察觉。 */
+        const uint16_t lt_len = kvspaceXvalueHeadLangtypeBounded(wire, total, &lt);
+        if (lt_len == 0 || lt == nullptr) return false;
+        const char *k = reinterpret_cast<const char *>(lt);
         uint16_t k_len = lt_len;
         if (k != nullptr && k_len != 0) {
             // 去掉 `*`/`@` 前缀与 `[dims]` 形状段，只留基种类。
             if (k[0] == '*' || k[0] == '@') { k++; k_len--; }
             if (k_len != 0 && k[0] == '[') {
-                const char *close = (const char *)memchr(k, ']', k_len);
+                const char *close = static_cast<const char *>(memchr(k, ']', k_len));
                 if (close != nullptr) {
-                    const size_t skip = (size_t)(close - k) + 1U;
+                    const size_t skip = static_cast<size_t>(close - k) + 1U;
                     k += skip;
-                    k_len = (uint16_t)(k_len - skip);
+                    k_len = static_cast<uint16_t>(k_len - skip);
                 }
             }
         }
         kind.assign(k != nullptr ? k : "", k_len);
-        if (effective > len - KVSPACE_XVALUE_HEAD_LEN) return false;
-        raw.assign((const char *)(out + KVSPACE_XVALUE_HEAD_LEN),
-                   (size_t)effective);
+        raw.assign(reinterpret_cast<const char *>(wire + KVSPACE_XVALUE_HEAD_LEN),
+                   static_cast<size_t>(kvspaceXvalueHeadLen(h)));
         return true;
     }
-    void del(const char *key) {
-        const char *keys[1] = { key };
-        kvspaceDel(kv, keys, 1, nullptr, 0);
-    }
-    void deltree(const char *p) { kvspaceDelTree(kv, p, nullptr, 0); }
-    void mkindex(const char *p) { kvspaceMkindex(kv, p, 0, nullptr, 0); }
-    // 前缀枚举：ListLen 定计数 + 逐 idx ListAt 取名（自备缓冲，读出即拷入 vector）。
+    void del(const char *key) { char err[256]; kvspaceFree(kv, key, err, sizeof(err)); }
+    void deltree(const char *p) { char err[256]; kvspaceDeltree(kv, p, err, sizeof(err)); }
+    void mkindex(const char *p) { kvspaceMkindex(kv, p, nullptr, 0); }
+    // 目录：listlen 给出 N/M，list 一次取全部名字（NUL 分隔），拷入 vector。
     std::vector<std::string> list(const char *prefix) {
         std::vector<std::string> r;
-        int32_t count = 0;
-        if (kvspaceListLen(kv, prefix, 0, 1, &count) != 0 || count <= 0) return r;
-        for (int32_t i = 0; i < count; i++) {
-            uint8_t nm[1024]; uint32_t nl = 0;
-            if (kvspaceListAt(kv, prefix, 0, 1, i, nm, sizeof(nm), &nl) == 0 && nl > 0)
-                r.push_back(std::string((const char *)nm, nl));
+        int64_t count = 0; uint32_t max_name = 0; char err[256];
+        if (kvspaceListlen(kv, prefix, &count, &max_name, err, sizeof(err)) != KVSPACE_OK ||
+            count <= 0)
+            return r;
+        std::vector<char> names(static_cast<size_t>(count) * (max_name + 1));
+        uint32_t length = 0, listed = 0; uint64_t generation = 0;
+        if (kvspaceList(kv, prefix, names.data(), static_cast<uint32_t>(names.size()),
+                        &length, &listed, &generation, err, sizeof(err)) != KVSPACE_OK)
+            return r;
+        for (uint32_t i = 0; i < length;) {
+            const char *name = names.data() + i;
+            const size_t n = strlen(name);
+            if (n) r.emplace_back(name, n);
+            i += static_cast<uint32_t>(n) + 1;
         }
         return r;
     }
@@ -103,12 +115,14 @@ struct KV {
 
 int main() {
     auto xv_int = [](int64_t v) {
-        uint8_t *b; uint32_t n; kvspaceNewInt64(v, "int64", &b, &n);
-        return std::pair<uint8_t *, uint32_t>{b, n};
+        uint8_t *b = static_cast<uint8_t *>(malloc(sizeof v));
+        memcpy(b, &v, sizeof v);
+        return std::pair<uint8_t *, uint32_t>{b, static_cast<uint32_t>(sizeof v)};
     };
     auto xv_str = [](const char *s) {
-        uint8_t *b; uint32_t n;
-        kvspaceNewChar((const uint8_t *)s, (uint32_t)strlen(s), "char/utf8", &b, &n);
+        const uint32_t n = static_cast<uint32_t>(strlen(s));
+        uint8_t *b = static_cast<uint8_t *>(malloc(n ? n : 1));
+        if (n) memcpy(b, s, n);
         return std::pair<uint8_t *, uint32_t>{b, n};
     };
 
