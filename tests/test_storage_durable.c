@@ -70,7 +70,7 @@ static void test_offsets_unsupported(void *kv) {
     CHECK(kvspaceXvalueInProcessAddress(kv) == NULL, "durable 的 kvspaceXvalueInProcessAddress 必须返回 NULL");
 
     clear_err();
-    CHECK(kvspaceResolve(kv, "/du/a", 0, &offset, err, sizeof err) ==
+    CHECK(kvspaceResolveOffset(kv, "/du/a", 0, &offset, err, sizeof err) ==
               KVSPACE_UNSUPPORTED,
           "durable 的 resolve 应返回 KVSPACE_UNSUPPORTED");
     CHECK(err[0] != '\0', "durable 的 resolve 拒绝时 err 不该为空");
@@ -357,7 +357,7 @@ int main(void) {
             kvspaceListlen(kv, "/__probe_never__/", &probe_count, &probe_max,
                            err, sizeof err);
         if (strstr(err, "has no new storage ABI") != NULL)
-            printf("探测: 闸拦下: kvspaceResolve/kvspaceXvalueInProcessAddress 均缺失\n");
+            printf("探测: 闸拦下: kvspaceResolveOffset/kvspaceXvalueInProcessAddress 均缺失\n");
         else
             printf("探测: 闸放行（后端已导出新 ABI 独有符号）\n");
         (void)probe_rc;

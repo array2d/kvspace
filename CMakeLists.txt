@@ -128,6 +128,18 @@ if(BUILD_TESTING)
         target_link_libraries(shm_${shm_name} PRIVATE kvspace)
         add_test(NAME shm_${shm_name} COMMAND shm_${shm_name})
     endforeach()
+
+    # 导出面链接测试：逐个引用全部 16 个导出符号，缺一个即链接失败。
+    #
+    # 为什么单独一条：头文件声明与 .so 导出**各说各话**时，编译期与运行期都不会报错
+    # ——`const.h` 曾声明 `kvspaceConst` 而实现/导出叫 `kvspaceConstStorage`，
+    # 用头文件写代码的人「能编过、一链接就找不到符号」，而当时 tests/cli 里零覆盖。
+    # 取地址是唯一在「不运行」的情况下就能挡住这类缺陷的形态：漏掉的符号没人调用，
+    # 运行期测试永远不会红。
+    add_executable(test_export_surface tests/test_export_surface.c)
+    target_include_directories(test_export_surface PRIVATE include)
+    target_link_libraries(test_export_surface PRIVATE kvspace)
+    add_test(NAME export_surface COMMAND test_export_surface)
 endif()
 
 # 前端 SONAME：libkvspace.so.1

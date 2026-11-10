@@ -4,12 +4,14 @@ KVSpace 的存储层实现：一个 `.so`，两个层次，互不越界。
 
 | 层 | 头 | 符号 |
 |---|---|---|
-| 存储 ABI | `kvspace.h` | 12 个：Connect / Close / XvalueInProcessAddress / Resolve / Realloc / Free / Cp / Mkindex / Deltree / Cpdir / Listlen / List |
+| 存储 ABI | `kvspace.h` | 12 个：Connect / Close / XvalueInProcessAddress / ResolveOffset / Realloc / Free / Cp / Mkindex / Deltree / Cpdir / Listlen / List |
 | 字节层 | `kvspace_xvalue.h` | 3 个：XvalueGetAttr / XvalueSetAttr / XvalueHeadEffectiveLen |
 | 存储常量 | `const.h` | 1 个：`kvspaceConstStorage` |
 
-**语言层不在这里**：langtype（tag 1）、wire 构造器、坐标段比较器、20 个 kind 常量
-都在 kvlang 仓的 `libkvlang_xvalue.a`（`include/kvlang/xvalue.h`、`const.h`）。
+**语言层不在这里**：langtype（tag 1）、wire 构造器、坐标段比较器、kind 常量
+都在 kvlang 仓的 `libkvlang_xvalue.a`（`include/kvlang/xvalue.h`、`kvlang/include/kvlang/const.h`）。
+**本仓不导出任何 kind 常量**——`const.h` 只有 6 个存储常量（两个分隔符、目录后缀、
+输入这两个错误串），语言层的 `KVLANG_KIND_*` 一个都不在这里。
 kvspace 是存储层，它不认识 langtype 这个词；把语言概念写进存储头，等于让存储层依赖
 语言层——那样的 kvspace 就不能被别的语言复用，也不能被独立替换。
 
