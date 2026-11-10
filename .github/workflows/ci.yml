@@ -35,6 +35,19 @@ jobs:
       - name: CLI smoke
         run: |
           set -euo pipefail
+          # **构建树不能依赖 RUNPATH。** CLI 的 rpath 是 `$ORIGIN/../lib`，那是为
+          # **安装后**的 `bin/` + `lib/` 布局准备的；构建树里它在
+          # `cli/target/release/`，`$ORIGIN/../lib` 指向 `cli/target/lib`。
+          #
+          # 那个目录现在不存在，所以症状是 `error while loading shared libraries`
+          # + exit 127。但**它存在时更坏**：本地实测过一次——那里躺着 11 月 6 日的
+          # 旧库，于是 CLI 加载成功、然后在符号解析阶段炸 `undefined symbol:
+          # kvspaceListlen`。同一个根因两种症状，后者更难查，因为「加载到了库」会
+          # 让人以为库是对的。
+          #
+          # 构建树里必须显式给库目录。这与「不依赖隐式布局」是同一条规矩：rpath 是
+          # 给安装产物的，不是给构建中间态的。
+          export LD_LIBRARY_PATH="$PWD/build"
           d=$(mktemp -d)
           export KVSPACE="shm://$d/smoke.shm"
           ./cli/target/release/kvspace mkindex /d/
