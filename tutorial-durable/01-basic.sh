@@ -1,22 +1,22 @@
 #!/bin/bash
-# expected:
-# === Set & Get ===
-# /t01/a	int64:42
-# === Set & List ===
-# a	int64	42
-# b	int64	7
-# c	char/utf8	hello
-# === Get bulk ===
-# /t01/a	int64:42
-# /t01/b	int64:7
-# /t01/c	char/utf8:hello
-# === Get nil ===
-# /t01/nonexist	(nil)
-# === Del ===
-# /t01/a	(nil)
-# b	int64	7
-# c	char/utf8	hello
-# /end
+           
+                   
+                 
+                    
+            
+           
+                   
+                  
+                 
+                
+                        
+                 
+                     
+             
+              
+           
+                   
+      
 
 set -e
 KV="${KVSPACE_BIN:-kvspace}"

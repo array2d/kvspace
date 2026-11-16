@@ -1,15 +1,15 @@
 #!/bin/bash
-# expected:
-# === get dir value and child ===
-# /ext/d	char/utf8:val
-# /ext/d/y	int64:2
-# /ext/k	int64:1
-# === tree shows extindex with dir+file ===
-# /ext/
-# ├── d/
-# │   └── y	2
-# └── k	1
-# /end
+           
+                                 
+                      
+                  
+                
+                                           
+       
+        
+             
+         
+      
 
 set -e
 KV="${KVSPACE_BIN:-kvspace}"
