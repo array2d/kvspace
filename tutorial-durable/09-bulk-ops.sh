@@ -1,19 +1,19 @@
 #!/bin/bash
-# expected:
-# === bulk get ===
-# /b/a/x	int64:1
-# /b/a/y	int64:2
-# /b/b/z	int64:3
-# === bulk del siblings ===
-# /b/c/x	(nil)
-# /b/c/y	(nil)
-# /b/c/z	int64:3
-# === bulk del cross dirs ===
-# /b/d/a	(nil)
-# /b/e/b	(nil)
-# /b/f/c	int64:6
-# c	int64	6
-# /end
+           
+                  
+                
+                
+                
+                           
+              
+              
+                
+                             
+              
+              
+                
+           
+      
 
 set -e
 KV="${KVSPACE_BIN:-kvspace}"

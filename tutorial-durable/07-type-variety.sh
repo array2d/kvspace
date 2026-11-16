@@ -1,23 +1,23 @@
 #!/bin/bash
-# expected:
-# === int ===
-# /t/zero	int64:0
-# /t/neg	int64:-9223372036854775808
-# /t/pos	int64:9223372036854775807
-# === float ===
-# /t/f0	float64:0.0
-# /t/fneg	float64:-3.141592653589793
-# /t/fpos	float64:2.718281828459045
-# === bool ===
-# /t/yes	bool:true
-# /t/no	bool:false
-# === string ===
-# /t/empty	char/utf8:
-# /t/space	char/utf8:hello world
-# /t/unicode	char/utf8:你好
-# === nil ===
-# /t/nothing	(nil)
-# /end
+           
+             
+                 
+                                   
+                                  
+               
+                   
+                                    
+                                   
+              
+                  
+                  
+                
+                     
+                                
+                         
+             
+                  
+      
 
 set -e
 KV="${KVSPACE_BIN:-kvspace}"

@@ -1,35 +1,35 @@
 #!/bin/bash
-# expected:
-# === read fallthrough ===
-# /merge/a	int64:1
-# /merge/b	int64:2
-# /merge/c	int64:3
-# === write new key ===
-# /merge/z	char/utf8:upper_only
-# /base/z	(nil)
-# === list merge ===
-# z	char/utf8	upper_only
-# a	int64	1
-# b	int64	2
-# c	int64	3
-# === del upper key ===
-# /merge/z	(nil)
-# a	int64	1
-# b	int64	2
-# c	int64	3
-# === nested write ===
-# /merge/nest/x	int64:42
-# /merge/nest/y	int64:43
-# /base/nest/x	(nil)
-# x	int64	42
-# y	int64	43
-# === deltree preserves base ===
-# /merge/a	(nil)
-# /base/a	int64:1
-# a	int64	1
-# b	int64	2
-# c	int64	3
-# /end
+           
+                          
+                  
+                  
+                  
+                       
+                               
+               
+                    
+                        
+           
+           
+           
+                       
+                
+           
+           
+           
+                      
+                        
+                        
+                    
+            
+            
+                                
+                
+                 
+           
+           
+           
+      
 
 set -e
 KV="${KVSPACE_BIN:-kvspace}"

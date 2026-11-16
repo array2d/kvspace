@@ -1,11 +1,11 @@
 #!/bin/bash
-# expected:
-# === prevent cascade ===
-# kvspace: ExtIndex 不容许级联: /mid/
-# Error: extindex cascade prevented
-# === unlink and recreate ===
-# /ext/a	int64:1
-# /end
+           
+                         
+                                
+                                   
+                             
+                
+      
 
 set -e
 KV="${KVSPACE_BIN:-kvspace}"

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
+                       
 """Run tutorial-durable/*.sh and compare against expected header comments;
 and verify write flush on next op and exit (issue #23)."""
 
@@ -11,8 +11,8 @@ import sys
 import tempfile
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parent.parent  # kvspace/
-WS = ROOT.parent  # array2d/
+ROOT = Path(__file__).resolve().parent.parent            
+WS = ROOT.parent            
 
 
 def find_first(env_key, candidates):
@@ -65,7 +65,7 @@ def run_script(script):
             env['KVSPACE'] = f'fs://{tmp}/store'
             r = subprocess.run(['bash', script], capture_output=True, text=True, timeout=30, env=env)
             return r.stdout.rstrip('\n').split('\n') if r.stdout.strip() else [], r
-    # Safe to clear explicit fs:// paths; redis:// relies on per-script deltree prefix cleanup.
+                                                                                               
     if env['KVSPACE'].startswith('fs://'):
         subprocess.run([KVSPACE_BIN, 'clear'], capture_output=True, timeout=10, env=env)
     r = subprocess.run(['bash', script], capture_output=True, text=True, timeout=30, env=env)
@@ -86,11 +86,11 @@ def test_script(script):
     return False
 
 
-# ── 写侧落盘时机（issue #23）─────────────────────────────────────────
-#
-# 写把 XValue 字节攒在句柄内（body 由调用方在返回后填，返回前无法落盘）：下一次 op 落盘上一笔
-# （读也是 op），另一个句柄随即可见；漏调 Close 而正常退出时由前端退出兜底落盘。子进程必须
-# 独立——它正是「不 Close 就退出」的那一个。
+                                                               
+ 
+                                                        
+                                                   
+                           
 
 CHILD = r'''
 # 只用新 ABI 读一笔，判断上一进程的写是否已落地。

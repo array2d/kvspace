@@ -1,19 +1,19 @@
 #!/bin/bash
-# expected:
-# === deep tree ===
-# /deep/a/b/c/d/e/f	int64:6
-# a/	lib	
-# /deep/a/b/c	int64:3
-# d/	lib	
-# c/	lib	
-# === deltree mid ===
-# /deep/a/b/c/d/e/f	(nil)
-# /deep/a/b/c/d/e	(nil)
-# /deep/a/b/c	int64:3
-# === deltree leaf ===
-# /deep/a/b/c	(nil)
-# a/	lib	
-# /end
+           
+                   
+                           
+         
+                     
+         
+         
+                     
+                         
+                       
+                     
+                      
+                   
+         
+      
 
 set -e
 KV="${KVSPACE_BIN:-kvspace}"

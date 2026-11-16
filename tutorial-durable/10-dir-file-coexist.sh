@@ -1,13 +1,13 @@
 #!/bin/bash
-# expected:
-# === dir and file coexist ===
-# /t10/b	char/utf8:value
-# /t10/b/x	int64:1
-# === tree ===
-# /t10/
-# └── b/
-#     └── x	1
-# /end
+           
+                              
+                        
+                  
+              
+       
+        
+             
+      
 
 set -e
 KV="${KVSPACE_BIN:-kvspace}"

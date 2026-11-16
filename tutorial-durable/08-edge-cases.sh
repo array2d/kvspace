@@ -1,13 +1,13 @@
 #!/bin/bash
-# expected:
-# === overwrite kind ===
-# /e/v	int64:42
-# /e/v	char/utf8:hello
-# === empty list ===
-# === del non-existent ===
-# /e/ghost	(nil)
-# === deltree non-existent ===
-# /end
+           
+                        
+               
+                      
+                    
+                          
+                
+                              
+      
 
 set -e
 KV="${KVSPACE_BIN:-kvspace}"

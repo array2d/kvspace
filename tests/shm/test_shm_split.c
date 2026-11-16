@@ -1,6 +1,4 @@
-/* test_shm_split [dir] — 3-file layout, ART growth, cross-process sync (#18) */
-
-#define _GNU_SOURCE
+#define _GNU_SOURCE 
 #include "kvspace_shm.h"
 #include "test_wire.h"
 #include "test_util.h"
@@ -10,14 +8,11 @@
 #include <string.h>
 #include <sys/wait.h>
 #include <unistd.h>
-
-#define SBO_DATA_SIZE (8UL * 64 * 64 * 64 * 64) /* 8 * 64^4 */
+#include "test_public_io.h"
+#define SBO_DATA_SIZE (8UL * 64 * 64 * 64 * 64)
 #define ART_SLAB_INIT (64UL * 1024 * 1024)
-/* 600B keys take ~55 ART blocks of 112B each: 16000 * 6KB > 64MB, one doubling */
 #define GROW_KEYS 16000
 #define GROW_KEY_LEN 600
-
-/* unique prefix + random tail, no shared prefix between keys */
 static void key_of(char *buf, size_t n, int i) {
   unsigned x = (unsigned)i * 2654435761u + 12345u;
   int p = snprintf(buf, n, "/L%07d-", i);
@@ -27,7 +22,6 @@ static void key_of(char *buf, size_t n, int i) {
   }
   buf[p] = 0;
 }
-
 static int set_int32(kvspace_t *kv, const char *key, int32_t v) {
   uint8_t raw[4] = {(uint8_t)v, (uint8_t)(v >> 8), (uint8_t)(v >> 16),
                     (uint8_t)(v >> 24)};
@@ -35,14 +29,13 @@ static int set_int32(kvspace_t *kv, const char *key, int32_t v) {
   uint64_t n = 0;
   if (kvspace_test_wire_scalar(raw, 4, "", &xv, &n) != 0)
     return -1;
-  int rc = kvspaceShmSet(kv, key, xv, (int32_t)n);
+  int rc = t_set_wire(kv, key, xv, (int32_t)n);
   free(xv);
   return rc;
 }
-
 static int32_t get_int32(kvspace_t *kv, const char *key) {
   int32_t len = 0;
-  uint8_t *d = kvspaceShmGet(kv, key, 1, &len);
+  uint8_t *d = t_get_wire(kv, key, 1, &len);
   if (!d || len <= 0)
     return -1;
   kvspaceXvalueHead h;
@@ -53,8 +46,6 @@ static int32_t get_int32(kvspace_t *kv, const char *key) {
   return (int32_t)((uint32_t)b[0] | ((uint32_t)b[1] << 8) |
                    ((uint32_t)b[2] << 16) | ((uint32_t)b[3] << 24));
 }
-
-/* returns failure count */
 static int fill_keys(kvspace_t *kv) {
   char key[GROW_KEY_LEN + 8];
   int fail = 0;
@@ -64,8 +55,6 @@ static int fill_keys(kvspace_t *kv) {
   }
   return fail;
 }
-
-/* returns mismatch count */
 static int check_keys(kvspace_t *kv, int step) {
   char key[GROW_KEY_LEN + 8];
   int bad = 0;
@@ -75,24 +64,20 @@ static int check_keys(kvspace_t *kv, int step) {
   }
   return bad;
 }
-
 static void t_layout(const char *db, const char *head, const char *data) {
   printf("[layout] three files created, sizes, basic set/get\n");
-  kvspace_t *kv = kvspaceShmOpen(db, SBO_DATA_SIZE);
+  kvspace_t *kv = t_open(db, SBO_DATA_SIZE);
   REQUIRE(kv != NULL, "open failed");
-
   CHECK(fsize(head) > 0, "head file missing");
   CHECK(fsize(data) == (off_t)SBO_DATA_SIZE, "data file size %ld",
         (long)fsize(data));
   off_t main_sz = fsize(db);
   CHECK(main_sz > (off_t)ART_SLAB_INIT && main_sz < (off_t)ART_SLAB_INIT + 4096,
         "main file size %ld", (long)main_sz);
-
   CHECK(set_int32(kv, "/a", 42) == 0, "set /a");
   CHECK(get_int32(kv, "/a") == 42, "get /a");
-  kvspaceShmClose(kv);
+  t_close(kv);
 }
-
 static void t_bad_size(const char *dir) {
   printf("[bad-size] data_size not 8*64^k is rejected before any file is "
          "created\n");
@@ -100,65 +85,56 @@ static void t_bad_size(const char *dir) {
   snprintf(p, sizeof p, "%s/bad", dir);
   snprintf(head, sizeof head, "%s.sbo.head", p);
   snprintf(data, sizeof data, "%s.sbo.data", p);
-  CHECK(kvspaceShmOpen(p, 16) == NULL,
-        "16 accepted"); /* power of 2, not of 64 */
-  CHECK(kvspaceShmOpen(p, 8 * 64 * 3) == NULL, "8*64*3 accepted");
+  CHECK(t_open(p, 16) == NULL,
+        "16 accepted");
+  CHECK(t_open(p, 8 * 64 * 3) == NULL, "8*64*3 accepted");
   CHECK(fsize(p) < 0 && fsize(head) < 0 && fsize(data) < 0,
         "files left behind");
 }
-
-static void t_v1_rejected(const char *dir) {
-  printf("[v1] legacy single-file magic is rejected\n");
+static void t_bad_magic(const char *dir) {
+  printf("[magic] a file that is not a store is rejected\n");
   char p[512];
-  snprintf(p, sizeof p, "%s/v1", dir);
+  snprintf(p, sizeof p, "%s/bad-magic", dir);
   int fd = open(p, O_RDWR | O_CREAT | O_TRUNC, 0644);
-  REQUIRE(fd >= 0, "create v1 stub");
-  static const char v1[4096] = "kvspace-c.v1";
-  CHECK(write(fd, v1, sizeof v1) == (ssize_t)sizeof v1, "write v1 stub");
+  REQUIRE(fd >= 0, "create stub");
+  static const char junk[4096] = "not-a-store";
+  CHECK(write(fd, junk, sizeof junk) == (ssize_t)sizeof junk, "write stub");
   close(fd);
-  CHECK(kvspaceShmOpen(p, SBO_DATA_SIZE) == NULL, "v1 file accepted");
+  CHECK(t_open(p, SBO_DATA_SIZE) == NULL, "junk file accepted");
   unlink(p);
 }
-
 static void t_grow_and_reopen(const char *db) {
   printf("[grow] %d keys force ART slab growth, then verify across reopen\n",
          GROW_KEYS);
-  kvspace_t *kv = kvspaceShmOpen(db, SBO_DATA_SIZE);
+  kvspace_t *kv = t_open(db, SBO_DATA_SIZE);
   REQUIRE(kv != NULL, "open failed");
   off_t before = fsize(db);
-
   int set_fail = fill_keys(kv);
   CHECK(set_fail == 0, "%d sets failed", set_fail);
   off_t after = fsize(db);
   CHECK(after >= (off_t)(2 * ART_SLAB_INIT),
         "main file did not grow: %ld -> %ld", (long)before, (long)after);
   printf("  main file %ld -> %ld bytes\n", (long)before, (long)after);
-
   int bad = check_keys(kv, 7);
   CHECK(bad == 0, "%d keys unreadable after grow", bad);
   CHECK(get_int32(kv, "/a") == 42, "pre-existing /a lost");
-  kvspaceShmClose(kv);
-
-  /* reopen ignores data_size */
-  kv = kvspaceShmOpen(db, 8);
+  t_close(kv);
+  kv = t_open(db, 8);
   REQUIRE(kv != NULL, "reopen failed");
   CHECK(fsize(db) == after, "reopen changed main file size");
   bad = check_keys(kv, 13);
   CHECK(bad == 0, "%d keys unreadable after reopen", bad);
   CHECK(set_int32(kv, "/after-reopen", 7) == 0, "set after reopen");
   CHECK(get_int32(kv, "/after-reopen") == 7, "get after reopen");
-  kvspaceShmClose(kv);
+  t_close(kv);
 }
-
-/* child maps the initial slab, parent grows, child reads/writes the grown area */
 static void t_cross_process(const char *dir) {
   printf("[xproc] one process grows, another syncs and reads the grown area\n");
   char db[512];
   snprintf(db, sizeof db, "%s/xp", dir);
-  kvspace_t *kv = kvspaceShmOpen(db, SBO_DATA_SIZE);
+  kvspace_t *kv = t_open(db, SBO_DATA_SIZE);
   REQUIRE(kv != NULL, "open failed");
   CHECK(set_int32(kv, "/seed", 1) == 0, "seed");
-
   int to_child[2], to_parent[2];
   REQUIRE(pipe(to_child) == 0 && pipe(to_parent) == 0, "pipe");
   pid_t pid = fork();
@@ -166,7 +142,7 @@ static void t_cross_process(const char *dir) {
   if (pid == 0) {
     close(to_child[1]);
     close(to_parent[0]);
-    kvspace_t *ckv = kvspaceShmOpen(db, SBO_DATA_SIZE);
+    kvspace_t *ckv = t_open(db, SBO_DATA_SIZE);
     if (!ckv)
       _exit(10);
     if (get_int32(ckv, "/seed") != 1)
@@ -176,7 +152,6 @@ static void t_cross_process(const char *dir) {
       _exit(12);
     if (read(to_child[0], &c, 1) != 1)
       _exit(13);
-    /* last key lives beyond ART_SLAB_INIT */
     char key[GROW_KEY_LEN + 8];
     key_of(key, sizeof key, GROW_KEYS - 1);
     if (get_int32(ckv, key) != GROW_KEYS - 1)
@@ -186,20 +161,18 @@ static void t_cross_process(const char *dir) {
       _exit(15);
     if (set_int32(ckv, "/from-child", 99) != 0)
       _exit(16);
-    kvspaceShmClose(ckv);
+    t_close(ckv);
     _exit(0);
   }
   close(to_child[0]);
   close(to_parent[1]);
   char c;
   CHECK(read(to_parent[0], &c, 1) == 1 && c == 'r', "child ready");
-
   int set_fail = fill_keys(kv);
   CHECK(set_fail == 0, "%d sets failed", set_fail);
   CHECK(fsize(db) >= (off_t)(2 * ART_SLAB_INIT), "parent did not grow");
   c = 'g';
   CHECK(write(to_child[1], &c, 1) == 1, "signal child");
-
   int status = 0;
   CHECK(waitpid(pid, &status, 0) == pid, "waitpid");
   CHECK(WIFEXITED(status) && WEXITSTATUS(status) == 0,
@@ -207,9 +180,8 @@ static void t_cross_process(const char *dir) {
         WIFEXITED(status) ? WEXITSTATUS(status) : -1,
         WIFSIGNALED(status) ? WTERMSIG(status) : 0);
   CHECK(get_int32(kv, "/from-child") == 99, "parent sees child's write");
-  kvspaceShmClose(kv);
+  t_close(kv);
 }
-
 int main(int argc, char **argv) {
   char tmpl[] = "/tmp/kvspace-split-XXXXXX";
   const char *dir = argc > 1 ? argv[1] : mkdtemp(tmpl);
@@ -221,13 +193,11 @@ int main(int argc, char **argv) {
   snprintf(db, sizeof db, "%s/db", dir);
   snprintf(head, sizeof head, "%s.sbo.head", db);
   snprintf(data, sizeof data, "%s.sbo.data", db);
-
   t_layout(db, head, data);
   t_bad_size(dir);
-  t_v1_rejected(dir);
+  t_bad_magic(dir);
   t_grow_and_reopen(db);
   t_cross_process(dir);
-
   if (argc <= 1) {
     char cmd[700];
     snprintf(cmd, sizeof cmd, "rm -rf '%s'", dir);

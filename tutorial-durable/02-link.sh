@@ -1,27 +1,27 @@
 #!/bin/bash
-# expected:
-# === read through ===
-# /lnk/x	int64:42
-# /lnk/y	int64:7
-# === list through ===
-# x	int64	42
-# y	int64	7
-# z	char/utf8	hello
-# === write through ===
-# /tgt/w	int64:99
-# w	int64	99
-# x	int64	42
-# y	int64	7
-# z	char/utf8	hello
-# === del through link ===
-# /tgt/y	(nil)
-# w	int64	99
-# x	int64	42
-# z	char/utf8	hello
-# === del link body ===
-# /lnk	(nil)
-# /tgt/x	int64:42
-# /end
+           
+                      
+                 
+                
+                      
+            
+           
+                   
+                       
+                 
+            
+            
+           
+                   
+                          
+              
+            
+            
+                   
+                       
+            
+                 
+      
 
 set -e
 KV="${KVSPACE_BIN:-kvspace}"

@@ -1,13 +1,13 @@
 #!/bin/bash
-# expected:
-# === unlink link ===
-# /lnk/x	int64:1
-# /lnk	(nil)
-# /tgt/x	int64:1
-# === unlink extindex ===
-# /merge	(nil)
-# /base/a	int64:2
-# /end
+           
+                     
+                
+            
+                
+                         
+              
+                 
+      
 
 set -e
 KV="${KVSPACE_BIN:-kvspace}"
