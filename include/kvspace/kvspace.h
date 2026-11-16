@@ -6,7 +6,7 @@
 extern "C" {
 #endif
 #define KVSPACE_ANCHOR_ROOT UINT64_C(0)
-typedef enum kvspace_status {
+enum {
     KVSPACE_OK = 0,
     KVSPACE_INVALID = -EINVAL,
     KVSPACE_MISSING = -ENOENT,
@@ -15,7 +15,7 @@ typedef enum kvspace_status {
     KVSPACE_NOT_INDEX = -ENOTDIR,
     KVSPACE_HAS_CHILDREN = -ENOTEMPTY,
     KVSPACE_BACKEND = -EIO
-} kvspace_status_t;
+};
 void *kvspaceConnect(const char *dsn);
 void kvspaceClose(void *h);
 uint8_t *kvspaceXvalueInProcessAddress(void *handle);
