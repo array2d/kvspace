@@ -62,7 +62,7 @@ static inline const uint8_t *kvspaceXvalueHeadAttrs(const uint8_t *wire) {
     return wire + KVSPACE_XVALUE_HEAD_LEN + (uint64_t)h->bodylen;
 }
 #define KVSPACE_XVALUE_ATTR_TAG_RETIRED_REALLEN 2u
-/* miaobyte, 2026-11-16, 最高, tlv编码 */
+/* miaobyte, 2026-11-16, 最高, attr区的taglen/tag/valuelen/value，按tlv编码的字节格式布局 */
 int kvspaceXvalueGetAttr(const uint8_t *wire, uint64_t wire_len, uint8_t tag,
                           const uint8_t **out_data, uint16_t *out_len);
 int kvspaceXvalueSetAttr(uint8_t *wire, uint64_t wire_capacity, uint8_t tag,
