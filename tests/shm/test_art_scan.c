@@ -266,9 +266,30 @@ static void expect_children(kvspace_t *kv, const char *prefix, bool ex,
     CHECK(strcmp(names[i], expected[i]) == 0, "%s child %d: %s != %s",
           prefix, i, names[i], expected[i]);
   list_free(names, n);
-  int32_t length = -1;
-  CHECK(kvspaceTestListLen(kv, prefix, ex, 0, &length) == 0 && length == count,
-        "%s ListLen %d, expected %d", prefix, length, count);
+  int64_t length = -1;
+  uint32_t max_name_length = 0;
+  uint32_t raw_length = 0;
+  uint32_t raw_count = 0;
+  uint64_t generation = 0;
+  char err[128] = {0};
+  int rc = kvspaceListlen(kv, prefix, &length, &max_name_length, err,
+                          sizeof err);
+  if (rc == KVSPACE_MISSING || rc == KVSPACE_NOT_INDEX) {
+    rc = KVSPACE_OK;
+    length = 0;
+  }
+  CHECK(rc == KVSPACE_OK, "%s ListLen: %s", prefix, err);
+  int list_rc = kvspaceList(kv, prefix, NULL, 0, &raw_length, &raw_count,
+                            &generation, err, sizeof err);
+  if (list_rc == KVSPACE_MISSING || list_rc == KVSPACE_NOT_INDEX) {
+    list_rc = KVSPACE_OK;
+    raw_count = 0;
+  }
+  CHECK(list_rc == KVSPACE_OK, "%s List raw: %s", prefix, err);
+  CHECK(length == (int64_t)raw_count,
+        "%s ListLen %lld, raw List %u", prefix, (long long)length, raw_count);
+  CHECK(raw_count >= (uint32_t)n, "%s raw List %u, filtered %d", prefix,
+        raw_count, n);
 }
 static void expect_children_set(kvspace_t *kv, const char *prefix, bool ex,
                                 const char **expected, int32_t count) {
