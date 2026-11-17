@@ -1,25 +1,3 @@
-                                        
-  
-            
-  
-                                                               
-                                                                     
-  
-                                              
-                                                                 
-  
-                                                      
-                                  
-  
-                   
-  
-                     
-  
-                                                                    
-                                                                       
-                                                                                                  
-                                                                    
-
 use std::env;
 use std::os::raw::{c_char, c_int, c_void};
 use std::process::exit;
@@ -32,32 +10,17 @@ struct KvspaceAnchor {
     flags: u32,
 }
 
-                                                                            
-                                                               
-                                               
 const KVSPACE_XVALUE_HEAD_LEN: usize = 16;
-                                                                          
+
 const KVSPACE_MISSING: c_int = -2;
 
-                                                          
-                                                     
-                                  
-                                                            
-                               
 #[link(name = "kvspace")]
 extern "C" {
-    fn kvspaceConnect(dsn: *const c_char) -> *mut c_void;       
-    fn kvspaceClose(h: *mut c_void);       
+    fn kvspaceConnect(dsn: *const c_char) -> *mut c_void;
+    fn kvspaceClose(h: *mut c_void);
 
-                                                                  
-                                                                          
-                                                     
+    fn kvspaceXvalueInProcessAddress(h: *mut c_void) -> *mut u8;
 
-                                                   
-                                             
-    fn kvspaceXvalueInProcessAddress(h: *mut c_void) -> *mut u8;       
-                                          
-             
     fn kvspaceResolveOffset(
         h: *mut c_void,
         key: *const c_char,
@@ -66,8 +29,8 @@ extern "C" {
         err: *mut c_char,
         err_cap: u32,
     ) -> c_int;
-    fn kvspaceFree(h: *mut c_void, key: *const c_char, err: *mut c_char, err_cap: u32) -> c_int;       
-             
+    fn kvspaceFree(h: *mut c_void, key: *const c_char, err: *mut c_char, err_cap: u32) -> c_int;
+
     fn kvspaceCp(
         h: *mut c_void,
         old_key: *const c_char,
@@ -75,10 +38,10 @@ extern "C" {
         err: *mut c_char,
         err_cap: u32,
     ) -> c_int;
-                        
-    fn kvspaceMkindex(h: *mut c_void, key: *const c_char, err: *mut c_char, err_cap: u32) -> c_int;                   
-    fn kvspaceDeltree(h: *mut c_void, key: *const c_char, err: *mut c_char, err_cap: u32) -> c_int;       
-             
+
+    fn kvspaceMkindex(h: *mut c_void, key: *const c_char, err: *mut c_char, err_cap: u32) -> c_int;
+    fn kvspaceDeltree(h: *mut c_void, key: *const c_char, err: *mut c_char, err_cap: u32) -> c_int;
+
     fn kvspaceCpdir(
         h: *mut c_void,
         source_key: *const c_char,
@@ -86,7 +49,7 @@ extern "C" {
         err: *mut c_char,
         err_cap: u32,
     ) -> c_int;
-             
+
     fn kvspaceListlen(
         h: *mut c_void,
         key: *const c_char,
@@ -95,7 +58,7 @@ extern "C" {
         err: *mut c_char,
         err_cap: u32,
     ) -> c_int;
-             
+
     fn kvspaceList(
         h: *mut c_void,
         key: *const c_char,
@@ -111,21 +74,10 @@ extern "C" {
 }
 
 fn cs(s: &str) -> *const c_char {
-                                                   
-                                
+
     std::ffi::CString::new(s).unwrap().into_raw() as *const c_char
 }
 
-                                      
-  
-            
-                                                               
-                                        
-                                                       
-                                              
-                               
-  
-                              
 fn default_dsn() -> String {
     match env::var("KVSPACE") {
         Ok(value) if !value.is_empty() => value,
@@ -141,7 +93,6 @@ fn fatalf(msg: &str) -> ! {
     exit(1)
 }
 
-                                                     
 fn fail_op(err: &[u8; 256], op: &str) -> ! {
     let n = err.iter().position(|&b| b == 0).unwrap_or(err.len());
     if n > 0 {
@@ -150,41 +101,10 @@ fn fail_op(err: &[u8; 256], op: &str) -> ! {
     fatalf(&format!("{}: failed（后端未填错误详情）", op));
 }
 
-
-                                                                              
-                                                                
-                                                      
-                                                             
-
-                                                            
-
-                                                          
-                                              
-                                                    
-                            
-
-                                                     
-                                                   
-                                                     
-             
-
-
-
-
-                                                   
-                                                         
-                                                               
-                                                
-
-                                                           
-                                       
-
-                                         
 fn data_base(kv: *mut c_void) -> *mut u8 {
     unsafe { kvspaceXvalueInProcessAddress(kv) }
 }
 
-                                          
 fn resolve_view<'a>(kv: *mut c_void, key: &str) -> Option<&'a [u8]> {
     let base = data_base(kv);
     if base.is_null() {
@@ -206,17 +126,13 @@ fn resolve_view<'a>(kv: *mut c_void, key: &str) -> Option<&'a [u8]> {
         return None;
     }
     let head = unsafe { base.add(offset as usize) };
-                                                              
+
     let raw = unsafe { std::slice::from_raw_parts(head, KVSPACE_XVALUE_HEAD_LEN) };
     let parsed = raw_head(raw)?;
     let total = usize::try_from(parsed.total).ok()?;
     Some(unsafe { std::slice::from_raw_parts(head, total) })
 }
 
-                               
-                                                                
-                                                                
-                            
 struct RawHead {
     body_len: u64,
     attrs_len: u16,
@@ -235,9 +151,6 @@ fn raw_head(wire: &[u8]) -> Option<RawHead> {
     Some(RawHead { body_len, attrs_len, total, padding_zero })
 }
 
-                                                                     
-                                                      
-                                       
 fn raw_attrs(wire: &[u8]) -> Option<Vec<(u8, Vec<u8>)>> {
     let head = raw_head(wire)?;
     let start = KVSPACE_XVALUE_HEAD_LEN + head.body_len as usize;
@@ -256,8 +169,7 @@ fn raw_attrs(wire: &[u8]) -> Option<Vec<(u8, Vec<u8>)>> {
         records.push((tag, wire[at + 3..at + 3 + len].to_vec()));
         at += 3 + len;
     }
-                                                 
-                              
+
     if at != end {
         return None;
     }
@@ -276,18 +188,6 @@ fn get(kv: *mut c_void, key: &str) -> Vec<u8> {
     resolve_view(kv, key).map(|v| v.to_vec()).unwrap_or_default()
 }
 
-                                                                                      
-                                        
-
-                                                                 
-
-                                                                
-                                                                       
-
-                                                         
-
-                                                                                 
-                                                                                 
 fn dir_form(prefix: &str) -> String {
     if prefix.ends_with('/') || prefix.ends_with('·') {
         prefix.to_string()
@@ -296,8 +196,6 @@ fn dir_form(prefix: &str) -> String {
     }
 }
 
-                                                  
-                                                  
 fn list_names(kv: *mut c_void, prefix: &str) -> Vec<String> {
     let p = cs(&dir_form(prefix));
     let mut count: i64 = 0;
@@ -316,7 +214,7 @@ fn list_names(kv: *mut c_void, prefix: &str) -> Vec<String> {
     if rc != 0 || count <= 0 {
         return Vec::new();
     }
-                                                               
+
     let cap = (count as usize)
         .saturating_mul(max_len as usize + 1)
         .min(u32::MAX as usize) as u32;
@@ -360,8 +258,6 @@ fn join_path(parent: &str, child: &str) -> String {
     format!("{}/{}", parent, child)
 }
 
-                                                                    
-                             
 fn parse_walk_args(tail: &[String]) -> String {
     let mut prefix = "/".to_string();
     for a in tail {
@@ -408,13 +304,12 @@ fn main() {
     let sub = rest[0].clone();
     if matches!(sub.as_str(), "help" | "--help" | "-h") {
         print_help();
-        return;              
+        return;
     }
 
     let kv = unsafe { kvspaceConnect(cs(&dsn)) };
     if kv.is_null() {
-                                                          
-                                                        
+
         fatalf(&format!(
             "connect failed: {dsn}\n  \
              本 CLI 只接受 shm://（例如 shm:///tmp/kvspace.shm），其它 scheme 一律 NULL；\n  \
@@ -474,7 +369,7 @@ fn main() {
             if tail.is_empty() {
                 fatalf("usage: kvspace del <key>...");
             }
-                                                           
+
             for k in tail {
                 let mut err = [0u8; 256];
                 let rc = unsafe { kvspaceFree(kv, cs(k), err.as_mut_ptr() as *mut c_char, 256) };
@@ -536,7 +431,7 @@ fn main() {
             if tail.len() > 1 {
                 fatalf("mkindex 不再接受 capacity（新 ABI 无该参数）");
             }
-                                     
+
             let p = dir_form(p);
             let mut err = [0u8; 256];
             let rc = unsafe { kvspaceMkindex(kv, cs(&p), err.as_mut_ptr() as *mut c_char, 256) };
@@ -545,7 +440,7 @@ fn main() {
             }
         }
         "clear" => {
-                                                     
+
             eprintln!("warning: clear 删除整个 kvspace（等价 deltree /），不可恢复");
             let mut err = [0u8; 256];
             let rc = unsafe { kvspaceDeltree(kv, cs("/"), err.as_mut_ptr() as *mut c_char, 256) };
@@ -573,10 +468,8 @@ fn main() {
     }
 }
 
-                                                       
-                                
 fn fprint_list(kv: *mut c_void, prefix: &str) {
-                                                          
+
     for c in list_names(kv, prefix) {
         let full = join_path(prefix, &c);
         match raw_head(&get(kv, &full)) {
@@ -587,7 +480,7 @@ fn fprint_list(kv: *mut c_void, prefix: &str) {
 }
 
 fn fprint_tree(kv: *mut c_void, prefix: &str, indent: &str) {
-                                            
+
     let children = list_names(kv, prefix);
     let n = children.len();
     for (i, c) in children.iter().enumerate() {
