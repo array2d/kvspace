@@ -6,7 +6,6 @@
 #define SBO_MIN_SHARD_BYTES (1ULL << 40)
 #define SLOTSBOXMALLOC_IMPLEMENTATION 
 #include "slotsboxmalloc/slotsboxobj.h"
-#include "kvspace_shared_memory.h"
 #include <kvspace/kvspace.h>
 #include <kvspace/kvspace_xvalue.h>
 #include <errno.h>
@@ -25,6 +24,7 @@
 #include <sys/stat.h>
 #include <time.h>
 #include <unistd.h>
+typedef struct kvspace kvspace_t;
 #define KVSPACE_MAGIC "kvspace-c"
 #define ADAPTIVE_RADIX_TREE_PREFIX_MAX 10
 #define ADAPTIVE_RADIX_TREE_BLOCK_SIZE 104

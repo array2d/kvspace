@@ -2,6 +2,7 @@
 #define KVSPACE_TEST_PUBLIC_IO_H 
 #include <kvspace/kvspace.h>
 #include <kvspace/kvspace_xvalue.h>
+#include "kvspace_test_hooks.h"
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
