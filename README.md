@@ -81,7 +81,6 @@ src/xvalue_head.c                  # 字节层实现
 src/const.c                        # 存储常量查找表
 cli/                               # kvspace CLI（Cargo）——只做存储子命令
 tests/                             # 存储契约 + 字节层
-tutorial-durable/                  # durable 后端 tutorial
 ```
 
 **不在本仓**（语言层示例与绑定都在 kvlang）：`tutorial-c/`、`py/`、`rust/`。
