@@ -141,6 +141,15 @@ if(BUILD_TESTING)
     target_include_directories(test_export_surface PRIVATE include)
     target_link_libraries(test_export_surface PRIVATE kvspace)
     add_test(NAME export_surface COMMAND test_export_surface)
+
+    find_program(PYTHON3_EXECUTABLE NAMES python3)
+    if(NOT PYTHON3_EXECUTABLE)
+        message(FATAL_ERROR "python3 is required for the separator hardcode check")
+    endif()
+    add_test(NAME separator_hardcode
+             COMMAND ${PYTHON3_EXECUTABLE}
+                     ${CMAKE_CURRENT_SOURCE_DIR}/tests/check_separator_hardcode.py
+                     ${CMAKE_CURRENT_SOURCE_DIR}/src)
 endif()
 
                            

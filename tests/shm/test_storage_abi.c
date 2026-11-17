@@ -354,6 +354,25 @@ int main(void) {
     CHECK(kvspaceResolveOffset(h, "x", &misaligned, &got, err, sizeof err) ==
               KVSPACE_ANCHOR_INVALID,
           "错位偏移应 ANCHOR_INVALID");
+    uint64_t invalid_offset = 0;
+    CHECK(kvspaceRealloc(h, "abc", 1, 0, &invalid_offset, err, sizeof err) ==
+              KVSPACE_INVALID,
+          "无前导 / 的 key 应 INVALID");
+    CHECK(kvspaceRealloc(h, "/a//b", 1, 0, &invalid_offset, err,
+                         sizeof err) == KVSPACE_INVALID,
+          "// 应 INVALID");
+    CHECK(kvspaceMkindex(h, "/a··b/", err, sizeof err) == KVSPACE_INVALID,
+          "·· 应 INVALID");
+    CHECK(kvspaceMkindex(h, "/a·/b/", err, sizeof err) == KVSPACE_INVALID,
+          "·/ 应 INVALID");
+    CHECK(kvspaceMkindex(h, "/a/·b/", err, sizeof err) == KVSPACE_INVALID,
+          "/· 应 INVALID");
+    CHECK(kvspaceMkindex(h, "/.kvspace-meta·x/", err, sizeof err) ==
+              KVSPACE_OK,
+          "· 不是保留前缀的后代边界");
+    CHECK(kvspaceMkindex(h, "/.kvspace-meta/x/", err, sizeof err) ==
+              KVSPACE_INVALID,
+          "保留前缀的 / 子树应 INVALID");
     kvspaceClose(h);
     char cmd[320];
     snprintf(cmd, sizeof cmd, "rm -rf %s", dir);

@@ -114,7 +114,7 @@ static void t_correct(const char *db) {
   int32_t n;
   REQUIRE(do_list(kv, "/d/", &ns, &n) == 0, "list /d/");
   CHECK(n == 2, "list /d/ count %d", n);
-  CHECK(list_has(ns, n, "f") && list_has(ns, n, "g"), "list /d/ names");
+  CHECK(list_has(ns, n, "f/") && list_has(ns, n, "g"), "list /d/ names");
   list_free(ns, n);
   REQUIRE(do_list(kv, "/d/f/", &ns, &n) == 0, "list /d/f/");
   CHECK(n == 2, "list /d/f/ count %d", n);
@@ -122,7 +122,7 @@ static void t_correct(const char *db) {
   list_free(ns, n);
   REQUIRE(do_list(kv, "/lib/", &ns, &n) == 0, "list /lib/");
   CHECK(n == 3, "list /lib/ count %d", n);
-  CHECK(list_has(ns, n, "a") && list_has(ns, n, "b") && list_has(ns, n, "mod"),
+  CHECK(list_has(ns, n, "a") && list_has(ns, n, "b") && list_has(ns, n, "mod/"),
         "list /lib/ names");
   list_free(ns, n);
   REQUIRE(do_list(kv, "/foo/", &ns, &n) == 0, "list /foo/");
@@ -138,7 +138,7 @@ static void t_correct(const char *db) {
   CHECK(n == 0, "list /food/ count %d", n);
   list_free(ns, n);
   REQUIRE(do_list(kv, "/", &ns, &n) == 0, "list /");
-  CHECK(list_has(ns, n, "lib") && list_has(ns, n, "d") && list_has(ns, n, "foo"),
+  CHECK(list_has(ns, n, "lib/") && list_has(ns, n, "d/") && list_has(ns, n, "foo/"),
         "list / names");
   CHECK(!list_has(ns, n, ".kvspace-meta"), "hide metadata root");
   list_free(ns, n);
@@ -221,7 +221,7 @@ static void t_scale(const char *db) {
   int32_t n;
   REQUIRE(do_list(kv, "/t/", &ns, &n) == 0, "list /t/");
   CHECK(n == 3 && list_has(ns, n, "a") && list_has(ns, n, "b") &&
-            list_has(ns, n, "c"),
+            list_has(ns, n, "c/"),
         "list /t/ names");
   list_free(ns, n);
   double t_lo = time_list(kv, "/t/", reps);
@@ -324,7 +324,7 @@ static void t_direct_children(const char *db) {
   CHECK(set_int32(kv, "/coords/[2]/x", 2) == 0, "coord 2");
   CHECK(set_int32(kv, "/coords/[-1]/x", -1) == 0, "coord -1");
   CHECK(mkindex(kv, "/coords/[10]/") == 0, "coord marker");
-  const char *coords[] = {"[-1]", "[2]", "[10]/"};
+  const char *coords[] = {"[-1]/", "[2]/", "[10]/"};
   expect_children_set(kv, "/coords/", false, coords, 3);
   for (int c = 1; c < 256; c++) {
     if (c == '/' || c == 0xC2)
@@ -336,7 +336,7 @@ static void t_direct_children(const char *db) {
   }
   expect_children(kv, "/dead/", false, NULL, 0);
   CHECK(set_int32(kv, "/dead/child/last/value", 11) == 0, "revive branch");
-  const char *alive[] = {"child"};
+  const char *alive[] = {"child/"};
   expect_children(kv, "/dead/", false, alive, 1);
   CHECK(t_del(kv, "/dead/child/last/value") == 0, "delete revived branch");
   expect_children(kv, "/dead/", false, NULL, 0);

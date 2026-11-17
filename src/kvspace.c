@@ -34,10 +34,66 @@
 #define ART_RESERVE (1ULL << 36)
 #define DATA_RESERVE (1ULL << 40)
 #define SBO_PUNCH_MIN (64UL * 1024)
+enum separator_kind { SEPARATOR_SLASH = 0, SEPARATOR_DOT = 1, SEPARATOR_COUNT = 2, SEPARATOR_NONE = -1 };
+static const struct { const char bytes[3]; uint8_t length; } separator_table[SEPARATOR_COUNT] = {
+    {"/", 1}, {"\xC2\xB7", 2}
+};
+static int separator_length(enum separator_kind kind) {
+    if (kind < SEPARATOR_SLASH || kind >= SEPARATOR_COUNT)
+        return 0;
+    return separator_table[kind].length;
+}
+static enum separator_kind separator_at(const char *text, size_t index, size_t length) {
+    for (int kind = SEPARATOR_SLASH; kind < SEPARATOR_COUNT; kind++) {
+        int n = separator_length((enum separator_kind)kind);
+        if (n > 0 && index + (size_t)n <= length &&
+            memcmp(text + index, separator_table[kind].bytes, (size_t)n) == 0)
+            return (enum separator_kind)kind;
+    }
+    return SEPARATOR_NONE;
+}
+static enum separator_kind ending_separator(const char *text, size_t length) {
+    for (int kind = SEPARATOR_SLASH; kind < SEPARATOR_COUNT; kind++) {
+        int n = separator_length((enum separator_kind)kind);
+        if (n > 0 && (size_t)n <= length &&
+            separator_at(text, length - (size_t)n, length) == (enum separator_kind)kind)
+            return (enum separator_kind)kind;
+    }
+    return SEPARATOR_NONE;
+}
+static char *append_separator(const char *text, enum separator_kind kind) {
+    size_t length = strlen(text);
+    int n = separator_length(kind);
+    char *result = malloc(length + (size_t)n + 1);
+    if (!result)
+        return NULL;
+    memcpy(result, text, length);
+    memcpy(result + length, separator_table[kind].bytes, (size_t)n);
+    result[length + (size_t)n] = 0;
+    return result;
+}
+static int separator_sequence_valid(const char *text, size_t length) {
+    for (size_t index = 0; index < length;) {
+        enum separator_kind kind = separator_at(text, index, length);
+        if (kind == SEPARATOR_NONE) {
+            index++;
+            continue;
+        }
+        int n = separator_length(kind);
+        if (separator_at(text, index + (size_t)n, length) != SEPARATOR_NONE)
+            return 0;
+        index += (size_t)n;
+    }
+    return 1;
+}
 static int reserved_meta_path(const char *key) {
     static const char root[] = "/.kvspace-meta";
-    return strncmp(key, root, sizeof root - 1) == 0 &&
-           (key[sizeof root - 1] == 0 || key[sizeof root - 1] == '/');
+    if (strncmp(key, root, sizeof root - 1) != 0)
+        return 0;
+    size_t length = strlen(key);
+    size_t index = sizeof root - 1;
+    return index == length ||
+           separator_at(key, index, length) == SEPARATOR_SLASH;
 }
 static int key_text_valid(const char *key) {
     if (!key)
@@ -45,7 +101,12 @@ static int key_text_valid(const char *key) {
     size_t length = strlen(key);
     if (length == 0 || length >= 1024)
         return 0;
-    return !reserved_meta_path(key) && strstr(key, "//") == NULL;
+    if (reserved_meta_path(key) || !separator_sequence_valid(key, length))
+        return 0;
+    enum separator_kind first = SEPARATOR_NONE;
+    for (size_t index = 0; index < length && first == SEPARATOR_NONE; index++)
+        first = separator_at(key, index, length);
+    return first == SEPARATOR_SLASH;
 }
 enum { ART_N4 = 0,
        ART_N16 = 1,
@@ -1492,23 +1553,20 @@ static int32_t art_del(kvspace_t *kv, int32_t nid, const uint8_t *key, int klen,
 }
 static char *pjoin(const char *a, const char *b) {
     size_t al = strlen(a), bl = strlen(b);
-    int sep = (al > 0 && a[al - 1] != '/') ? 1 : 0;
-    char *r = malloc(al + sep + bl + 1);
+    int sep = (al > 0 && ending_separator(a, al) != SEPARATOR_SLASH)
+                  ? separator_length(SEPARATOR_SLASH) : 0;
+    char *r = malloc(al + (size_t)sep + bl + 1);
     memcpy(r, a, al);
     if (sep)
-        r[al] = '/';
-    memcpy(r + al + sep, b, bl + 1);
+        memcpy(r + al, separator_table[SEPARATOR_SLASH].bytes, (size_t)sep);
+    memcpy(r + al + (size_t)sep, b, bl + 1);
     return r;
 }
 static char *edir(const char *p) {
     size_t l = strlen(p);
-    if (l > 0 && p[l - 1] == '/')
+    if (ending_separator(p, l) == SEPARATOR_SLASH)
         return strdup(p);
-    char *r = malloc(l + 2);
-    memcpy(r, p, l);
-    r[l] = '/';
-    r[l + 1] = '\0';
-    return r;
+    return append_separator(p, SEPARATOR_SLASH);
 }
 static int32_t art_cover(kvspace_t *kv, int32_t nid, const uint8_t *pfx,
                          int plen, char *buf, int bcap, int *bpos) {
@@ -1576,11 +1634,9 @@ static int keyscan_add_n(keyscan_t *scan, const char *key, size_t len) {
 }
 static int child_name_len(const char *rest, int restlen) {
     for (int i = 0; i < restlen; i++) {
-        if (rest[i] == '/')
-            return i;
-        if (i + 1 < restlen && (unsigned char)rest[i] == 0xC2 &&
-            (unsigned char)rest[i + 1] == 0xB7)
-            return i + 2;
+        enum separator_kind kind = separator_at(rest, (size_t)i, (size_t)restlen);
+        if (kind != SEPARATOR_NONE)
+            return i + separator_length(kind);
     }
     return restlen;
 }
@@ -1625,23 +1681,23 @@ static int art_scan_children(kvspace_t *kv, int32_t nid, char *buf, int bpos, in
     art_hdr_t *h = art_hdr(kv, nid);
     if (!h || h->prefix_len > bcap - bpos - 1)
         return -1;
-    int start = bpos > plen + 1 ? bpos - plen - 2 : 0;
     for (int i = 0; i < h->prefix_len; i++)
         buf[bpos++] = h->prefix[i];
     buf[bpos] = 0;
     if (bpos > plen) {
         const char *rest = buf + plen;
         int restlen = bpos - plen;
-        int len = start + child_name_len(rest + start, restlen - start);
+        int len = child_name_len(rest, restlen);
         if (len < restlen) {
-            if (len == 0)
-                return 0;
             int live = art_has_live_value(kv, nid);
             if (live <= 0)
                 return live;
-            if (rest[len] == '/' && len + 1 == restlen &&
-                AV_HAS(art_val_load(h)))
-                len++;
+            return keyscan_add_n(scan, rest, (size_t)len);
+        }
+        if (ending_separator(rest, (size_t)restlen) != SEPARATOR_NONE) {
+            int live = art_has_live_value(kv, nid);
+            if (live <= 0)
+                return live;
             return keyscan_add_n(scan, rest, (size_t)len);
         }
         if (AV_HAS(art_val_load(h)) &&
@@ -1979,21 +2035,16 @@ static int shm_del_key(kvspace_t *kv, const char *key) {
     return d ? 1 : 0;
 }
 static char *memdir(const char *p) {
-    size_t l = strlen(p);
-    char *r = malloc(l + 3);
-    memcpy(r, p, l);
-    r[l] = (char)0xC2;
-    r[l + 1] = (char)0xB7;
-    r[l + 2] = 0;
-    return r;
+    return append_separator(p, SEPARATOR_DOT);
 }
 static int subtree_key(const char *base, size_t bl, const char *key) {
     if (bl == 0)
-        return key[0] == '/';
+        return separator_at(key, 0, strlen(key)) == SEPARATOR_SLASH;
     if (strncmp(key, base, bl) != 0)
         return 0;
-    const unsigned char *r = (const unsigned char *)key + bl;
-    return r[0] == 0 || r[0] == '/' || (r[0] == 0xC2 && r[1] == 0xB7);
+    const char *rest = key + bl;
+    return rest[0] == 0 ||
+           separator_at(rest, 0, strlen(rest)) != SEPARATOR_NONE;
 }
 static int delete_tree(kvspace_t *kv, const char *prefix) {
     if (!kv || !prefix || reserved_meta_path(prefix))
@@ -2006,18 +2057,21 @@ static int delete_tree(kvspace_t *kv, const char *prefix) {
     char base[1024];
     memcpy(base, prefix, pl + 1);
     size_t bl = pl;
-    if (strcmp(prefix, "/") == 0)
+    if (bl == (size_t)separator_length(SEPARATOR_SLASH) &&
+        separator_at(base, 0, bl) == SEPARATOR_SLASH) {
         bl = 0;
-    else if (bl && base[bl - 1] == '/')
-        bl--;
-    else if (bl >= 2 && (unsigned char)base[bl - 2] == 0xC2 &&
-             (unsigned char)base[bl - 1] == 0xB7)
-        bl -= 2;
+    } else {
+        enum separator_kind kind = ending_separator(base, bl);
+        if (kind != SEPARATOR_NONE)
+            bl -= (size_t)separator_length(kind);
+    }
     base[bl] = 0;
     if (bl && reserved_meta_path(base))
         return -1;
     keyscan_t keys = {0};
-    if (art_scan_keys(kv, bl ? base : "/", bl ? (int)bl : 1, &keys) != 0) {
+    if (art_scan_keys(kv, bl ? base : separator_table[SEPARATOR_SLASH].bytes,
+                      bl ? (int)bl : separator_length(SEPARATOR_SLASH),
+                      &keys) != 0) {
         keyscan_free(&keys);
         return -1;
     }
@@ -2156,16 +2210,24 @@ static int copy_tree(kvspace_t *kv, const char *src, const char *dst) {
         reserved_meta_path(dst))
         return -1;
     size_t sl = strlen(src);
-    while (sl > 1 && src[sl - 1] == '/')
-        sl--;
-    if (sl == 1 && src[0] == '/' && dst[0] == '/')
-        return dst[1] ? -1 : 0;
+    for (;;) {
+        enum separator_kind kind = ending_separator(src, sl);
+        if (kind == SEPARATOR_NONE || sl <= (size_t)separator_length(kind))
+            break;
+        sl -= (size_t)separator_length(kind);
+    }
+    if (sl == 1 && separator_at(src, 0, sl) == SEPARATOR_SLASH &&
+        separator_at(dst, 0, strlen(dst)) == SEPARATOR_SLASH)
+        return strlen(dst) == 1 ? 0 : -1;
     if (strncmp(src, dst, sl) == 0) {
-        if (dst[sl] == 0 || (dst[sl] == '/' && dst[sl + 1] == 0))
+        const char *rest = dst + sl;
+        size_t restlen = strlen(rest);
+        enum separator_kind kind = separator_at(rest, 0, restlen);
+        if (restlen == 0 ||
+            (kind != SEPARATOR_NONE &&
+             restlen == (size_t)separator_length(kind)))
             return 0;
-        if (dst[sl] == '/' ||
-            ((unsigned char)dst[sl] == 0xc2 &&
-             (unsigned char)dst[sl + 1] == 0xb7))
+        if (kind != SEPARATOR_NONE)
             return -1;
     }
     delete_tree(kv, dst);
@@ -2228,10 +2290,11 @@ static int resolve_anchor(kvspace_t *kv, const char *key,
     *out_offset = 0;
     if (!anchor || anchor->node_offset == 0)
         return resolve_root(kv, key, out_offset);
-    if (reserved_meta_path(key) || strstr(key, "//"))
-        return KVSPACE_INVALID;
     uint64_t suffix_len = (uint64_t)strlen(key);
-    if (key[0] == '/' || (uint64_t)anchor->depth + suffix_len >= 1024)
+    if (reserved_meta_path(key) ||
+        separator_at(key, 0, (size_t)suffix_len) != SEPARATOR_NONE ||
+        !separator_sequence_valid(key, (size_t)suffix_len) ||
+        (uint64_t)anchor->depth + suffix_len >= 1024)
         return KVSPACE_INVALID;
     if (!(anchor->flags & KVSPACE_ANCHOR_FLAG_INDEX))
         return KVSPACE_ANCHOR_INVALID;
@@ -2349,12 +2412,7 @@ static int realloc_key(kvspace_t *kv, const char *key,
 }
 static int storage_is_index_key(const char *key) {
     size_t n = strlen(key);
-    if (n == 0)
-        return 0;
-    if (key[n - 1] == '/')
-        return 1;
-    return n >= 2 && (unsigned char)key[n - 2] == 0xC2 &&
-           (unsigned char)key[n - 1] == 0xB7;
+    return n > 0 && ending_separator(key, n) != SEPARATOR_NONE;
 }
 static int storage_has_children(kvspace_t *kv, const char *key) {
     keyscan_t children = {0};
@@ -2429,14 +2487,15 @@ static int storage_key_exists(kvspace_t *kv, const char *key) {
         return has;
     }
     size_t n = strlen(key);
-    char dir[1024];
-    if (n == 0 || n + 2 > sizeof dir)
+    if (n == 0 || n + 2 > 1024)
         return 0;
-    memcpy(dir, key, n);
-    dir[n] = '/';
-    dir[n + 1] = 0;
+    char *dir = append_separator(key, SEPARATOR_SLASH);
+    if (!dir)
+        return 0;
     h = art_search(kv, kv->hdr->art_root, (const uint8_t *)dir, (int)strlen(dir));
-    return h && AV_HAS(art_val_load(h));
+    int exists = h && AV_HAS(art_val_load(h));
+    free(dir);
+    return exists;
 }
 static int storage_index_state(kvspace_t *kv, const char *key) {
     if (!storage_is_index_key(key))
