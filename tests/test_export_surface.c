@@ -3,6 +3,7 @@
 #include <kvspace/kvspace_xvalue.h>
 #include <stddef.h>
 #include <stdio.h>
+#include <string.h>
 static const void *const exported_symbols[] = {
     (const void *)&kvspaceConnect,
     (const void *)&kvspaceClose,
@@ -32,9 +33,20 @@ int main(void) {
             return 1;
         }
     }
+    const char *directory_suffix = kvspaceConstStorage("KVSPACE_DIR_INDEX_SUF");
     const char *separator = kvspaceConstStorage("KVSPACE_MEMBER_SEP");
-    if (separator == NULL || separator[0] == '\0') {
-        fprintf(stderr, "FAIL export_surface: kvspaceConstStorage returned empty\n");
+    const char *error = kvspaceConstStorage(
+        "KVSPACE_ERR_INDEX_MUST_END_WITH_SEPARATOR");
+    if (directory_suffix == NULL || strcmp(directory_suffix, "/") != 0 ||
+        separator == NULL || strcmp(separator, "·") != 0 ||
+        error == NULL || strcmp(error, "kvspace: index must end with /·") != 0) {
+        fprintf(stderr, "FAIL export_surface: const values changed\n");
+        return 1;
+    }
+    if (kvspaceConstStorage("KVSPACE_PATH_SEP") != NULL ||
+        kvspaceConstStorage("KVSPACE_RUNTIME_MEMBER_SEP") != NULL ||
+        kvspaceConstStorage("KVSPACE_ERR_DIR_MUST_END_WITH_SLASH") != NULL) {
+        fprintf(stderr, "FAIL export_surface: removed const still present\n");
         return 1;
     }
     printf("ok: %zu exported symbols linked, const query works\n",

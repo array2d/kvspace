@@ -32,9 +32,10 @@ reallen）：**任何读写路径见到它都必须拒**——那是「写读双
 
 ## 常量
 
-`include/kvspace/const.h` 是**存储**常量的唯一定义处：路径分隔符 `/`、成员分隔符
-`·`、运行期成员分隔符 `‥`、两条错误串。`kvspaceConstStorage("KVSPACE_MEMBER_SEP")`
-→ `"·"`，供 Go/Python/Rust 扩展运行期取，免去硬编码裸字面量。
+`include/kvspace/const.h` 是**存储**常量的唯一定义处：目录索引后缀 `/`、成员分隔符
+`·`、两条错误串。`kvspaceConstStorage("KVSPACE_MEMBER_SEP")` → `"·"`，供
+Go/Python/Rust 扩展运行期取，免去硬编码裸字面量。运行期成员分隔符 `‥` 属于语言层，
+已移到 `kvlangConstLanguage("KVLANG_RUNTIME_MEMBER_SEP")`。
 
 语言常量（`int64`/`char/utf8`/`stringkeymap`/`rwir`/…）走另一个入口
 `kvlangConstLanguage`——同一个函数返回两种层的东西，等于把「这个名字属于哪层」
