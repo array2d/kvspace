@@ -17,6 +17,7 @@ endif()
                                                  
 add_library(kvspace SHARED
     src/kvspace.c
+    src/kvspace_recovery.c
     src/kvspace_key.c
     src/kvspace_xvalue_internal.c
     src/xvalue_head.c

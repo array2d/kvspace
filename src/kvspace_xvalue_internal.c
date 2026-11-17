@@ -2,6 +2,7 @@
 #define _GNU_SOURCE
 #endif
 #include "kvspace_xvalue_internal.h"
+#include "kvspace_recovery.h"
 #include <fcntl.h>
 #include <stdio.h>
 #include <stdlib.h>

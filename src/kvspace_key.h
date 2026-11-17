@@ -72,7 +72,7 @@ int storage_is_index_key(const char *key);
 int32_t adaptive_radix_tree_id_of(kvspace_t *store, const void *pointer);
 adaptive_radix_tree_header_t *adaptive_radix_tree_search(kvspace_t *store, int32_t node_id, const uint8_t *key, int key_length);
 int32_t adaptive_radix_tree_insert(kvspace_t *store, int32_t node_id, const uint8_t *key, int key_length, int depth, uint64_t offset);
-int32_t adaptive_radix_tree_delete(kvspace_t *store, int32_t node_id, const uint8_t *key, int key_length, int depth, bool *deleted);
+int32_t adaptive_radix_tree_delete(kvspace_t *store, int32_t node_id, const uint8_t *key, int key_length, int depth, bool *deleted, uint64_t *out_retired_offset);
 int adaptive_radix_tree_scan_keys(kvspace_t *store, const char *prefix, int prefix_length, keyscan_t *scan);
 int32_t recovery_node_at(kvspace_t *store, const char *key);
 generations_t *generations_at(kvspace_t *store, int32_t id);
