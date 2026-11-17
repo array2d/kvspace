@@ -138,106 +138,106 @@ void store_slots_box_free(kvspace_t *store, uint64_t offset) {
 #endif
     sbo_free(store->slots_box_meta, offset);
 }
-uint64_t garbage_threshold(void) {
-    return GARBAGE_THRESHOLD;
+uint64_t retirement_threshold(void) {
+    return RETIREMENT_THRESHOLD;
 }
-static void garbage_full_report(kvspace_t *store) {
+static void retirement_full_report(kvspace_t *store) {
     static bool once;
     if (once)
         return;
     once = true;
-    uint64_t garbage_head_index = __atomic_load_n(&store->header->garbage_head, __ATOMIC_ACQUIRE);
-    uint64_t garbage_tail_index = __atomic_load_n(&store->header->garbage_tail, __ATOMIC_ACQUIRE);
-    uint32_t meta_state = __atomic_load_n(&store->garbage[garbage_head_index & (GARBAGE_CAPACITY - 1)].meta,
+    uint64_t retirement_head_index = __atomic_load_n(&store->header->retirement_head, __ATOMIC_ACQUIRE);
+    uint64_t retirement_tail_index = __atomic_load_n(&store->header->retirement_tail, __ATOMIC_ACQUIRE);
+    uint32_t meta_state = __atomic_load_n(&store->retirement[retirement_head_index & (RETIREMENT_CAPACITY - 1)].meta,
                                  __ATOMIC_ACQUIRE);
     fprintf(stderr,
-            "kvspace: garbage ring full (cap=%llu, head=%llu, tail=%llu, "
+            "kvspace: retirement ring full (cap=%llu, head=%llu, tail=%llu, "
             "bytes=%llu): head entry #%llu state=%u claim=%u is holding "
             "the drain (no reclaim round yet)\n",
-            (unsigned long long)GARBAGE_CAPACITY, (unsigned long long)garbage_head_index,
-            (unsigned long long)garbage_tail_index,
+            (unsigned long long)RETIREMENT_CAPACITY, (unsigned long long)retirement_head_index,
+            (unsigned long long)retirement_tail_index,
             (unsigned long long)(store->header->committed_bytes -
                                  store->header->freed_bytes),
-            (unsigned long long)garbage_head_index, GARBAGE_ENTRY_STATE(meta_state), GARBAGE_ENTRY_CLAIM(meta_state));
+            (unsigned long long)retirement_head_index, RING_ENTRY_STATE(meta_state), RING_ENTRY_CLAIM(meta_state));
 }
-int garbage_reserve(kvspace_t *store, uint64_t *index) {
+int retirement_reserve(kvspace_t *store, uint64_t *index) {
     uint32_t claim = store->recovery_slot >= 0 ? store->header->slots[store->recovery_slot].claim_id : 0;
     if (!claim)
         return -1;
-    uint64_t garbage_head_index = __atomic_load_n(&store->header->garbage_head, __ATOMIC_ACQUIRE);
-    uint64_t garbage_tail_index = __atomic_load_n(&store->header->garbage_tail, __ATOMIC_ACQUIRE);
-    if (garbage_tail_index - garbage_head_index >= GARBAGE_CAPACITY) {
-        garbage_full_report(store);
+    uint64_t retirement_head_index = __atomic_load_n(&store->header->retirement_head, __ATOMIC_ACQUIRE);
+    uint64_t retirement_tail_index = __atomic_load_n(&store->header->retirement_tail, __ATOMIC_ACQUIRE);
+    if (retirement_tail_index - retirement_head_index >= RETIREMENT_CAPACITY) {
+        retirement_full_report(store);
         return -1;
     }
     if (store->reclaim_unavailable &&
-        GARBAGE_CAPACITY - (garbage_tail_index - garbage_head_index) < GARBAGE_CAPACITY / 4) {
-        garbage_full_report(store);
+        RETIREMENT_CAPACITY - (retirement_tail_index - retirement_head_index) < RETIREMENT_CAPACITY / 4) {
+        retirement_full_report(store);
         return -1;
     }
-    garbage_entry_t *entry = &store->garbage[garbage_tail_index & (GARBAGE_CAPACITY - 1)];
+    retirement_entry_t *entry = &store->retirement[retirement_tail_index & (RETIREMENT_CAPACITY - 1)];
     uint32_t meta_state = __atomic_load_n(&entry->meta, __ATOMIC_ACQUIRE);
-    if (meta_state != GARBAGE_ENTRY_EMPTY) {
-        if (GARBAGE_ENTRY_STATE(meta_state) != GARBAGE_ENTRY_RESERVED || recovery_claim_alive(store, GARBAGE_ENTRY_CLAIM(meta_state)))
+    if (meta_state != RETIREMENT_ENTRY_EMPTY) {
+        if (RING_ENTRY_STATE(meta_state) != RETIREMENT_ENTRY_RESERVED || recovery_claim_alive(store, RING_ENTRY_CLAIM(meta_state)))
             return -1;
-        __atomic_store_n(&entry->meta, GARBAGE_ENTRY_EMPTY, __ATOMIC_RELEASE);
+        __atomic_store_n(&entry->meta, RETIREMENT_ENTRY_EMPTY, __ATOMIC_RELEASE);
     }
-    __atomic_store_n(&entry->meta, GARBAGE_ENTRY_MAKE(GARBAGE_ENTRY_RESERVED, claim), __ATOMIC_RELEASE);
-    __atomic_store_n(&store->header->garbage_tail, garbage_tail_index + 1, __ATOMIC_RELEASE);
-    *index = garbage_tail_index;
+    __atomic_store_n(&entry->meta, RING_ENTRY_MAKE(RETIREMENT_ENTRY_RESERVED, claim), __ATOMIC_RELEASE);
+    __atomic_store_n(&store->header->retirement_tail, retirement_tail_index + 1, __ATOMIC_RELEASE);
+    *index = retirement_tail_index;
     return 0;
 }
-void garbage_commit(kvspace_t *store, uint64_t index, uint64_t offset,
+void retirement_commit(kvspace_t *store, uint64_t index, uint64_t offset,
                         uint64_t bytes_retired) {
-    garbage_entry_t *entry = &store->garbage[index & (GARBAGE_CAPACITY - 1)];
-    uint32_t claim = GARBAGE_ENTRY_CLAIM(__atomic_load_n(&entry->meta, __ATOMIC_ACQUIRE));
+    retirement_entry_t *entry = &store->retirement[index & (RETIREMENT_CAPACITY - 1)];
+    uint32_t claim = RING_ENTRY_CLAIM(__atomic_load_n(&entry->meta, __ATOMIC_ACQUIRE));
     entry->offset = offset;
     entry->epoch = __atomic_load_n(&store->header->recovery_epoch, __ATOMIC_ACQUIRE);
-    __atomic_store_n(&entry->meta, GARBAGE_ENTRY_MAKE(GARBAGE_ENTRY_COMMITTED, claim), __ATOMIC_RELEASE);
+    __atomic_store_n(&entry->meta, RING_ENTRY_MAKE(RETIREMENT_ENTRY_COMMITTED, claim), __ATOMIC_RELEASE);
     uint64_t bytes = store->header->committed_bytes + bytes_retired;
     __atomic_store_n(&store->header->committed_bytes, bytes, __ATOMIC_RELEASE);
     if (bytes - __atomic_load_n(&store->header->freed_bytes, __ATOMIC_ACQUIRE) >=
-        garbage_threshold())
+        retirement_threshold())
         (void)recovery_maintenance_start(store);
 }
-void garbage_cancel(kvspace_t *store, uint64_t index) {
-    __atomic_store_n(&store->garbage[index & (GARBAGE_CAPACITY - 1)].meta, GARBAGE_ENTRY_EMPTY,
+void retirement_cancel(kvspace_t *store, uint64_t index) {
+    __atomic_store_n(&store->retirement[index & (RETIREMENT_CAPACITY - 1)].meta, RETIREMENT_ENTRY_EMPTY,
                      __ATOMIC_RELEASE);
 }
-int garbage_drain(kvspace_t *store, uint32_t epoch) {
+int retirement_drain(kvspace_t *store, uint32_t epoch) {
     int freed = 0;
-    uint64_t i = __atomic_load_n(&store->header->garbage_head, __ATOMIC_ACQUIRE);
+    uint64_t i = __atomic_load_n(&store->header->retirement_head, __ATOMIC_ACQUIRE);
     for (;;) {
-        if (i >= __atomic_load_n(&store->header->garbage_tail, __ATOMIC_ACQUIRE))
+        if (i >= __atomic_load_n(&store->header->retirement_tail, __ATOMIC_ACQUIRE))
             goto out;
-        garbage_entry_t *entry = &store->garbage[i & (GARBAGE_CAPACITY - 1)];
+        retirement_entry_t *entry = &store->retirement[i & (RETIREMENT_CAPACITY - 1)];
         uint32_t meta_state = __atomic_load_n(&entry->meta, __ATOMIC_ACQUIRE);
-        uint32_t garbage_state = GARBAGE_ENTRY_STATE(meta_state);
-        if (garbage_state == GARBAGE_ENTRY_EMPTY) {
-            __atomic_store_n(&store->header->garbage_head, i + 1, __ATOMIC_RELEASE);
+        uint32_t retirement_state = RING_ENTRY_STATE(meta_state);
+        if (retirement_state == RETIREMENT_ENTRY_EMPTY) {
+            __atomic_store_n(&store->header->retirement_head, i + 1, __ATOMIC_RELEASE);
             i++;
             continue;
         }
-        if (garbage_state == GARBAGE_ENTRY_RESERVED) {
-            if (recovery_claim_alive(store, GARBAGE_ENTRY_CLAIM(meta_state)))
+        if (retirement_state == RETIREMENT_ENTRY_RESERVED) {
+            if (recovery_claim_alive(store, RING_ENTRY_CLAIM(meta_state)))
                 goto out;
-            __atomic_store_n(&entry->meta, GARBAGE_ENTRY_EMPTY, __ATOMIC_RELEASE);
+            __atomic_store_n(&entry->meta, RETIREMENT_ENTRY_EMPTY, __ATOMIC_RELEASE);
             fprintf(stderr,
-                    "kvspace: garbage entry %llu reserved by dead claim %u: "
-                    "leaked\n", (unsigned long long)i, GARBAGE_ENTRY_CLAIM(meta_state));
-            __atomic_store_n(&store->header->garbage_head, i + 1, __ATOMIC_RELEASE);
+                    "kvspace: retirement entry %llu reserved by dead claim %u: "
+                    "leaked\n", (unsigned long long)i, RING_ENTRY_CLAIM(meta_state));
+            __atomic_store_n(&store->header->retirement_head, i + 1, __ATOMIC_RELEASE);
             i++;
             continue;
         }
-        if (garbage_state != GARBAGE_ENTRY_COMMITTED)
+        if (retirement_state != RETIREMENT_ENTRY_COMMITTED)
             goto out;
         if (!((int32_t)(epoch - __atomic_load_n(&entry->epoch, __ATOMIC_ACQUIRE)) > 0))
             goto out;
         uint64_t offset = __atomic_load_n(&entry->offset, __ATOMIC_ACQUIRE);
         uint64_t capacity = sbo_allocated_size(store->slots_box_meta, offset);
-        __atomic_store_n(&store->header->garbage_freeing, offset, __ATOMIC_RELEASE);
-        __atomic_store_n(&entry->meta, GARBAGE_ENTRY_EMPTY, __ATOMIC_RELEASE);
-        __atomic_store_n(&store->header->garbage_head, i + 1, __ATOMIC_RELEASE);
+        __atomic_store_n(&store->header->retirement_freeing, offset, __ATOMIC_RELEASE);
+        __atomic_store_n(&entry->meta, RETIREMENT_ENTRY_EMPTY, __ATOMIC_RELEASE);
+        __atomic_store_n(&store->header->retirement_head, i + 1, __ATOMIC_RELEASE);
         store_slots_box_free(store, offset);
         __atomic_store_n(&store->header->freed_bytes,
                          store->header->freed_bytes + capacity, __ATOMIC_RELEASE);
@@ -245,7 +245,7 @@ int garbage_drain(kvspace_t *store, uint32_t epoch) {
         freed++;
     }
 out:
-    __atomic_store_n(&store->header->garbage_freeing, 0, __ATOMIC_RELEASE);
+    __atomic_store_n(&store->header->retirement_freeing, 0, __ATOMIC_RELEASE);
     return freed;
 }
 void storage_write_head(uint8_t *destination, uint64_t body_length,
@@ -257,22 +257,22 @@ void storage_write_head(uint8_t *destination, uint64_t body_length,
     memcpy(destination, &header, sizeof header);
 }
 
-void garbage_release_all(kvspace_t *store) {
-    uint64_t garbage_head_index = __atomic_load_n(&store->header->garbage_head, __ATOMIC_ACQUIRE);
-    uint64_t garbage_tail_index = __atomic_load_n(&store->header->garbage_tail, __ATOMIC_ACQUIRE);
-    for (; garbage_head_index < garbage_tail_index; garbage_head_index++) {
-        garbage_entry_t *entry = &store->garbage[garbage_head_index & (GARBAGE_CAPACITY - 1)];
+void retirement_release_all(kvspace_t *store) {
+    uint64_t retirement_head_index = __atomic_load_n(&store->header->retirement_head, __ATOMIC_ACQUIRE);
+    uint64_t retirement_tail_index = __atomic_load_n(&store->header->retirement_tail, __ATOMIC_ACQUIRE);
+    for (; retirement_head_index < retirement_tail_index; retirement_head_index++) {
+        retirement_entry_t *entry = &store->retirement[retirement_head_index & (RETIREMENT_CAPACITY - 1)];
         uint32_t meta_state = __atomic_load_n(&entry->meta, __ATOMIC_ACQUIRE);
-        if (GARBAGE_ENTRY_STATE(meta_state) == GARBAGE_ENTRY_COMMITTED) {
+        if (RING_ENTRY_STATE(meta_state) == RETIREMENT_ENTRY_COMMITTED) {
             uint64_t offset = __atomic_load_n(&entry->offset, __ATOMIC_ACQUIRE);
             uint64_t capacity = sbo_allocated_size(store->slots_box_meta, offset);
-            __atomic_store_n(&entry->meta, GARBAGE_ENTRY_EMPTY, __ATOMIC_RELEASE);
+            __atomic_store_n(&entry->meta, RETIREMENT_ENTRY_EMPTY, __ATOMIC_RELEASE);
             store_slots_box_free(store, offset);
             __atomic_store_n(&store->header->freed_bytes,
                              store->header->freed_bytes + capacity, __ATOMIC_RELEASE);
         } else {
-            __atomic_store_n(&entry->meta, GARBAGE_ENTRY_EMPTY, __ATOMIC_RELEASE);
+            __atomic_store_n(&entry->meta, RETIREMENT_ENTRY_EMPTY, __ATOMIC_RELEASE);
         }
     }
-    __atomic_store_n(&store->header->garbage_head, garbage_tail_index, __ATOMIC_RELEASE);
+    __atomic_store_n(&store->header->retirement_head, retirement_tail_index, __ATOMIC_RELEASE);
 }

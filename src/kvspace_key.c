@@ -689,16 +689,16 @@ int32_t adaptive_radix_tree_delete(kvspace_t *store, int32_t node_id, const uint
         uint64_t header_value = adaptive_radix_tree_value_load(node_header);
         if (!ADAPTIVE_RADIX_TREE_VALUE_HAS(header_value))
             return node_id;
-        uint64_t garbage_index;
-        if (garbage_reserve(store, &garbage_index) != 0)
+        uint64_t retirement_index;
+        if (retirement_reserve(store, &retirement_index) != 0)
             return -1;
         if (!adaptive_radix_tree_value_compare_and_swap(node_header, &header_value, 0)) {
-            garbage_cancel(store, garbage_index);
+            retirement_cancel(store, retirement_index);
             return node_id;
         }
         generation_bump_value(store, adaptive_radix_tree_id_of(store, node_header));
         generation_bump_struct(store, adaptive_radix_tree_id_of(store, node_header));
-        garbage_commit(store, garbage_index, ADAPTIVE_RADIX_TREE_VALUE_OFFSET(header_value),
+        retirement_commit(store, retirement_index, ADAPTIVE_RADIX_TREE_VALUE_OFFSET(header_value),
                     sbo_allocated_size(store->slots_box_meta, ADAPTIVE_RADIX_TREE_VALUE_OFFSET(header_value)));
         *deleted = true;
     } else {
