@@ -267,7 +267,7 @@ static void expect_children(kvspace_t *kv, const char *prefix, bool ex,
           prefix, i, names[i], expected[i]);
   list_free(names, n);
   int32_t length = -1;
-  CHECK(kvspaceShmListLen(kv, prefix, ex, 0, &length) == 0 && length == count,
+  CHECK(kvspaceTestListLen(kv, prefix, ex, 0, &length) == 0 && length == count,
         "%s ListLen %d, expected %d", prefix, length, count);
 }
 static void expect_children_set(kvspace_t *kv, const char *prefix, bool ex,

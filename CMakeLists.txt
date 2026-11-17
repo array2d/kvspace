@@ -16,10 +16,10 @@ endif()
                                        
                                                  
 add_library(kvspace SHARED
-    src/shm/kvspace.c
+    src/kvspace.c
     src/xvalue_head.c
     src/const.c)
-target_include_directories(kvspace PRIVATE src/shm)
+target_include_directories(kvspace PRIVATE src)
 
                                                                     
                                                                      
@@ -120,7 +120,7 @@ if(BUILD_TESTING)
         string(SUBSTRING "${pair}" ${pair_tail} -1 shm_source)
         add_executable(shm_${shm_name} tests/shm/${shm_source}.c)
         target_include_directories(shm_${shm_name} PRIVATE
-            src/shm include)
+            src include)
                                                                   
                                      
                                                                 

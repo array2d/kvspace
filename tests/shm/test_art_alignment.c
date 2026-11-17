@@ -36,7 +36,7 @@ int main(void) {
         CHECK(t_set_wire(kv, key, v, (int32_t)n) == 0);
         free(v);
     }
-    CHECK(kvspaceShmArtAlignCheck(kv) == -1);
+    CHECK(kvspaceTestArtAlignCheck(kv) == -1);
     printf("PASS art_alignment\n");
     return 0;
 }
