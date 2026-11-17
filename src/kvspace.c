@@ -117,17 +117,14 @@ typedef struct {
     char magic[sizeof(KVS_MAGIC)];
     uint64_t art_slab_size, sbo_head_size, sbo_data_size;
     int32_t art_root;
-    uint64_t gens_size;
     uint64_t gen_epoch;
     uint32_t recovery_epoch;
     uint32_t ack_seq;
     uint32_t barrier_state;
-    uint64_t barrier_pid, barrier_starttime;
     uint64_t garb_head, garb_tail;
     uint64_t committed_bytes;
     uint64_t freed_bytes;
     uint64_t garb_freeing;
-    uint64_t round_ok, round_aborted, leak_boxes;
     uint64_t list_gen;
     uint32_t claim_seq;
     p2_slot_t slots[P2_SLOT_N];
@@ -192,7 +189,6 @@ struct kvspace {
     uint64_t gen_n;
     uint64_t art_total_seen;
     kvspace_hdr_t *hdr;
-    uint64_t store_id;
     int p2_slot;
     uint32_t pid;
     uint32_t fork_gen;
@@ -285,21 +281,7 @@ static int64_t gen_alloc_epoch(kvspace_t *kv) {
 static int p2_maint_start(kvspace_t *kv);
 static bool p2_claim_alive(kvspace_t *kv, uint32_t claim);
 static int kv_sync(kvspace_t *kv);
-#ifdef P2_TEST_HOOKS
-static struct {
-    uint32_t garb_threshold_megabytes;
-    int barrier_ms;
-    uint32_t hold_drain_ms;
-    uint32_t hold_reserve_ms;
-    bool fail_alloc;
-    bool fail_art_insert;
-} g_p2_test_knobs;
-#endif
 static uint64_t p2_garb_threshold(void) {
-#ifdef P2_TEST_HOOKS
-    if (g_p2_test_knobs.garb_threshold_megabytes)
-        return (uint64_t)g_p2_test_knobs.garb_threshold_megabytes << 20;
-#endif
     return GARB_THRESHOLD;
 }
 static void garb_full_report(kvspace_t *kv) {
@@ -496,18 +478,6 @@ static void p2_reg_release(kvspace_t *kv) {
                                 __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE);
     kv->p2_slot = -1;
 }
-static void p2_ack_slot(kvspace_t *kv, uint32_t ep) {
-    if (kv->p2_slot < 0)
-        return;
-    __atomic_store_n(&kv->hdr->slots[kv->p2_slot].recovery_ack, ep,
-                     __ATOMIC_RELEASE);
-    __atomic_add_fetch(&kv->hdr->ack_seq, 1u, __ATOMIC_RELEASE);
-#if defined(__linux__)
-    if (__atomic_load_n(&kv->hdr->barrier_state, __ATOMIC_ACQUIRE))
-        syscall(SYS_futex, &kv->hdr->ack_seq, FUTEX_WAKE, INT_MAX, NULL, NULL,
-                0);
-#endif
-}
 #define GEN_RESERVE (8ULL << 30)
 static int gens_grow(kvspace_t *kv) {
     uint64_t want = gen_cap(kv) * sizeof(kv_gens_t);
@@ -529,7 +499,6 @@ static int gens_grow(kvspace_t *kv) {
         return -1;
     if (region_map(&kv->r_gen, (size_t)want) != 0)
         return -1;
-    kv->hdr->gens_size = want;
     return 0;
 }
 static uint32_t g_fork_gen;
@@ -540,9 +509,6 @@ static void p2_atfork_child(void) {
 static void p2_atfork_install(void) {
     (void)pthread_atfork(NULL, NULL, p2_atfork_child);
 }
-#define P2_FORK_GUARD(kv) \
-    ((kv)->fork_gen != __atomic_load_n(&g_fork_gen, __ATOMIC_ACQUIRE))
-#define P2_VIEW_GUARD(kv) ((kv)->quiesced || P2_FORK_GUARD(kv))
 static int head_of(const uint8_t *val, int32_t val_len, kvspaceXvalueHead *out) {
     if (!val || val_len < (int32_t)KVSPACE_XVALUE_HEAD_LEN)
         return -1;
@@ -558,26 +524,13 @@ static int head_of(const uint8_t *val, int32_t val_len, kvspaceXvalueHead *out) 
     }
     return 0;
 }
-static int value_ok(const uint8_t *val, int32_t val_len,
-                    kvspaceXvalueHead *out) {
-    if (head_of(val, val_len, out) != 0)
-        return -1;
-    return 0;
-}
 static long long p2_now_ms(void) {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return (long long)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
 }
 static int p2_barrier_ms(void) {
-#ifdef P2_TEST_HOOKS
-    int ms = g_p2_test_knobs.barrier_ms;
-    if (ms == 0)
-        ms = P2_BARRIER_MS_DEFAULT;
-#else
-    int ms = P2_BARRIER_MS_DEFAULT;
-#endif
-    return ms < 1 ? 1 : (ms > 5000 ? 5000 : ms);
+    return P2_BARRIER_MS_DEFAULT;
 }
 #if defined(__linux__)
 static void p2_futex_wait(uint32_t *addr, uint32_t val, int ms) {
@@ -713,7 +666,6 @@ static int p2_drain(kvspace_t *kv, uint32_t r) {
             if (p2_claim_alive(kv, GE_CLAIM(m)))
                 goto out;
             __atomic_store_n(&e->meta, GE_EMPTY, __ATOMIC_RELEASE);
-            __atomic_add_fetch(&kv->hdr->leak_boxes, 1, __ATOMIC_ACQ_REL);
             fprintf(stderr,
                     "kvspace: garbage entry %llu reserved by dead claim %u: "
                     "leaked\n", (unsigned long long)i, GE_CLAIM(m));
@@ -730,10 +682,6 @@ static int p2_drain(kvspace_t *kv, uint32_t r) {
         __atomic_store_n(&kv->hdr->garb_freeing, off, __ATOMIC_RELEASE);
         __atomic_store_n(&e->meta, GE_EMPTY, __ATOMIC_RELEASE);
         __atomic_store_n(&kv->hdr->garb_head, i + 1, __ATOMIC_RELEASE);
-#ifdef P2_TEST_HOOKS
-        if (g_p2_test_knobs.hold_drain_ms)
-            usleep((useconds_t)g_p2_test_knobs.hold_drain_ms * 1000);
-#endif
         kv_sbo_free(kv, off);
         __atomic_store_n(&kv->hdr->freed_bytes,
                          kv->hdr->freed_bytes + cap, __ATOMIC_RELEASE);
@@ -762,14 +710,12 @@ static int p2_round(kvspace_t *kv) {
     uint64_t pending = __atomic_exchange_n(&kv->hdr->garb_freeing, 0,
                                            __ATOMIC_ACQ_REL);
     if (pending) {
-        __atomic_add_fetch(&kv->hdr->leak_boxes, 1, __ATOMIC_ACQ_REL);
         fprintf(stderr, "kvspace: previous leader died freeing box %llu: "
                         "leaked\n", (unsigned long long)pending);
     }
     uint32_t r = __atomic_add_fetch(&kv->hdr->recovery_epoch, 1u,
                                     __ATOMIC_ACQ_REL);
     if (!p2_wait_acks(kv, r, p2_barrier_ms())) {
-        __atomic_add_fetch(&kv->hdr->round_aborted, 1, __ATOMIC_ACQ_REL);
         p2_release_busy(kv);
         return -2;
     }
@@ -784,7 +730,6 @@ static int p2_round(kvspace_t *kv) {
         __atomic_compare_exchange_n(&s->state, &v, P2_SLOT_FREE, false,
                                     __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE);
     }
-    __atomic_add_fetch(&kv->hdr->round_ok, 1, __ATOMIC_ACQ_REL);
     p2_release_busy(kv);
     return freed;
 #endif
@@ -844,30 +789,12 @@ static void p2_maint_stop(kvspace_t *kv) {
     __atomic_store_n(&kv->maint_started, 0u, __ATOMIC_RELEASE);
 }
 #ifdef P2_TEST_HOOKS
-void kvspaceShmTestSetGarbageThresholdMegabytes(uint32_t megabytes) {
-    g_p2_test_knobs.garb_threshold_megabytes = megabytes;
-}
-void kvspaceShmTestSetBarrierMilliseconds(int milliseconds) {
-    g_p2_test_knobs.barrier_ms = milliseconds;
-}
-void kvspaceShmTestSetHoldDrainMilliseconds(uint32_t milliseconds) {
-    g_p2_test_knobs.hold_drain_ms = milliseconds;
-}
-void kvspaceShmTestSetHoldReserveMilliseconds(uint32_t milliseconds) {
-    g_p2_test_knobs.hold_reserve_ms = milliseconds;
-}
-void kvspaceShmTestSetFailAlloc(bool enabled) {
-    g_p2_test_knobs.fail_alloc = enabled;
-}
-void kvspaceShmTestSetFailArtInsert(bool enabled) {
-    g_p2_test_knobs.fail_art_insert = enabled;
-}
-#ifdef P2_TEST_HOOKS
 void kvspaceTestSetDataSize(size_t data_size) {
     kvspace_data_size = data_size;
 }
 #endif
-int64_t kvspaceShmArtAlignCheck(kvspace_t *kv) {
+#ifdef P2_TEST_HOOKS
+int64_t kvspaceTestArtAlignCheck(kvspace_t *kv) {
     if (!kv || !kv->art_meta)
         return -2;
     blocks_meta_t *m = kv->art_meta;
@@ -1190,64 +1117,6 @@ static int32_t art_find2(kvspace_t *kv, int32_t nid, const uint8_t *key, int kle
 static int32_t art_find(kvspace_t *kv, int32_t nid, const uint8_t *key,
                         int klen) {
     return art_find2(kv, nid, key, klen, NULL, NULL);
-}
-static int last_key_sep(const uint8_t *key, int klen, int *seplen) {
-    int slash = -1, mid = -1;
-    for (int i = 0; i < klen; i++) {
-        if (key[i] == '/')
-            slash = i;
-        if (i + 1 < klen && key[i] == 0xC2 && key[i + 1] == 0xB7)
-            mid = i;
-    }
-    if (mid > slash) {
-        *seplen = 2;
-        return mid;
-    }
-    if (slash > 0) {
-        *seplen = 1;
-        return slash;
-    }
-    *seplen = 0;
-    return -1;
-}
-static int32_t art_find_dir(kvspace_t *kv, int32_t nid, const uint8_t *key,
-                            int klen, int last_sep, int seplen, int32_t *dirn,
-                            int *dird) {
-    int d = 0;
-    int32_t dir = -1;
-    int dd = 0;
-    if (nid < 0 || !key)
-        return -1;
-    while (nid >= 0) {
-        art_hdr_t *h = art_hdr(kv, nid);
-        if (!h || h->type == ART_MOVED)
-            return -1;
-        int entry_d = d;
-        if (h->prefix_len) {
-            int s = pfx_shared(h->prefix, h->prefix_len, key + d, klen - d);
-            if (s != h->prefix_len)
-                return -1;
-            d += h->prefix_len;
-            if (d > klen)
-                return -1;
-        }
-        if (dir < 0 && last_sep > 0 && seplen > 0 &&
-            ((entry_d <= last_sep && last_sep < d) ||
-             d == last_sep + seplen)) {
-            dir = nid;
-            dd = d;
-        }
-        if (d == klen) {
-            if (dirn)
-                *dirn = dir;
-            if (dird)
-                *dird = dd;
-            return AV_HAS(art_val_load(h)) ? nid : -1;
-        }
-        nid = art_child(kv, h, key[d]);
-        d++;
-    }
-    return -1;
 }
 static art_hdr_t *art_search(kvspace_t *kv, int32_t nid, const uint8_t *key,
                              int klen) {
@@ -1641,19 +1510,6 @@ static char *pjoin(const char *a, const char *b) {
     memcpy(r + al + sep, b, bl + 1);
     return r;
 }
-static void psplit(const char *k, char **p, char **n) {
-    const char *s = strrchr(k, '/');
-    if (!s || s == k) {
-        *p = strdup("/");
-        *n = strdup(s ? s + 1 : k);
-        return;
-    }
-    size_t pl = (size_t)(s - k) + 1;
-    *p = malloc(pl + 1);
-    memcpy(*p, k, pl);
-    (*p)[pl] = '\0';
-    *n = strdup(s + 1);
-}
 static int bad_dir_prefix(const char *p) {
     if (!p || !p[0])
         return 1;
@@ -2031,10 +1887,6 @@ static kvspace_t *open_shm_store(const char *path, size_t data_size) {
     kv->sbo_meta = (sbo_meta_t *)kv->r_head.base;
     kv->sbo_data = kv->r_data.base;
     kv->garb = (garb_ent_t *)kv->r_garb.base;
-    {
-        static uint32_t store_seq;
-        kv->store_id = ((uint64_t)getpid() << 32) | (uint64_t)++store_seq;
-    }
     if (created) {
         memset(kv->hdr, 0, sizeof(*kv->hdr));
         kv->hdr->art_slab_size = art_slab;
@@ -2228,187 +2080,6 @@ static int dir_ext_path(kvspace_t *kv, const char *dir, char *out, int osz) {
     memcpy(out, raw + KVSPACE_XVALUE_HEAD_LEN, (size_t)l4);
     out[l4] = 0;
     return 1;
-}
-#define KVSPACE_STATUS_MAX_LEN 16u
-#define KVSPACE_STATUS_MIN_CAP 80u
-static int is_vthread_status_key(const char *key) {
-    static const char pfx[] = "/vthread/";
-    static const char suf[] = "/\xE2\x80\xA5status";
-    if (!key)
-        return 0;
-    size_t n = strlen(key), sl = sizeof suf - 1;
-    return n > sl && strncmp(key, pfx, sizeof pfx - 1) == 0 &&
-           memcmp(key + n - sl, suf, sl) == 0;
-}
-static int is_char_langtype(const uint8_t *langtype, uint16_t length) {
-    if (!langtype || length == 0)
-        return 0;
-    uint16_t at = 0;
-    if (langtype[0] == '[') {
-        while (at < length && langtype[at] != ']')
-            ++at;
-        if (at >= length)
-            return 0;
-        ++at;
-    }
-    return (uint16_t)(length - at) >= 5 &&
-           memcmp(langtype + at, "char/", 5) == 0;
-}
-static int shm_set_local(kvspace_t *kv, const char *key, const uint8_t *val,
-                         int32_t val_len, art_hdr_t *old, size_t reserve) {
-    size_t alloc_len = (size_t)val_len;
-    if (reserve > alloc_len)
-        alloc_len = reserve;
-    if (is_vthread_status_key(key) && alloc_len < KVSPACE_STATUS_MIN_CAP)
-        alloc_len = KVSPACE_STATUS_MIN_CAP;
-    uint64_t ohv = old ? art_val_load(old) : 0;
-    bool retiring = old && AV_HAS(ohv);
-    uint64_t gidx = 0;
-    uint64_t cap = 0;
-    if (retiring) {
-        cap = sbo_allocated_size(kv->sbo_meta, AV_OFF(ohv));
-        if ((uint64_t)alloc_len <= cap) {
-            kv_gens_t *g = gens_at(kv, art_id_of(kv, old));
-            if (g)
-                __atomic_add_fetch(&g->value_gen, 1u, __ATOMIC_ACQ_REL);
-            memcpy(kv->sbo_data + AV_OFF(ohv), val, (size_t)val_len);
-            if (g)
-                __atomic_add_fetch(&g->value_gen, 1u, __ATOMIC_ACQ_REL);
-            return 0;
-        }
-        if (garb_reserve(kv, &gidx) != 0)
-            return -1;
-#ifdef P2_TEST_HOOKS
-        if (g_p2_test_knobs.hold_reserve_ms)
-            usleep((useconds_t)g_p2_test_knobs.hold_reserve_ms * 1000);
-        if (g_p2_test_knobs.fail_alloc) {
-            garb_cancel(kv, gidx);
-            return -1;
-        }
-#endif
-    }
-    uint64_t off = kv_sbo_alloc(kv, alloc_len);
-    if (off == (uint64_t)-1) {
-        if (retiring)
-            garb_cancel(kv, gidx);
-        return -1;
-    }
-    memcpy(kv->sbo_data + off, val, val_len);
-#ifdef P2_TEST_HOOKS
-    if (retiring && g_p2_test_knobs.fail_art_insert) {
-        garb_cancel(kv, gidx);
-        kv_sbo_free(kv, off);
-        return -1;
-    }
-#endif
-    int32_t root = art_ins(kv, kv->hdr->art_root, (const uint8_t *)key,
-                           (int)strlen(key), 0, off);
-    if (root < 0) {
-        if (retiring)
-            garb_cancel(kv, gidx);
-        kv_sbo_free(kv, off);
-        return -1;
-    }
-    kv->hdr->art_root = root;
-    {
-        int32_t nid = p2_node_at(kv, key);
-        kv_gens_t *g = gens_at(kv, nid);
-        if (g) {
-            gen_bump_struct(kv, nid);
-            gen_bump_value(kv, nid);
-        }
-    }
-    if (retiring)
-        garb_commit(kv, gidx, AV_OFF(ohv), cap);
-    else
-        list_gen_bump(kv);
-    return 0;
-}
-static int shm_set_raw(kvspace_t *kv, const char *key, const uint8_t *val,
-                       int32_t val_len, size_t reserve) {
-    art_hdr_t *old = art_search(kv, kv->hdr->art_root, (const uint8_t *)key,
-                                (int)strlen(key));
-    return shm_set_local(kv, key, val, val_len, old, reserve);
-}
-static int frame_operand_ptr(const char *key, const uint8_t *wire_bytes,
-                             uint64_t wire_len) {
-    if (kvspace_c_reference_of(wire_bytes, wire_len) !=
-            KVSPACE_XVALUE_REFERENCE_PTR ||
-        strncmp(key, "/vthread/", 9) != 0)
-        return 0;
-    const char *slot = strrchr(key, '/');
-    if (!slot || slot[1] != '[')
-        return 0;
-    char *end;
-    long row = strtol(slot + 2, &end, 10);
-    if (row <= 0 || *end++ != ',')
-        return 0;
-    long col = strtol(end, &end, 10);
-    return col != 0 && *end++ == ']' && *end == '\0';
-}
-static int shm_set_validated(kvspace_t *kv, const char *key,
-                            const uint8_t *val, int32_t val_len,
-                            const kvspaceXvalueHead *wire) {
-    if (kv_sync(kv) != 0)
-        return -1;
-    char kbuf[1024];
-    if (strlen(key) >= sizeof kbuf || strstr(key, "//") ||
-        reserved_meta_path(key))
-        return -1;
-    strcpy(kbuf, key);
-    art_hdr_t *local = art_search(kv, kv->hdr->art_root,
-                                   (const uint8_t *)kbuf, (int)strlen(kbuf));
-    uint64_t lhv = local ? art_val_load(local) : 0;
-    if (!local || !AV_HAS(lhv)) {
-        char *pp = NULL, *nn = NULL;
-        psplit(kbuf, &pp, &nn);
-        char extpath[1024];
-        if (pp && nn && dir_ext_path(kv, pp, extpath, sizeof extpath)) {
-            char *tgt = pjoin(extpath, nn);
-            art_hdr_t *eh = art_search(kv, kv->hdr->art_root,
-                                       (const uint8_t *)tgt, (int)strlen(tgt));
-            free(tgt);
-            if (eh && AV_HAS(art_val_load(eh)) &&
-                !frame_operand_ptr(kbuf, val, (uint64_t)val_len)) {
-                free(pp);
-                free(nn);
-                return -1;
-            }
-        }
-        free(pp);
-        free(nn);
-    }
-    if (is_vthread_status_key(kbuf)) {
-        const uint8_t *status_langtype = NULL;
-        uint16_t status_langtype_len = 0;
-        if (kvspace_c_scan_attrs(val, (uint64_t)val_len, &status_langtype,
-                                 &status_langtype_len) != 0)
-            return -1;
-        uint64_t effective = 0;
-        if (kvspaceXvalueHeadEffectiveLen(val, (uint64_t)val_len, &effective) != 0 ||
-            effective > KVSPACE_STATUS_MAX_LEN ||
-            !is_char_langtype(status_langtype, status_langtype_len))
-            return -1;
-        if (local && AV_HAS(lhv)) {
-            uint8_t *old_raw = kv->sbo_data + AV_OFF(lhv);
-            uint64_t old_sz = sbo_allocated_size(kv->sbo_meta, AV_OFF(lhv));
-            kvspaceXvalueHead old;
-            const uint8_t *old_langtype = NULL;
-            uint16_t old_langtype_len = 0;
-            if (kvspace_c_scan_attrs(old_raw, (uint64_t)old_sz, &old_langtype,
-                                     &old_langtype_len) != 0)
-                return -1;
-            uint64_t old_effective = 0;
-            if (head_of(old_raw, (int32_t)old_sz, &old) != 0 ||
-                kvspaceXvalueHeadEffectiveLen(old_raw, (uint64_t)old_sz,
-                                              &old_effective) != 0 ||
-                old_effective > KVSPACE_STATUS_MAX_LEN ||
-                old_sz < KVSPACE_STATUS_MIN_CAP ||
-                !is_char_langtype(old_langtype, old_langtype_len))
-                return -1;
-        }
-    }
-    return shm_set_local(kv, kbuf, val, val_len, local, 0);
 }
 static int shm_del_key(kvspace_t *kv, const char *key) {
     bool d = false;
@@ -2655,53 +2326,6 @@ static int copy_tree(kvspace_t *kv, const char *src, const char *dst) {
     delete_tree(kv, dst);
     return cptree_rec(kv, src, dst);
 }
-int kvspaceShmCplist(kvspace_t *kv, const char *src, const char *dst) {
-    if (!kv || !src || !dst || reserved_meta_path(src) ||
-        reserved_meta_path(dst))
-        return -1;
-    if (strcmp(src, dst) == 0)
-        return 0;
-    delete_tree(kv, dst);
-    const uint8_t *raw = NULL;
-    uint64_t rl = 0;
-    if (read_wire(kv, src, &raw, &rl) == 0 && copy_key(kv, src, dst) != 0)
-        return -1;
-    char *ms = memdir(src), *md = memdir(dst);
-    char **mms;
-    int32_t mc;
-    if (list_names(kv, ms, false, 1, &mms, &mc) != 0) {
-        free(ms);
-        free(md);
-        return -1;
-    }
-    size_t msl = strlen(ms), mdl = strlen(md);
-    int rc = 0;
-    for (int i = 0; i < mc; i++) {
-        size_t nl = strlen(mms[i]);
-        char *cs = malloc(msl + nl + 1);
-        char *cd = malloc(mdl + nl + 1);
-        if (!cs || !cd) {
-            rc = -1;
-        } else {
-            memcpy(cs, ms, msl);
-            memcpy(cs + msl, mms[i], nl + 1);
-            memcpy(cd, md, mdl);
-            memcpy(cd + mdl, mms[i], nl + 1);
-            if (copy_key(kv, cs, cd) != 0)
-                rc = -1;
-        }
-        free(cs);
-        free(cd);
-        if (rc != 0)
-            break;
-    }
-    for (int i = 0; i < mc; i++)
-        free(mms[i]);
-    free(mms);
-    free(ms);
-    free(md);
-    return rc;
-}
 static int same_child(const char *a, const char *b) {
     size_t na = strlen(a), nb = strlen(b);
     if (na && a[na - 1] == '/') na--;
@@ -2837,8 +2461,8 @@ static int list_names(kvspace_t *kv, const char *prefix, bool ex, int resolve,
         return rc > 0 ? 0 : -1;
     return list_scan(kv, target, ext, on, oc);
 }
-int kvspaceShmListLen(kvspace_t *kv, const char *prefix, bool ex, int resolve,
-                      int32_t *out_count) {
+int kvspaceTestListLen(kvspace_t *kv, const char *prefix, bool ex, int resolve,
+                       int32_t *out_count) {
     if (!out_count)
         return -1;
     *out_count = 0;
@@ -3234,12 +2858,6 @@ static int list_names_raw(kvspace_t *kv, const char *key, char *out_names,
     keyscan_free(&children);
     return KVSPACE_OK;
 }
-#define KVSPACE_SHM_DEFAULT_SIZE (8ULL * 64 * 64 * 64 * 64)
-#if defined(__GNUC__)
-#define KVSPACE_PUBLIC __attribute__((visibility("default")))
-#else
-#define KVSPACE_PUBLIC 
-#endif
 static int kvspace_dsn_path(const char *dsn, char *out, size_t out_size) {
     if (!dsn)
         return -1;

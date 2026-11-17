@@ -1,7 +1,6 @@
 #include <kvspace/kvspace_xvalue.h>
 #include <stdint.h>
 #include <string.h>
-#define KVSPACE_XVALUE_ATTR_TAG_RETIRED_REALLEN 2u
 static int tag_is_writable(uint8_t tag) {
     return tag != KVSPACE_XVALUE_ATTR_TAG_RETIRED_REALLEN && tag != 0u;
 }

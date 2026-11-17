@@ -4,7 +4,7 @@ KVSpace 的存储层实现：一个 `.so`，两个层次，互不越界。
 
 | 层 | 头 | 符号 |
 |---|---|---|
-| 存储 ABI | `kvspace.h` | 12 个：Connect / Close / XvalueInProcessAddress / ResolveOffset / Realloc / Free / Cp / Mkindex / Deltree / Cpdir / Listlen / List |
+| 存储 ABI | `kvspace.h` | 13 个：Connect / Close / XvalueInProcessAddress / ResolveOffset / AnchorOf / Realloc / Free / Cp / Mkindex / Deltree / Cpdir / Listlen / List |
 | 字节层 | `kvspace_xvalue.h` | 3 个：XvalueGetAttr / XvalueSetAttr / XvalueHeadEffectiveLen |
 | 存储常量 | `const.h` | 1 个：`kvspaceConstStorage` |
 
@@ -49,7 +49,7 @@ reallen）：**任何读写路径见到它都必须拒**——那是「写读双
 ## Build
 
 ```bash
-# 生产（17 个导出符号：13 存储 + 3 字节层 + 1 常量；内部 kvspaceShm* 隐藏）
+# 生产（17 个导出符号：13 存储 + 3 字节层 + 1 常量；内部符号隐藏）
 cmake -S . -B build -DBUILD_TESTING=OFF
 cmake --build build -j
 
@@ -72,10 +72,10 @@ cmake --install build                   # libkvspace.so.1 + include/ + kvspace.p
 ## 目录
 
 ```
-include/kvspace/kvspace.h          # 权威存储 ABI 头（12 符号）
+include/kvspace/kvspace.h          # 权威存储 ABI 头（13 符号）
 include/kvspace/kvspace_xvalue.h   # 字节层：head 布局 + attr 读写（3 符号）
 include/kvspace/const.h            # 存储常量 + kvspaceConstStorage()
-src/shm/kvspace.c                  # SHM 引擎（file-backed mmap + ART）
+src/kvspace.c                      # SHM 引擎（file-backed mmap + ART）
 src/xvalue_head.c                  # 字节层实现
 src/const.c                        # 存储常量查找表
 cli/                               # kvspace CLI（Cargo）——只做存储子命令
