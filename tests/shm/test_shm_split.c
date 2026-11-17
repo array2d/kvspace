@@ -1,5 +1,5 @@
 #define _GNU_SOURCE 
-#include "kvspace_shm.h"
+#include "kvspace_shared_memory.h"
 #include "test_wire.h"
 #include "test_util.h"
 #include <fcntl.h>

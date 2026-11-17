@@ -125,7 +125,7 @@ if(BUILD_TESTING)
                                      
                                                                 
                   
-        target_compile_definitions(shm_${shm_name} PRIVATE P2_TEST_HOOKS)
+        target_compile_definitions(shm_${shm_name} PRIVATE RECOVERY_TEST_HOOKS)
         target_link_libraries(shm_${shm_name} PRIVATE kvspace)
         add_test(NAME shm_${shm_name} COMMAND shm_${shm_name})
     endforeach()
@@ -185,7 +185,7 @@ target_compile_definitions(kvspace PRIVATE _GNU_SOURCE)
                                                 
                             
 if(BUILD_TESTING)
-    target_compile_definitions(kvspace PRIVATE P2_TEST_HOOKS)
+    target_compile_definitions(kvspace PRIVATE RECOVERY_TEST_HOOKS)
 endif()
 
                  
