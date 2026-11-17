@@ -17,6 +17,8 @@ endif()
                                                  
 add_library(kvspace SHARED
     src/kvspace.c
+    src/kvspace_key.c
+    src/kvspace_xvalue_internal.c
     src/xvalue_head.c
     src/const.c)
 target_include_directories(kvspace PRIVATE src)
