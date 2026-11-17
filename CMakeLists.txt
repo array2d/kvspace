@@ -17,6 +17,7 @@ endif()
                                                  
 add_library(kvspace SHARED
     src/shm/kvspace.c
+    src/shm/trie.c
     src/xvalue_head.c
     src/const.c)
 target_include_directories(kvspace PRIVATE src/shm)
@@ -128,6 +129,11 @@ if(BUILD_TESTING)
         target_link_libraries(shm_${shm_name} PRIVATE kvspace)
         add_test(NAME shm_${shm_name} COMMAND shm_${shm_name})
     endforeach()
+
+    add_executable(trie_test tests/shm/test_trie.c)
+    target_include_directories(trie_test PRIVATE src/shm include)
+    target_link_libraries(trie_test PRIVATE kvspace)
+    add_test(NAME trie_test COMMAND trie_test)
 
                                        
      
