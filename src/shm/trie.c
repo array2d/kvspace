@@ -1,10 +1,21 @@
 #include "trie.h"
+#include <sched.h>
 #include <string.h>
 
 #define TRIE_INITIAL_CAPACITY UINT32_C(4)
 #define TRIE_SEPARATOR_SLASH ((uint8_t)0x2F)
 #define TRIE_SEPARATOR_DOT_LEAD ((uint8_t)0xC2)
 #define TRIE_SEPARATOR_DOT_TRAIL ((uint8_t)0xB7)
+
+static void trie_processor_relax(void) {
+#if defined(__x86_64__) || defined(__i386__)
+    __builtin_ia32_pause();
+#elif defined(__aarch64__)
+    __asm__ __volatile__("yield");
+#else
+    sched_yield();
+#endif
+}
 
 static int trie_environment_ready(const trie_env_t *env) {
     return env != NULL && env->alloc_bytes != NULL && env->base != NULL &&
@@ -375,6 +386,15 @@ static int trie_write_from(trie_env_t *env, uint64_t start_offset,
             if (status != KVSPACE_OK) {
                 return status;
             }
+            if (index + 1 < count && env->make_index_value != NULL) {
+                uint64_t initial_value = TRIE_VALUE_ABSENT;
+                if (env->make_index_value(env->context, &initial_value) != 0) {
+                    return KVSPACE_BACKEND;
+                }
+                trie_hdr_t *created = trie_header_pointer(env, child_offset);
+                created->value = initial_value;
+                created->value_gen++;
+            }
             status = trie_edge_insert(
                 env, trie_header_pointer(env, current_offset), child_offset);
             if (status != KVSPACE_OK) {
@@ -689,4 +709,148 @@ int trie_list_children(trie_env_t *env, uint64_t node, trie_visit_t visit,
         *out_count = index;
     }
     return KVSPACE_OK;
+}
+
+static int trie_subtree_walk(trie_env_t *env, uint64_t node, char *suffix,
+                             size_t suffix_length,
+                             trie_subtree_visit_t visit, void *context,
+                             uint32_t *out_count) {
+    trie_hdr_t *header = NULL;
+    int status = trie_node_live(env, node, &header);
+    if (status != KVSPACE_OK) {
+        return status;
+    }
+    int visit_status = visit(context, suffix, node, header->value);
+    if (visit_status != 0) {
+        return visit_status;
+    }
+    (*out_count)++;
+    trie_ent_t *table = trie_table_pointer(env, header);
+    for (uint32_t index = 0; index < header->count; index++) {
+        trie_ent_t *entry = &table[index];
+        if (!trie_span_inside(env, entry->name_offset, entry->name_length)) {
+            return KVSPACE_ANCHOR_INVALID;
+        }
+        if (suffix_length + entry->name_length >= TRIE_KEY_LIMIT) {
+            return KVSPACE_INVALID;
+        }
+        memcpy(suffix + suffix_length, env->base + entry->name_offset,
+               entry->name_length);
+        suffix[suffix_length + entry->name_length] = '\0';
+        status = trie_subtree_walk(env, entry->child_offset, suffix,
+                                   suffix_length + entry->name_length, visit,
+                                   context, out_count);
+        if (status != 0) {
+            return status;
+        }
+    }
+    return KVSPACE_OK;
+}
+
+int trie_subtree_visit(trie_env_t *env, uint64_t start,
+                       trie_subtree_visit_t visit, void *context,
+                       uint32_t *out_count) {
+    if (!trie_environment_ready(env) || visit == NULL) {
+        return KVSPACE_INVALID;
+    }
+    if (out_count != NULL) {
+        *out_count = 0;
+    }
+    char suffix[TRIE_KEY_LIMIT];
+    suffix[0] = '\0';
+    uint32_t count = 0;
+    int status = trie_subtree_walk(env, start, suffix, 0, visit, context,
+                                   &count);
+    if (out_count != NULL) {
+        *out_count = count;
+    }
+    return status;
+}
+
+int trie_child_at(trie_env_t *env, uint64_t node, uint32_t index,
+                  const uint8_t **out_name, uint16_t *out_name_length,
+                  uint64_t *out_child) {
+    if (!trie_environment_ready(env) || out_name == NULL ||
+        out_name_length == NULL || out_child == NULL) {
+        return KVSPACE_INVALID;
+    }
+    trie_hdr_t *header = NULL;
+    int status = trie_node_live(env, node, &header);
+    if (status != KVSPACE_OK) {
+        return status;
+    }
+    if (index >= header->count) {
+        return KVSPACE_INVALID;
+    }
+    trie_ent_t *entry = &trie_table_pointer(env, header)[index];
+    if (!trie_span_inside(env, entry->name_offset, entry->name_length)) {
+        return KVSPACE_ANCHOR_INVALID;
+    }
+    *out_name = env->base + entry->name_offset;
+    *out_name_length = entry->name_length;
+    *out_child = entry->child_offset;
+    return KVSPACE_OK;
+}
+
+int trie_value_get(trie_env_t *env, uint64_t node, uint64_t *out_value) {
+    if (!trie_environment_ready(env) || out_value == NULL) {
+        return KVSPACE_INVALID;
+    }
+    trie_hdr_t *header = NULL;
+    int status = trie_node_live(env, node, &header);
+    if (status != KVSPACE_OK) {
+        return status;
+    }
+    *out_value = header->value;
+    return KVSPACE_OK;
+}
+
+int trie_value_set(trie_env_t *env, uint64_t node, uint64_t value) {
+    if (!trie_environment_ready(env)) {
+        return KVSPACE_INVALID;
+    }
+    trie_hdr_t *header = NULL;
+    int status = trie_node_live(env, node, &header);
+    if (status != KVSPACE_OK) {
+        return status;
+    }
+    header->value = value;
+    header->value_gen++;
+    return KVSPACE_OK;
+}
+
+int trie_generations(trie_env_t *env, uint64_t node, uint32_t *out_struct_gen,
+                     uint32_t *out_value_gen) {
+    if (!trie_environment_ready(env) || out_struct_gen == NULL ||
+        out_value_gen == NULL) {
+        return KVSPACE_INVALID;
+    }
+    trie_hdr_t *header = NULL;
+    int status = trie_node_live(env, node, &header);
+    if (status != KVSPACE_OK) {
+        return status;
+    }
+    *out_struct_gen = header->struct_gen;
+    *out_value_gen = header->value_gen;
+    return KVSPACE_OK;
+}
+
+void trie_node_lock(trie_env_t *env, uint64_t node) {
+    trie_hdr_t *header = trie_header_pointer(env, node);
+    for (;;) {
+        uint32_t expected = 0;
+        if (__atomic_compare_exchange_n(&header->lock, &expected, UINT32_C(1),
+                                        0, __ATOMIC_ACQUIRE,
+                                        __ATOMIC_RELAXED)) {
+            return;
+        }
+        while (__atomic_load_n(&header->lock, __ATOMIC_RELAXED) != 0) {
+            trie_processor_relax();
+        }
+    }
+}
+
+void trie_node_unlock(trie_env_t *env, uint64_t node) {
+    trie_hdr_t *header = trie_header_pointer(env, node);
+    __atomic_store_n(&header->lock, UINT32_C(0), __ATOMIC_RELEASE);
 }

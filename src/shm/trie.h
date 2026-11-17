@@ -47,10 +47,14 @@ typedef struct trie_env {
     int (*alloc_bytes)(void *context, uint64_t bytes, uint64_t *out_offset);
     uint8_t *base;
     uint64_t slab_size;
+    int (*make_index_value)(void *context, uint64_t *out_value);
 } trie_env_t;
 
 typedef int (*trie_visit_t)(void *context, const uint8_t *name,
                             uint16_t name_length, uint64_t child_offset);
+
+typedef int (*trie_subtree_visit_t)(void *context, const char *suffix,
+                                    uint64_t node_offset, uint64_t value);
 
 int trie_root_create(trie_env_t *env, uint64_t *out_root);
 int trie_key_segments(const char *key, trie_segment_t *out_segments,
@@ -71,5 +75,17 @@ int trie_longest_child_name(trie_env_t *env, uint64_t node,
                             uint16_t *out_length);
 int trie_list_children(trie_env_t *env, uint64_t node, trie_visit_t visit,
                        void *context, uint32_t *out_count);
+int trie_subtree_visit(trie_env_t *env, uint64_t start,
+                       trie_subtree_visit_t visit, void *context,
+                       uint32_t *out_count);
+int trie_child_at(trie_env_t *env, uint64_t node, uint32_t index,
+                  const uint8_t **out_name, uint16_t *out_name_length,
+                  uint64_t *out_child);
+int trie_value_get(trie_env_t *env, uint64_t node, uint64_t *out_value);
+int trie_value_set(trie_env_t *env, uint64_t node, uint64_t value);
+int trie_generations(trie_env_t *env, uint64_t node, uint32_t *out_struct_gen,
+                     uint32_t *out_value_gen);
+void trie_node_lock(trie_env_t *env, uint64_t node);
+void trie_node_unlock(trie_env_t *env, uint64_t node);
 
 #endif

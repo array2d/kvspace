@@ -164,6 +164,10 @@ target_include_directories(kvspace
 find_package(Threads REQUIRED)
 target_link_libraries(kvspace PRIVATE Threads::Threads)
 
+if(BUILD_TESTING)
+    target_link_libraries(trie_test PRIVATE Threads::Threads)
+endif()
+
                                               
                          
                                                   
