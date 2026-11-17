@@ -140,10 +140,6 @@ static int t_list(void *kv, const char *prefix, bool expand_ext, int resolve,
     uint32_t kept = 0;
     for (uint32_t i = 0; i < count; i++) {
         size_t len = strlen(p);
-        if (memchr(p, 0xC2, len) || memchr(p, 0xB7, len)) {
-            p += len + 1;
-            continue;
-        }
         int replaced = 0;
         for (uint32_t j = 0; j < kept; j++) {
             size_t other = strlen(names[j]);
