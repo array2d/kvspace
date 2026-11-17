@@ -2,7 +2,6 @@
 #define _GNU_SOURCE
 #endif
 #include "kvspace_key.h"
-#include "kvspace_xvalue_internal.h"
 #include <limits.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -673,7 +672,9 @@ int32_t adaptive_radix_tree_insert(kvspace_t *store, int32_t node_id, const uint
     return node_id;
 }
 int32_t adaptive_radix_tree_delete(kvspace_t *store, int32_t node_id, const uint8_t *key, int key_length,
-                       int depth, bool *deleted) {
+                       int depth, bool *deleted, uint64_t *out_retired_offset) {
+    *deleted = false;
+    *out_retired_offset = 0;
     if (node_id < 0)
         return -1;
     adaptive_radix_tree_header_t *node_header = adaptive_radix_tree_header(store, node_id);
@@ -689,22 +690,16 @@ int32_t adaptive_radix_tree_delete(kvspace_t *store, int32_t node_id, const uint
         uint64_t header_value = adaptive_radix_tree_value_load(node_header);
         if (!ADAPTIVE_RADIX_TREE_VALUE_HAS(header_value))
             return node_id;
-        uint64_t retirement_index;
-        if (retirement_reserve(store, &retirement_index) != 0)
-            return -1;
-        if (!adaptive_radix_tree_value_compare_and_swap(node_header, &header_value, 0)) {
-            retirement_cancel(store, retirement_index);
+        if (!adaptive_radix_tree_value_compare_and_swap(node_header, &header_value, 0))
             return node_id;
-        }
         generation_bump_value(store, adaptive_radix_tree_id_of(store, node_header));
         generation_bump_struct(store, adaptive_radix_tree_id_of(store, node_header));
-        retirement_commit(store, retirement_index, ADAPTIVE_RADIX_TREE_VALUE_OFFSET(header_value),
-                    sbo_allocated_size(store->slots_box_meta, ADAPTIVE_RADIX_TREE_VALUE_OFFSET(header_value)));
+        *out_retired_offset = ADAPTIVE_RADIX_TREE_VALUE_OFFSET(header_value);
         *deleted = true;
     } else {
         int32_t child_id = adaptive_radix_tree_child(store, node_header, key[depth]);
         if (child_id >= 0) {
-            int32_t return_code = adaptive_radix_tree_delete(store, child_id, key, key_length, depth + 1, deleted);
+            int32_t return_code = adaptive_radix_tree_delete(store, child_id, key, key_length, depth + 1, deleted, out_retired_offset);
             if (return_code < 0)
                 return return_code;
         }

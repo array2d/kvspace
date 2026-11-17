@@ -180,8 +180,6 @@ static inline void kvspace_sbo_box_format(sbo_box_t *box, uint8_t objlevel,
 }
 int store_sync(kvspace_t *store);
 int region_map(shared_memory_region_t *region, size_t size);
-int recovery_maintenance_start(kvspace_t *store);
-bool recovery_claim_alive(kvspace_t *store, uint32_t claim);
 void kvspace_block_meta_lock(blocks_meta_t *meta);
 void kvspace_block_meta_unlock(blocks_meta_t *meta);
 void kvspace_block_mark_used(blocks_meta_t *meta, void *block_pointer);
