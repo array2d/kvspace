@@ -134,7 +134,6 @@ typedef struct {
 } kvspace_hdr_t;
 #define ART_OFF (sizeof(kvspace_hdr_t) + sizeof(blocks_meta_t))
 static size_t kvspace_data_size = 8ULL * 64 * 64 * 64 * 64;
-typedef struct kvspaceAnchor kvspaceAnchor_t;
 static int list_names(kvspace_t *kv, const char *prefix, bool expand_ext,
                    int resolve, char ***out_names, int32_t *out_count);
 static int delete_key(kvspace_t *kv, const char *key);
@@ -145,7 +144,10 @@ static uint8_t *storage_data_base(kvspace_t *kv);
 static int resolve_root(kvspace_t *kv, const char *key,
                              uint64_t *out_offset);
 static int resolve_anchor(kvspace_t *kv, const char *key,
-                                 kvspaceAnchor_t anchor, uint64_t *out_offset);
+                          const kvspace_anchor_t *anchor,
+                          uint64_t *out_offset);
+static int art_resume(kvspace_t *kv, int32_t node_id, const char *suffix,
+                      int suffix_len, uint64_t *out_offset);
 static int realloc_key(kvspace_t *kv, const char *key, uint64_t body_len,
                              uint64_t attr_len, uint64_t *out_offset);
 static int free_key(kvspace_t *kv, const char *key);
@@ -2870,42 +2872,72 @@ static int storage_locate(kvspace_t *kv, const char *key, int32_t *out_id,
     *out_offset = AV_OFF(hv);
     return KVSPACE_OK;
 }
-static int anchor_from_offset(kvspace_t *kv, int64_t key_offset,
-                              kvspaceAnchor_t *out) {
-    if (!kv || !out || key_offset <= 0)
-        return -1;
-    if ((uint64_t)key_offset >= kv->art_meta->total_size)
-        return -1;
-    int64_t block_id = blockid_bydataoffset(kv->art_meta, (uint64_t)key_offset);
-    if (block_id < 0 || (uint64_t)block_id >= kv->art_meta->used_blocks)
-        return -1;
-    out->key_offset = key_offset;
-    out->block_id = (int32_t)block_id;
-    return 0;
-}
-static int storage_anchor_ok(kvspace_t *kv, const kvspaceAnchor_t *anchor) {
-    if (!kv || !anchor || anchor->block_id < 0)
+static int anchor_offset_valid(kvspace_t *kv, uint64_t offset,
+                               int32_t *out_id) {
+    blocks_meta_t *m = kv->art_meta;
+    if (offset < (uint64_t)m->sizeof_block_head || offset >= m->total_size)
         return 0;
-    if ((uint64_t)anchor->block_id >= kv->art_meta->used_blocks)
+    int64_t id = blockid_bydataoffset(m, offset);
+    if (id < 0 || (uint64_t)id >= m->used_blocks)
         return 0;
-    art_hdr_t *h = art_hdr(kv, anchor->block_id);
-    if (!h || h->type == ART_MOVED)
-        return 0;
+    *out_id = (int32_t)id;
     return 1;
 }
+static int art_resume(kvspace_t *kv, int32_t node_id, const char *suffix,
+                      int suffix_len, uint64_t *out_offset) {
+    int32_t id = art_follow(kv, node_id);
+    if (id < 0)
+        return KVSPACE_ANCHOR_INVALID;
+    art_hdr_t *node = art_hdr(kv, id);
+    if (!node || node->type > ART_N256 || node->prefix_len > ART_PREFIX_MAX)
+        return KVSPACE_ANCHOR_INVALID;
+    uint64_t value = art_val_load(node);
+    if (suffix_len == 0)
+        return AV_HAS(value) ? (*out_offset = AV_OFF(value), KVSPACE_OK)
+                             : KVSPACE_MISSING;
+    int32_t child = art_child(kv, node, (uint8_t)suffix[0]);
+    if (child < 0)
+        return KVSPACE_MISSING;
+    int32_t found = art_walk(kv, child, (const uint8_t *)suffix, suffix_len, 1,
+                             NULL, NULL);
+    if (found < 0)
+        return KVSPACE_MISSING;
+    value = art_val_load(art_hdr(kv, found));
+    if (!AV_HAS(value))
+        return KVSPACE_MISSING;
+    *out_offset = AV_OFF(value);
+    return KVSPACE_OK;
+}
 static int resolve_anchor(kvspace_t *kv, const char *key,
-                                 kvspaceAnchor_t anchor, uint64_t *out_offset) {
-    int32_t id = -1;
+                          const kvspace_anchor_t *anchor,
+                          uint64_t *out_offset) {
     if (!kv || !key || !out_offset)
         return KVSPACE_INVALID;
     *out_offset = 0;
+    if (!anchor || anchor->node_offset == 0)
+        return resolve_root(kv, key, out_offset);
     if (reserved_meta_path(key))
         return KVSPACE_INVALID;
+    uint64_t suffix_len = (uint64_t)strlen(key);
+    if (key[0] == '/' || (uint64_t)anchor->depth + suffix_len >= 1024)
+        return KVSPACE_INVALID;
+    if (!(anchor->flags & KVSPACE_ANCHOR_FLAG_INDEX))
+        return KVSPACE_ANCHOR_INVALID;
     if (kv_sync(kv) != 0)
         return KVSPACE_BACKEND;
-    if (!storage_anchor_ok(kv, &anchor))
+    int32_t node_id = -1;
+    if (!anchor_offset_valid(kv, anchor->node_offset, &node_id))
         return KVSPACE_ANCHOR_INVALID;
-    return storage_locate(kv, key, &id, out_offset);
+    for (int attempt = 0; attempt < 3; attempt++) {
+        uint64_t before =
+            __atomic_load_n(&kv->hdr->gen_epoch, __ATOMIC_ACQUIRE);
+        int status = art_resume(kv, node_id, key, (int)suffix_len, out_offset);
+        uint64_t after =
+            __atomic_load_n(&kv->hdr->gen_epoch, __ATOMIC_ACQUIRE);
+        if (before == after)
+            return status;
+    }
+    return KVSPACE_ANCHOR_INVALID;
 }
 static uint8_t *storage_data_base(kvspace_t *kv) {
     return kv ? kv->sbo_data : NULL;
@@ -2922,34 +2954,6 @@ static int resolve_root(kvspace_t *kv, const char *key,
         return KVSPACE_BACKEND;
     return storage_locate(kv, key, &id, out_offset);
 }
-#ifdef P2_TEST_HOOKS
-int kvspaceShmTestAnchorOf(kvspace_t *kv, const char *parent_key,
-                           int64_t *out_anchor) {
-    if (!kv || !parent_key || !out_anchor)
-        return KVSPACE_INVALID;
-    if (reserved_meta_path(parent_key))
-        return KVSPACE_INVALID;
-    if (kv_sync(kv) != 0)
-        return KVSPACE_BACKEND;
-    art_hdr_t *h = art_search(kv, kv->hdr->art_root,
-                              (const uint8_t *)parent_key,
-                              (int)strlen(parent_key));
-    if (!h || !AV_HAS(art_val_load(h)))
-        return KVSPACE_MISSING;
-    int32_t id = art_id_of(kv, h);
-    if (id < 0)
-        return KVSPACE_BACKEND;
-    if ((uint64_t)id >= kv->art_meta->used_blocks)
-        return KVSPACE_BACKEND;
-    if (art_hdr(kv, id)->type == ART_MOVED)
-        return KVSPACE_BACKEND;
-    int64_t offset = (int64_t)blockdata_offset(kv->art_meta, (uint64_t)id);
-    if (offset <= 0)
-        return KVSPACE_BACKEND;
-    *out_anchor = offset;
-    return KVSPACE_OK;
-}
-#endif
 static void storage_write_head(uint8_t *dst, uint64_t body_len,
                                uint64_t attr_len) {
     kvspaceXvalueHead h;
@@ -3278,28 +3282,54 @@ KVSPACE_PUBLIC uint8_t *kvspaceXvalueInProcessAddress(void *handle) {
     return storage_data_base((kvspace_t *)handle);
 }
 KVSPACE_PUBLIC int kvspaceResolveOffset(void *handle, const char *key,
-                                 int64_t parent_key_anchor,
+                                 const kvspace_anchor_t *anchor,
                                  uint64_t *out_value_offset, char *err,
                                  uint32_t err_cap) {
     if (!handle || !key || !out_value_offset)
         return KVSPACE_INVALID;
     *out_value_offset = 0;
-    int internal;
-    if (parent_key_anchor == KVSPACE_ANCHOR_ROOT) {
-        internal = resolve_root((kvspace_t *)handle, key,
-                                            out_value_offset);
-    } else {
-        kvspaceAnchor_t anchor;
-        if (anchor_from_offset((kvspace_t *)handle, parent_key_anchor,
-                               &anchor) != 0)
-            return kvspace_fail(KVSPACE_ANCHOR_INVALID, err, err_cap,
-                                "resolve", key);
-        internal = resolve_anchor((kvspace_t *)handle, key,
-                                                anchor, out_value_offset);
-    }
+    int internal = resolve_anchor((kvspace_t *)handle, key, anchor,
+                                  out_value_offset);
     if (internal == KVSPACE_OK)
         return KVSPACE_OK;
     return kvspace_fail(internal, err, err_cap, "resolve", key);
+}
+KVSPACE_PUBLIC int kvspaceAnchorOf(void *handle, const char *directory_key,
+                                   kvspace_anchor_t *out_anchor, char *err,
+                                   uint32_t err_cap) {
+    if (!handle || !directory_key || !out_anchor)
+        return KVSPACE_INVALID;
+    size_t key_len = strlen(directory_key);
+    if (reserved_meta_path(directory_key) || strstr(directory_key, "//") ||
+        key_len == 0 || key_len >= 1024)
+        return kvspace_fail(KVSPACE_INVALID, err, err_cap, "anchor",
+                            directory_key);
+    if (!storage_is_index_key(directory_key))
+        return kvspace_fail(KVSPACE_NOT_INDEX, err, err_cap, "anchor",
+                            directory_key);
+    kvspace_t *kv = (kvspace_t *)handle;
+    if (kv_sync(kv) != 0)
+        return kvspace_fail(KVSPACE_BACKEND, err, err_cap, "anchor",
+                            directory_key);
+    art_hdr_t *node = art_search(kv, kv->hdr->art_root,
+                                 (const uint8_t *)directory_key,
+                                 (int)key_len);
+    if (!node || !AV_HAS(art_val_load(node)))
+        return kvspace_fail(KVSPACE_MISSING, err, err_cap, "anchor",
+                            directory_key);
+    int32_t id = art_id_of(kv, node);
+    if (id < 0)
+        return kvspace_fail(KVSPACE_BACKEND, err, err_cap, "anchor",
+                            directory_key);
+    uint64_t offset = (uint64_t)blockdata_offset(kv->art_meta, (uint64_t)id);
+    if (offset == 0)
+        return kvspace_fail(KVSPACE_BACKEND, err, err_cap, "anchor",
+                            directory_key);
+    out_anchor->node_offset = offset;
+    out_anchor->epoch = __atomic_load_n(&kv->hdr->gen_epoch, __ATOMIC_ACQUIRE);
+    out_anchor->depth = (uint32_t)key_len;
+    out_anchor->flags = KVSPACE_ANCHOR_FLAG_INDEX;
+    return KVSPACE_OK;
 }
 KVSPACE_PUBLIC int kvspaceRealloc(void *handle, const char *key,
                                  uint64_t body_length, uint64_t attr_length,

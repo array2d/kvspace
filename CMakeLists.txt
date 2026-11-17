@@ -107,6 +107,7 @@ if(BUILD_TESTING)
         "art_scan|test_art_scan"
         "art_alignment|test_art_alignment"
         "anchor_hook|test_anchor_hook"
+        "anchor_cross_process|test_anchor_cross_process"
         "shm_split|test_shm_split"
         "storage_abi|test_storage_abi"
                                                                       

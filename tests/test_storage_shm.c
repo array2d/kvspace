@@ -31,13 +31,13 @@ static void test_resolve_realloc(void *kv) {
         CHECK(back == probe, "base+offset 写读回的字节不对");
     }
     clear_err();
-    CHECK(kvspaceResolveOffset(kv, "/ct/a", 0, &again, err, sizeof err) == KVSPACE_OK,
+    CHECK(kvspaceResolveOffset(kv, "/ct/a", NULL, &again, err, sizeof err) == KVSPACE_OK,
           "resolve 已存在的 key 失败: %s", err);
     CHECK(again == first,
           "resolve 的 offset(%llu) 与 realloc 返回(%llu) 不一致",
           (unsigned long long)again, (unsigned long long)first);
     clear_err();
-    int rc = kvspaceResolveOffset(kv, "/ct/never", 0, &again, err, sizeof err);
+    int rc = kvspaceResolveOffset(kv, "/ct/never", NULL, &again, err, sizeof err);
     CHECK(rc == KVSPACE_MISSING,
           "resolve 不存在的 key 应返回 MISSING，实得 %d (%s)", rc, err);
     clear_err();
@@ -69,7 +69,7 @@ static void test_makeindex_free(void *kv) {
     CHECK(kvspaceFree(kv, "/idx2/", err, sizeof err) == KVSPACE_HAS_CHILDREN,
           "free 非空索引应返回 HAS_CHILDREN");
     clear_err();
-    CHECK(kvspaceResolveOffset(kv, "/idx2/member", 0, &off, err, sizeof err) ==
+    CHECK(kvspaceResolveOffset(kv, "/idx2/member", NULL, &off, err, sizeof err) ==
               KVSPACE_OK,
           "free 非空索引失败后，成员不该消失: %s", err);
 }
@@ -257,7 +257,7 @@ static void test_copy_and_delete(void *kv) {
     CHECK(kvspaceCp(kv, "/cp/src", "/cp/dst", err, sizeof err) == KVSPACE_OK,
           "kvspaceCp 失败: %s", err);
     clear_err();
-    CHECK(kvspaceResolveOffset(kv, "/cp/dst", 0, &off, err, sizeof err) == KVSPACE_OK,
+    CHECK(kvspaceResolveOffset(kv, "/cp/dst", NULL, &off, err, sizeof err) == KVSPACE_OK,
           "cp 之后目标不存在: %s", err);
     CHECK(kvspaceMkindex(kv, "/cd/src/", err, sizeof err) == KVSPACE_OK,
           "建 /cd/src/ 失败: %s", err);
@@ -267,13 +267,13 @@ static void test_copy_and_delete(void *kv) {
     CHECK(kvspaceCpdir(kv, "/cd/src/", "/cd/dst/", err, sizeof err) == KVSPACE_OK,
           "kvspaceCpdir 失败: %s", err);
     clear_err();
-    CHECK(kvspaceResolveOffset(kv, "/cd/dst/m", 0, &off, err, sizeof err) == KVSPACE_OK,
+    CHECK(kvspaceResolveOffset(kv, "/cd/dst/m", NULL, &off, err, sizeof err) == KVSPACE_OK,
           "cpdir 之后子项不存在: %s", err);
     clear_err();
     CHECK(kvspaceDeltree(kv, "/cd/src/", err, sizeof err) == KVSPACE_OK,
           "kvspaceDeltree 失败: %s", err);
     clear_err();
-    CHECK(kvspaceResolveOffset(kv, "/cd/src/m", 0, &off, err, sizeof err) ==
+    CHECK(kvspaceResolveOffset(kv, "/cd/src/m", NULL, &off, err, sizeof err) ==
               KVSPACE_MISSING,
           "deltree 之后子项仍可 resolve");
     clear_err();
@@ -284,7 +284,7 @@ static void test_copy_and_delete(void *kv) {
     CHECK(kvspaceDeltree(kv, "/cd/src/", err, sizeof err) == KVSPACE_OK,
           "deltree 不存在的 key 应视为成功");
     clear_err();
-    CHECK(kvspaceResolveOffset(kv, "/cd/dst/m", 0, &off, err, sizeof err) == KVSPACE_OK,
+    CHECK(kvspaceResolveOffset(kv, "/cd/dst/m", NULL, &off, err, sizeof err) == KVSPACE_OK,
           "deltree 连带删掉了兄弟子树 /cd/dst/");
 }
 int main(void) {

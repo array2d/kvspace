@@ -1,6 +1,6 @@
-#define _GNU_SOURCE 
+#define _GNU_SOURCE
 #include "kvspace/kvspace.h"
-#include "kvspace_shm.h"
+#include "kvspace/kvspace_xvalue.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -30,7 +30,6 @@ int main(void) {
         return 1;
     }
     char err[256] = {0};
-    kvspace_t *kv = (kvspace_t *)h;
     int rc = kvspaceMkindex(h, "/d/", err, sizeof err);
     CHECK(rc == KVSPACE_OK, "mkindex /d/ rc=%d err=%s", rc, err);
     uint64_t off = 0;
@@ -40,35 +39,74 @@ int main(void) {
     CHECK(base != NULL, "in-process address must not be NULL for shm");
     if (base) {
         for (int i = 0; i < 8; i++)
-            base[off + 16 + (uint64_t)i] = (uint8_t)(i + 1);
+            base[off + KVSPACE_XVALUE_HEAD_LEN + (uint64_t)i] = (uint8_t)(i + 1);
     }
-    int64_t anchor = 0;
-    rc = kvspaceShmTestAnchorOf(kv, "/d/", &anchor);
-    CHECK(rc == KVSPACE_OK, "anchor_of /d/ rc=%d", rc);
-    CHECK(anchor > 0, "anchor 必须是正的 key 区偏移，实际 %lld",
-          (long long)anchor);
+    kvspace_anchor_t anchor = {0};
+    rc = kvspaceAnchorOf(h, "/d/", &anchor, err, sizeof err);
+    CHECK(rc == KVSPACE_OK, "anchor_of /d/ rc=%d err=%s", rc, err);
+    CHECK(anchor.node_offset > 0, "anchor 必须是正的 key 区偏移，实际 %llu",
+          (unsigned long long)anchor.node_offset);
+    CHECK(anchor.depth == 3, "anchor.depth 应是父 key 字节数 3，实际 %u",
+          anchor.depth);
+    CHECK(anchor.flags == KVSPACE_ANCHOR_FLAG_INDEX,
+          "anchor.flags 应含 INDEX，实际 %u", anchor.flags);
     uint64_t child_off = 0;
     memset(err, 0, sizeof err);
-    rc = kvspaceResolveOffset(h, "/d/x", (uint64_t)anchor, &child_off, err,
-                        sizeof err);
+    rc = kvspaceResolveOffset(h, "x", &anchor, &child_off, err, sizeof err);
     CHECK(rc == KVSPACE_OK,
-          "用钩子给的 anchor 解析 /d/x 必须成功（rc=%d err=%s）—— "
+          "用 anchor 解析相对后缀 x 必须成功（rc=%d err=%s）—— "
           "否则这个 anchor 就不是可用锚点",
           rc, err);
     CHECK(child_off == off,
           "经 anchor 解析出的偏移应与 Realloc 返回的一致：%llu vs %llu",
           (unsigned long long)child_off, (unsigned long long)off);
-    int64_t untouched = -12345;
-    rc = kvspaceShmTestAnchorOf(kv, "/no-such-parent/", &untouched);
+    uint64_t parent_off = 0;
+    rc = kvspaceResolveOffset(h, "", &anchor, &parent_off, err, sizeof err);
+    CHECK(rc == KVSPACE_OK, "空后缀解析到父节点自身 rc=%d err=%s", rc, err);
+    static const char *const siblings[] = {"/d/a", "/d/b", "/d/c", "/d/d",
+                                           "/d/e"};
+    for (size_t i = 0; i < sizeof siblings / sizeof siblings[0]; i++) {
+        uint64_t sibling_off = 0;
+        rc = kvspaceRealloc(h, siblings[i], 1, 0, &sibling_off, err, sizeof err);
+        CHECK(rc == KVSPACE_OK, "realloc %s rc=%d err=%s", siblings[i], rc, err);
+    }
+    int64_t child_count = 0;
+    uint32_t max_name_length = 0;
+    rc = kvspaceListlen(h, "/d/", &child_count, &max_name_length, err,
+                        sizeof err);
+    CHECK(rc == KVSPACE_OK && child_count == 6,
+          "/d/ 必须有 6 个子项（N4 上限 4，必然已增长）：rc=%d n=%lld err=%s",
+          rc, (long long)child_count, err);
+    uint64_t grown_off = 0;
+    rc = kvspaceResolveOffset(h, "x", &anchor, &grown_off, err, sizeof err);
+    CHECK(rc == KVSPACE_OK && grown_off == off,
+          "节点增长（ART_MOVED）后旧 anchor 仍须解析到同一偏移：rc=%d "
+          "off=%llu vs %llu err=%s",
+          rc, (unsigned long long)grown_off, (unsigned long long)off, err);
+    rc = kvspaceResolveOffset(h, "/d/x", &anchor, &child_off, err, sizeof err);
+    CHECK(rc == KVSPACE_INVALID, "绝对后缀必须 INVALID（rc=%d）", rc);
+    kvspace_anchor_t no_flag = anchor;
+    no_flag.flags = 0;
+    rc = kvspaceResolveOffset(h, "x", &no_flag, &child_off, err, sizeof err);
+    CHECK(rc == KVSPACE_ANCHOR_INVALID,
+          "flags 不含 INDEX 必须 ANCHOR_INVALID（rc=%d）", rc);
+    kvspace_anchor_t untouched = {0};
+    rc = kvspaceAnchorOf(h, "/d/x", &untouched, err, sizeof err);
+    CHECK(rc == KVSPACE_NOT_INDEX, "值 key 不是 index，必须 NOT_INDEX（rc=%d）",
+          rc);
+    CHECK(untouched.node_offset == 0, "失败时不得写 out_anchor，实际 %llu",
+          (unsigned long long)untouched.node_offset);
+    rc = kvspaceAnchorOf(h, "/no-such-parent/", &untouched, err, sizeof err);
     CHECK(rc == KVSPACE_MISSING,
           "不存在的父节点必须 MISSING（rc=%d，期望 %d）", rc, KVSPACE_MISSING);
-    CHECK(untouched == -12345, "失败时不得写 out_anchor，实际 %lld",
-          (long long)untouched);
-    CHECK(kvspaceShmTestAnchorOf(NULL, "/d/", &anchor) == KVSPACE_INVALID,
-          "NULL kv 必须 INVALID");
-    CHECK(kvspaceShmTestAnchorOf(kv, NULL, &anchor) == KVSPACE_INVALID,
+    CHECK(untouched.node_offset == 0, "失败时不得写 out_anchor，实际 %llu",
+          (unsigned long long)untouched.node_offset);
+    CHECK(kvspaceAnchorOf(NULL, "/d/", &anchor, err, sizeof err) ==
+              KVSPACE_INVALID,
+          "NULL handle 必须 INVALID");
+    CHECK(kvspaceAnchorOf(h, NULL, &anchor, err, sizeof err) == KVSPACE_INVALID,
           "NULL key 必须 INVALID");
-    CHECK(kvspaceShmTestAnchorOf(kv, "/d/", NULL) == KVSPACE_INVALID,
+    CHECK(kvspaceAnchorOf(h, "/d/", NULL, err, sizeof err) == KVSPACE_INVALID,
           "NULL out 必须 INVALID");
     kvspaceClose(h);
     char cmd[600];
