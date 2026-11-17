@@ -1,5 +1,5 @@
-#ifndef KVSPACE_SHARED_MEMORY_H
-#define KVSPACE_SHARED_MEMORY_H
+#ifndef KVSPACE_TEST_HOOKS_H
+#define KVSPACE_TEST_HOOKS_H
 #include <kvspace/kvspace.h>
 #include <stdbool.h>
 #include <stddef.h>

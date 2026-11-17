@@ -1,5 +1,4 @@
 #define _GNU_SOURCE
-#include "kvspace_shared_memory.h"
 #include "test_public_io.h"
 #include "test_wire.h"
 #include <kvspace/kvspace.h>
