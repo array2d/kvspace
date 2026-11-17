@@ -1572,7 +1572,7 @@ static int child_name_len(const char *rest, int restlen) {
             return i;
         if (i + 1 < restlen && (unsigned char)rest[i] == 0xC2 &&
             (unsigned char)rest[i + 1] == 0xB7)
-            return i;
+            return i + 2;
     }
     return restlen;
 }
