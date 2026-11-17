@@ -9,9 +9,9 @@ KVSpace 的存储层实现：一个 `.so`，两个层次，互不越界。
 | 存储常量 | `const.h` | 1 个：`kvspaceConstStorage` |
 
 **语言层不在这里**：langtype（tag 1）、wire 构造器、坐标段比较器、kind 常量
-都在 kvlang 仓的 `libkvlang_xvalue.a`（`include/kvlang/xvalue.h`、`kvlang/include/kvlang/const.h`）。
-**本仓不导出任何 kind 常量**——`const.h` 只有 6 个存储常量（两个分隔符、目录后缀、
-输入这两个错误串），语言层的 `KVLANG_KIND_*` 一个都不在这里。
+都在 kvlang 仓的 `libkvlang_xvalue.so`（`kvlangxvalue/kvlangxvalue.h`，常量查询在同头声明）。
+**本仓不导出任何 kind 常量**——`const.h` 只有 4 个存储常量（目录索引后缀、成员分隔符、
+两条错误串），语言层的 `KVLANG_KIND_*` 一个都不在这里。
 kvspace 是存储层，它不认识 langtype 这个词；把语言概念写进存储头，等于让存储层依赖
 语言层——那样的 kvspace 就不能被别的语言复用，也不能被独立替换。
 
@@ -47,6 +47,23 @@ Go/Python/Rust 扩展运行期取，免去硬编码裸字面量。运行期成�
 排在 `[10]` 前面）是上层的事：需要它的调用方用 `kvlangCoordCmp`（唯一一份
 `cmp_coord`），不要指望存储层给。
 
+## 兼容性
+
+本分支有三类不兼容变化，旧环境必须重建或同步升级：
+
+- **shm store 布局**：共享头字段、退役环侧车 `.retirement` 与旧版本不同；旧 store
+  不能打开。magic 不承载版本号，按「只有一个 version、不向后兼容」处理：删除旧
+  store 后重建。
+- **anchor ABI**：`kvspaceResolveOffset` 的 anchor 参数由整数改为
+  `const kvspace_anchor_t *`。`NULL` 表示从根按绝对 key 解析；非零 anchor 表示从
+  该目录节点按相对后缀解析。跨仓调用方必须同步声明与调用点。
+- **常量归属**：`KVSPACE_PATH_SEP` 删除（与 `KVSPACE_DIR_INDEX_SUF` 重复）；
+  `KVSPACE_RUNTIME_MEMBER_SEP` 移到 `kvlangConstLanguage("KVLANG_RUNTIME_MEMBER_SEP")`；
+  错误串改为 `KVSPACE_ERR_INDEX_MUST_END_WITH_SEPARATOR`。
+
+合并顺序：kvlang 的常量迁移与 anchor ABI 迁移先落地，再合并 kvspace，避免 kvlang
+的扩展与绑定点查询已删除的常量或按旧参数调用。
+
 ## Build
 
 ```bash
@@ -54,13 +71,13 @@ Go/Python/Rust 扩展运行期取，免去硬编码裸字面量。运行期成�
 cmake -S . -B build -DBUILD_TESTING=OFF
 cmake --build build -j
 
-# 测试（额外打开内部观测钩子，并把 kvspaceShm* 放出来供测试直接链接）
+# 测试（额外打开内部观测钩子，并把 kvspaceTest* 放出来供测试直接链接）
 cmake -S . -B build-test -DBUILD_TESTING=ON
 cmake --build build-test -j && ctest --test-dir build-test
 ```
 
 **本仓不依赖 kvlang**：测试造值用 `tests/shm/test_wire.h` 里的本地 inline 拼 wire，
-不链 `libkvlang_xvalue.a`；CLI 只做存储子命令，也只链 `libkvspace`。所以上面两条
+不链 `libkvlang_xvalue.so`；CLI 只做存储子命令，也只链 `libkvspace`。所以上面两条
 命令都不需要外部路径参数。谁要构造带 langtype 的值，谁就是语言层的消费者——那是
 kvlang 仓的 `tutorial-c/` 与 `bindings/{py,rust}/`。
 
