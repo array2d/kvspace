@@ -74,11 +74,9 @@ static void suite_q1(void) {
         emit_skipped("kvspace", "write-8B", "p50", "connect failed");
         return;
     }
-    char err[256];
     uint64_t off = 0;
     uint8_t payload[8] = {1, 2, 3, 4, 5, 6, 7, 8};
-    err[0] = 0;
-    if (kvspaceRealloc(h, "/bench/k", 8, 0, &off, err, sizeof err) != 0) {
+    if (kvspaceRealloc(h, "/bench/k", 8, 0, &off) != 0) {
         emit_skipped("kvspace", "write-8B", "p50", "realloc failed");
         kvspaceClose(h);
         return;
@@ -92,12 +90,12 @@ static void suite_q1(void) {
     uint8_t *base = kvspaceXvalueInProcessAddress(h);
     for (int i = 0; i < Q1_WARMUP; i++) {
         uint64_t o = 0;
-        kvspaceResolveOffset(h, "/bench/k", 0, &o, err, sizeof err);
+        kvspaceResolveOffset(h, "/bench/k", 0, &o);
     }
     for (int i = 0; i < Q1_ITERS; i++) {
         double t0 = now_ns();
         uint64_t o = 0;
-        if (kvspaceResolveOffset(h, "/bench/k", 0, &o, err, sizeof err) == 0 &&
+        if (kvspaceResolveOffset(h, "/bench/k", 0, &o) == 0 &&
             base) {
             memcpy(base + o, payload, 8);
         }
@@ -121,11 +119,9 @@ static void suite_q2(void) {
                      "connect failed");
         return;
     }
-    char err[256], key[64];
+    char key[64];
     uint64_t off_before = 0;
-    err[0] = 0;
-    if (kvspaceRealloc(h, "/bench/probe", 8, 0, &off_before, err,
-                       sizeof err) != 0) {
+    if (kvspaceRealloc(h, "/bench/probe", 8, 0, &off_before) != 0) {
         emit_skipped("kvspace", "address-stable-after-grow", "correct",
                      "probe realloc failed");
         kvspaceClose(h);
@@ -137,17 +133,14 @@ static void suite_q2(void) {
     for (int i = 0; i < Q2_FILL_KEYS; i++) {
         uint64_t o = 0;
         snprintf(key, sizeof key, "/bench/fill%06d", i);
-        err[0] = 0;
-        if (kvspaceRealloc(h, key, Q2_FILL_BYTES, 0, &o, err, sizeof err) != 0)
+            if (kvspaceRealloc(h, key, Q2_FILL_BYTES, 0, &o) != 0)
             break;
         uint8_t *b = kvspaceXvalueInProcessAddress(h);
         if (b)
             memset(b + o, (uint8_t)(i & 0xFF), Q2_FILL_BYTES);
     }
     uint64_t off_after = 0;
-    err[0] = 0;
-    int resolved = kvspaceResolveOffset(h, "/bench/probe", 0, &off_after, err,
-                                        sizeof err);
+    int resolved = kvspaceResolveOffset(h, "/bench/probe", 0, &off_after);
     uint8_t *base1 = kvspaceXvalueInProcessAddress(h);
     int same = 0;
     if (resolved == 0 && base1) {
@@ -170,15 +163,14 @@ static void *q3_thread(void *arg) {
     void *h = kvspaceConnect(w->dsn);
     if (!h)
         return NULL;
-    char err[256], key[96], dir[64];
+    char key[96], dir[64];
     snprintf(dir, sizeof dir, "/bench/dir%d/", w->thread_id % w->dirs);
     double t0 = now_ns();
     for (int i = 0; i < w->iters; i++) {
         uint64_t off = 0;
         snprintf(key, sizeof key, "%se%06d", dir, i);
-        err[0] = 0;
-        if (kvspaceRealloc(h, key, 64, 0, &off, err, sizeof err) == 0)
-            kvspaceFree(h, key, err, sizeof err);
+            if (kvspaceRealloc(h, key, 64, 0, &off) == 0)
+            kvspaceFree(h, key);
     }
     w->elapsed_ns = (uint64_t)(now_ns() - t0);
     kvspaceClose(h);
@@ -227,12 +219,11 @@ static void suite_q4(void) {
         void *h = kvspaceConnect(g_dsn);
         if (!h)
             _exit(2);
-        char err[256], key[64];
+        char key[64];
         for (int i = 0; i < Q4_KEYS; i++) {
             uint64_t off = 0;
             snprintf(key, sizeof key, "/bench/recover%04d", i);
-            err[0] = 0;
-            if (kvspaceRealloc(h, key, 8, 0, &off, err, sizeof err) != 0)
+                    if (kvspaceRealloc(h, key, 8, 0, &off) != 0)
                 _exit(3);
             uint8_t *b = kvspaceXvalueInProcessAddress(h);
             int64_t marker = i;
@@ -254,13 +245,12 @@ static void suite_q4(void) {
                      "reopen failed");
         return;
     }
-    char err[256], key[64];
+    char key[64];
     uint64_t correct = 0, missing = 0, unreadable = 0;
     for (int i = 0; i < Q4_KEYS; i++) {
         uint64_t off = 0;
         snprintf(key, sizeof key, "/bench/recover%04d", i);
-        err[0] = 0;
-        if (kvspaceResolveOffset(h, key, 0, &off, err, sizeof err) != 0) {
+            if (kvspaceResolveOffset(h, key, 0, &off) != 0) {
             missing++;
             continue;
         }

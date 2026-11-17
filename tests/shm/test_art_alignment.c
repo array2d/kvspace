@@ -37,6 +37,7 @@ int main(void) {
         free(v);
     }
     CHECK(kvspaceTestArtAlignCheck(kv) == -1);
+    kvspaceClose(kv);
     printf("PASS art_alignment\n");
     return 0;
 }

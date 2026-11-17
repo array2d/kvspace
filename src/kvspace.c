@@ -103,8 +103,6 @@ static bool slots_box_data_size_ok(size_t data_size) {
     return false;
 }
 static kvspace_t *open_shared_memory_store(const char *path, size_t data_size) {
-    if (!path)
-        return NULL;
     if (!blockmalloc_layout_ok()) {
         fprintf(stderr, "kvspace: unexpected blockmalloc blocks_meta_t layout\n");
         return NULL;
@@ -223,8 +221,6 @@ fail:
     return NULL;
 }
 static void close_shared_memory_store(kvspace_t *store) {
-    if (!store)
-        return;
     if (store->process_id == (uint32_t)getpid() && store->recovery_slot >= 0 &&
         !recovery_other_alive(store)) {
 #if defined(__linux__)
@@ -270,7 +266,7 @@ static int shared_memory_delete_key(kvspace_t *store, const char *key) {
     return 1;
 }
 static int delete_tree(kvspace_t *store, const char *prefix) {
-    if (!store || !prefix || reserved_meta_path(prefix))
+    if (reserved_meta_path(prefix))
         return -1;
     if (store_sync(store) != 0)
         return -1;
@@ -355,8 +351,6 @@ static int write_wire(kvspace_t *store, const char *key, const uint8_t *wire,
     return 0;
 }
 static int copy_key(kvspace_t *store, const char *source, const char *destination) {
-    if (!store || !source || !destination)
-        return -1;
     const uint8_t *raw = NULL;
     uint64_t raw_length = 0;
     if (read_wire(store, source, &raw, &raw_length) != 0)
@@ -428,8 +422,7 @@ static int copy_tree_recursive(kvspace_t *store, const char *source, const char 
     return return_code;
 }
 static int copy_tree(kvspace_t *store, const char *source, const char *destination) {
-    if (!store || !source || !destination || reserved_meta_path(source) ||
-        reserved_meta_path(destination))
+    if (reserved_meta_path(source) || reserved_meta_path(destination))
         return -1;
     size_t source_length = strlen(source);
     for (;;) {
@@ -456,13 +449,11 @@ static int copy_tree(kvspace_t *store, const char *source, const char *destinati
     return copy_tree_recursive(store, source, destination);
 }
 static uint8_t *storage_data_base(kvspace_t *store) {
-    return store ? store->slots_box_data : NULL;
+    return store->slots_box_data;
 }
 static int realloc_key(kvspace_t *store, const char *key,
                              uint64_t body_length, uint64_t attribute_length,
                              uint64_t *out_offset) {
-    if (!store || !key || !out_offset)
-        return KVSPACE_INVALID;
     *out_offset = 0;
     if (!key_text_valid(key))
         return KVSPACE_INVALID;
@@ -531,8 +522,6 @@ static int realloc_key(kvspace_t *store, const char *key,
     return KVSPACE_OK;
 }
 static int free_key(kvspace_t *store, const char *key) {
-    if (!store || !key)
-        return KVSPACE_INVALID;
     if (!key_text_valid(key))
         return KVSPACE_INVALID;
     if (store_sync(store) != 0)
@@ -553,8 +542,6 @@ static int free_key(kvspace_t *store, const char *key) {
     return KVSPACE_OK;
 }
 static int makeindex_key(kvspace_t *store, const char *key) {
-    if (!store || !key)
-        return KVSPACE_INVALID;
     if (!key_text_valid(key))
         return KVSPACE_INVALID;
     if (!storage_is_index_key(key))
@@ -577,13 +564,6 @@ static int kvspace_data_source_name_path(const char *data_source_name, char *out
     int written = snprintf(out, out_size, "%s", separator + 3);
     return written > 0 && (size_t)written < out_size ? 0 : -1;
 }
-static int kvspace_fail(int status, char *error, uint32_t error_capacity,
-                        const char *operation, const char *key) {
-    if (error && error_capacity)
-        snprintf(error, error_capacity, "kvspace: %s failed at %s", operation,
-                 key ? key : "(null)");
-    return status;
-}
 KVSPACE_PUBLIC void *kvspaceConnect(const char *data_source_name) {
     int entry_errno = errno;
     char path[1024];
@@ -601,57 +581,38 @@ KVSPACE_PUBLIC void *kvspaceConnect(const char *data_source_name) {
     return NULL;
 }
 KVSPACE_PUBLIC void kvspaceClose(void *handle) {
-    if (handle)
-        close_shared_memory_store((kvspace_t *)handle);
+    close_shared_memory_store((kvspace_t *)handle);
 }
 KVSPACE_PUBLIC uint8_t *kvspaceXvalueInProcessAddress(void *handle) {
-    if (!handle)
-        return NULL;
     return storage_data_base((kvspace_t *)handle);
 }
 KVSPACE_PUBLIC int kvspaceResolveOffset(void *handle, const char *key,
                                  const kvspace_anchor_t *anchor,
-                                 uint64_t *out_value_offset, char *error,
-                                 uint32_t error_capacity) {
-    if (!handle || !key || !out_value_offset)
-        return KVSPACE_INVALID;
+                                 uint64_t *out_value_offset) {
     *out_value_offset = 0;
-    int internal = resolve_anchor((kvspace_t *)handle, key, anchor,
-                                  out_value_offset);
-    if (internal == KVSPACE_OK)
-        return KVSPACE_OK;
-    return kvspace_fail(internal, error, error_capacity, "resolve", key);
+    return resolve_anchor((kvspace_t *)handle, key, anchor, out_value_offset);
 }
 KVSPACE_PUBLIC int kvspaceAnchorOf(void *handle, const char *directory_key,
-                                   kvspace_anchor_t *out_anchor, char *error,
-                                   uint32_t error_capacity) {
-    if (!handle || !directory_key || !out_anchor)
-        return KVSPACE_INVALID;
+                                   kvspace_anchor_t *out_anchor) {
     size_t key_len = strlen(directory_key);
     if (!key_text_valid(directory_key))
-        return kvspace_fail(KVSPACE_INVALID, error, error_capacity, "anchor",
-                            directory_key);
+        return KVSPACE_INVALID;
     if (!storage_is_index_key(directory_key))
-        return kvspace_fail(KVSPACE_NOT_INDEX, error, error_capacity, "anchor",
-                            directory_key);
+        return KVSPACE_NOT_INDEX;
     kvspace_t *store = (kvspace_t *)handle;
     if (store_sync(store) != 0)
-        return kvspace_fail(KVSPACE_BACKEND, error, error_capacity, "anchor",
-                            directory_key);
+        return KVSPACE_BACKEND;
     adaptive_radix_tree_header_t *node = adaptive_radix_tree_search(store, store->header->adaptive_radix_tree_root,
                                  (const uint8_t *)directory_key,
                                  (int)key_len);
     if (!node || !ADAPTIVE_RADIX_TREE_VALUE_HAS(adaptive_radix_tree_value_load(node)))
-        return kvspace_fail(KVSPACE_MISSING, error, error_capacity, "anchor",
-                            directory_key);
+        return KVSPACE_MISSING;
     int32_t id = adaptive_radix_tree_id_of(store, node);
     if (id < 0)
-        return kvspace_fail(KVSPACE_BACKEND, error, error_capacity, "anchor",
-                            directory_key);
+        return KVSPACE_BACKEND;
     uint64_t offset = (uint64_t)blockdata_offset(store->adaptive_radix_tree_meta, (uint64_t)id);
     if (offset == 0)
-        return kvspace_fail(KVSPACE_BACKEND, error, error_capacity, "anchor",
-                            directory_key);
+        return KVSPACE_BACKEND;
     out_anchor->node_offset = offset;
     out_anchor->epoch = __atomic_load_n(&store->header->generation_epoch, __ATOMIC_ACQUIRE);
     out_anchor->depth = (uint32_t)key_len;
@@ -660,89 +621,43 @@ KVSPACE_PUBLIC int kvspaceAnchorOf(void *handle, const char *directory_key,
 }
 KVSPACE_PUBLIC int kvspaceRealloc(void *handle, const char *key,
                                  uint64_t body_length, uint64_t attribute_length,
-                                 uint64_t *out_value_offset, char *error,
-                                 uint32_t error_capacity) {
-    if (!handle || !key || !out_value_offset)
-        return KVSPACE_INVALID;
+                                 uint64_t *out_value_offset) {
     *out_value_offset = 0;
-    int internal = realloc_key((kvspace_t *)handle, key,
-                                            body_length, attribute_length,
-                                            out_value_offset);
-    if (internal == KVSPACE_OK)
-        return KVSPACE_OK;
-    return kvspace_fail(internal, error, error_capacity, "realloc",
-                        key);
+    return realloc_key((kvspace_t *)handle, key, body_length,
+                       attribute_length, out_value_offset);
 }
-KVSPACE_PUBLIC int kvspaceFree(void *handle, const char *key, char *error,
-                               uint32_t error_capacity) {
-    if (!handle || !key)
-        return KVSPACE_INVALID;
-    int internal = free_key((kvspace_t *)handle, key);
-    if (internal == KVSPACE_OK)
-        return KVSPACE_OK;
-    return kvspace_fail(internal, error, error_capacity, "free", key);
+KVSPACE_PUBLIC int kvspaceFree(void *handle, const char *key) {
+    return free_key((kvspace_t *)handle, key);
 }
 KVSPACE_PUBLIC int kvspaceCp(void *handle, const char *old_key,
-                             const char *new_key, char *error,
-                             uint32_t error_capacity) {
-    if (!handle || !old_key || !new_key)
-        return KVSPACE_INVALID;
-    if (copy_key((kvspace_t *)handle, old_key, new_key) != 0)
-        return kvspace_fail(KVSPACE_BACKEND, error, error_capacity, "cp", old_key);
-    return KVSPACE_OK;
+                             const char *new_key) {
+    return copy_key((kvspace_t *)handle, old_key, new_key) == 0 ? KVSPACE_OK
+                                                                : KVSPACE_BACKEND;
 }
-KVSPACE_PUBLIC int kvspaceMkindex(void *handle, const char *key, char *error,
-                                  uint32_t error_capacity) {
-    if (!handle || !key)
-        return KVSPACE_INVALID;
-    int internal = makeindex_key((kvspace_t *)handle, key);
-    if (internal == KVSPACE_OK)
-        return KVSPACE_OK;
-    return kvspace_fail(internal, error, error_capacity, "mkindex",
-                        key);
+KVSPACE_PUBLIC int kvspaceMkindex(void *handle, const char *key) {
+    return makeindex_key((kvspace_t *)handle, key);
 }
-KVSPACE_PUBLIC int kvspaceDeltree(void *handle, const char *key, char *error,
-                                  uint32_t error_capacity) {
-    if (!handle || !key)
-        return KVSPACE_INVALID;
-    if (delete_tree((kvspace_t *)handle, key) != 0)
-        return kvspace_fail(KVSPACE_BACKEND, error, error_capacity, "deltree", key);
-    return KVSPACE_OK;
+KVSPACE_PUBLIC int kvspaceDeltree(void *handle, const char *key) {
+    return delete_tree((kvspace_t *)handle, key) == 0 ? KVSPACE_OK
+                                                      : KVSPACE_BACKEND;
 }
 KVSPACE_PUBLIC int kvspaceCpdir(void *handle, const char *source_key,
-                                const char *destination_key, char *error,
-                                uint32_t error_capacity) {
-    if (!handle || !source_key || !destination_key)
-        return KVSPACE_INVALID;
-    if (copy_tree((kvspace_t *)handle, source_key, destination_key) != 0)
-        return kvspace_fail(KVSPACE_BACKEND, error, error_capacity, "cpdir", source_key);
-    return KVSPACE_OK;
+                                const char *destination_key) {
+    return copy_tree((kvspace_t *)handle, source_key, destination_key) == 0
+               ? KVSPACE_OK
+               : KVSPACE_BACKEND;
 }
 KVSPACE_PUBLIC int kvspaceListlen(void *handle, const char *key,
                                   int64_t *out_count,
-                                  uint32_t *out_max_name_length, char *error,
-                                  uint32_t error_capacity) {
-    if (!handle || !key || !out_count || !out_max_name_length)
-        return KVSPACE_INVALID;
+                                  uint32_t *out_max_name_length) {
     *out_count = 0;
     *out_max_name_length = 0;
-    int internal = listlen_key((kvspace_t *)handle, key, out_count,
-                                            out_max_name_length);
-    if (internal == KVSPACE_OK)
-        return KVSPACE_OK;
-    return kvspace_fail(internal, error, error_capacity, "listlen",
-                        key);
+    return listlen_key((kvspace_t *)handle, key, out_count,
+                       out_max_name_length);
 }
 KVSPACE_PUBLIC int kvspaceList(void *handle, const char *key, char *out_names,
                                uint32_t out_capacity, uint32_t *out_length,
-                               uint32_t *out_count, uint64_t *out_generation,
-                               char *error, uint32_t error_capacity) {
-    if (!handle || !key)
-        return KVSPACE_INVALID;
-    int internal = list_names_raw((kvspace_t *)handle, key, out_names,
-                                         out_capacity, out_length, out_count,
-                                         out_generation);
-    if (internal == KVSPACE_OK)
-        return KVSPACE_OK;
-    return kvspace_fail(internal, error, error_capacity, "list", key);
+                               uint32_t *out_count, uint64_t *out_generation) {
+    return list_names_raw((kvspace_t *)handle, key, out_names, out_capacity,
+                          out_length, out_count, out_generation);
 }

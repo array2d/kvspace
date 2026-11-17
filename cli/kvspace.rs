@@ -26,28 +26,22 @@ extern "C" {
         key: *const c_char,
         anchor: *const KvspaceAnchor,
         out_value_offset: *mut u64,
-        err: *mut c_char,
-        err_cap: u32,
     ) -> c_int;
-    fn kvspaceFree(h: *mut c_void, key: *const c_char, err: *mut c_char, err_cap: u32) -> c_int;
+    fn kvspaceFree(h: *mut c_void, key: *const c_char) -> c_int;
 
     fn kvspaceCp(
         h: *mut c_void,
         old_key: *const c_char,
         new_key: *const c_char,
-        err: *mut c_char,
-        err_cap: u32,
     ) -> c_int;
 
-    fn kvspaceMkindex(h: *mut c_void, key: *const c_char, err: *mut c_char, err_cap: u32) -> c_int;
-    fn kvspaceDeltree(h: *mut c_void, key: *const c_char, err: *mut c_char, err_cap: u32) -> c_int;
+    fn kvspaceMkindex(h: *mut c_void, key: *const c_char) -> c_int;
+    fn kvspaceDeltree(h: *mut c_void, key: *const c_char) -> c_int;
 
     fn kvspaceCpdir(
         h: *mut c_void,
         source_key: *const c_char,
         destination_key: *const c_char,
-        err: *mut c_char,
-        err_cap: u32,
     ) -> c_int;
 
     fn kvspaceListlen(
@@ -55,8 +49,6 @@ extern "C" {
         key: *const c_char,
         out_count: *mut i64,
         out_max_name_length: *mut u32,
-        err: *mut c_char,
-        err_cap: u32,
     ) -> c_int;
 
     fn kvspaceList(
@@ -67,8 +59,6 @@ extern "C" {
         out_length: *mut u32,
         out_count: *mut u32,
         out_generation: *mut u64,
-        err: *mut c_char,
-        err_cap: u32,
     ) -> c_int;
 
 }
@@ -93,12 +83,8 @@ fn fatalf(msg: &str) -> ! {
     exit(1)
 }
 
-fn fail_op(err: &[u8; 256], op: &str) -> ! {
-    let n = err.iter().position(|&b| b == 0).unwrap_or(err.len());
-    if n > 0 {
-        fatalf(&String::from_utf8_lossy(&err[..n]));
-    }
-    fatalf(&format!("{}: failed（后端未填错误详情）", op));
+fn fail_op(rc: c_int, op: &str) -> ! {
+    fatalf(&format!("{}: failed（rc={}）", op, rc));
 }
 
 fn data_base(kv: *mut c_void) -> *mut u8 {
@@ -111,16 +97,8 @@ fn resolve_view<'a>(kv: *mut c_void, key: &str) -> Option<&'a [u8]> {
         return None;
     }
     let mut offset: u64 = 0;
-    let mut err = [0u8; 256];
     let rc = unsafe {
-        kvspaceResolveOffset(
-            kv,
-            cs(key),
-            std::ptr::null(),
-            &mut offset,
-            err.as_mut_ptr() as *mut c_char,
-            256,
-        )
+        kvspaceResolveOffset(kv, cs(key), std::ptr::null(), &mut offset)
     };
     if rc != 0 {
         return None;
@@ -200,16 +178,8 @@ fn list_names(kv: *mut c_void, prefix: &str) -> Vec<String> {
     let p = cs(&dir_form(prefix));
     let mut count: i64 = 0;
     let mut max_len: u32 = 0;
-    let mut err = [0u8; 256];
     let rc = unsafe {
-        kvspaceListlen(
-            kv,
-            p,
-            &mut count,
-            &mut max_len,
-            err.as_mut_ptr() as *mut c_char,
-            256,
-        )
+        kvspaceListlen(kv, p, &mut count, &mut max_len)
     };
     if rc != 0 || count <= 0 {
         return Vec::new();
@@ -234,12 +204,10 @@ fn list_names(kv: *mut c_void, prefix: &str) -> Vec<String> {
             &mut length,
             &mut out_count,
             &mut generation,
-            err.as_mut_ptr() as *mut c_char,
-            256,
         )
     };
     if rc != 0 {
-        fail_op(&err, "list");
+        fail_op(rc, "list");
     }
     buf.truncate(length as usize);
     buf.split(|b| *b == 0)
@@ -371,10 +339,9 @@ fn main() {
             }
 
             for k in tail {
-                let mut err = [0u8; 256];
-                let rc = unsafe { kvspaceFree(kv, cs(k), err.as_mut_ptr() as *mut c_char, 256) };
+                let rc = unsafe { kvspaceFree(kv, cs(k)) };
                 if rc != 0 && rc != KVSPACE_MISSING {
-                    fail_op(&err, &format!("del {}", k));
+                    fail_op(rc, &format!("del {}", k));
                 }
             }
         }
@@ -382,46 +349,31 @@ fn main() {
             let p = tail
                 .first()
                 .unwrap_or_else(|| fatalf("usage: kvspace deltree <prefix>"));
-            let mut err = [0u8; 256];
-            let rc = unsafe { kvspaceDeltree(kv, cs(p), err.as_mut_ptr() as *mut c_char, 256) };
+            let rc = unsafe { kvspaceDeltree(kv, cs(p)) };
             if rc != 0 {
-                fail_op(&err, "deltree");
+                fail_op(rc, "deltree");
             }
         }
         "cp" => {
             if tail.len() < 2 {
                 fatalf("usage: kvspace cp <src> <dst>");
             }
-            let mut err = [0u8; 256];
             let rc = unsafe {
-                kvspaceCp(
-                    kv,
-                    cs(&tail[0]),
-                    cs(&tail[1]),
-                    err.as_mut_ptr() as *mut c_char,
-                    256,
-                )
+                kvspaceCp(kv, cs(&tail[0]), cs(&tail[1]))
             };
             if rc != 0 {
-                fail_op(&err, "cp");
+                fail_op(rc, "cp");
             }
         }
         "cpdir" => {
             if tail.len() < 2 {
                 fatalf("usage: kvspace cpdir <src> <dst>");
             }
-            let mut err = [0u8; 256];
             let rc = unsafe {
-                kvspaceCpdir(
-                    kv,
-                    cs(&tail[0]),
-                    cs(&tail[1]),
-                    err.as_mut_ptr() as *mut c_char,
-                    256,
-                )
+                kvspaceCpdir(kv, cs(&tail[0]), cs(&tail[1]))
             };
             if rc != 0 {
-                fail_op(&err, "cpdir");
+                fail_op(rc, "cpdir");
             }
         }
         "mkindex" => {
@@ -433,19 +385,17 @@ fn main() {
             }
 
             let p = dir_form(p);
-            let mut err = [0u8; 256];
-            let rc = unsafe { kvspaceMkindex(kv, cs(&p), err.as_mut_ptr() as *mut c_char, 256) };
+            let rc = unsafe { kvspaceMkindex(kv, cs(&p)) };
             if rc != 0 {
-                fail_op(&err, "mkindex");
+                fail_op(rc, "mkindex");
             }
         }
         "clear" => {
 
             eprintln!("warning: clear 删除整个 kvspace（等价 deltree /），不可恢复");
-            let mut err = [0u8; 256];
-            let rc = unsafe { kvspaceDeltree(kv, cs("/"), err.as_mut_ptr() as *mut c_char, 256) };
+            let rc = unsafe { kvspaceDeltree(kv, cs("/")) };
             if rc != 0 {
-                fail_op(&err, "clear");
+                fail_op(rc, "clear");
             }
         }
         "list" | "ls" => {

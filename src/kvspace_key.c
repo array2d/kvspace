@@ -1050,8 +1050,6 @@ static int adaptive_radix_tree_resume(kvspace_t *store, int32_t node_id, const c
 int resolve_anchor(kvspace_t *store, const char *key,
                           const kvspace_anchor_t *anchor,
                           uint64_t *out_offset) {
-    if (!store || !key || !out_offset)
-        return KVSPACE_INVALID;
     *out_offset = 0;
     if (!anchor || anchor->node_offset == 0)
         return resolve_root(store, key, out_offset);
@@ -1083,8 +1081,6 @@ int resolve_anchor(kvspace_t *store, const char *key,
 int resolve_root(kvspace_t *store, const char *key,
                              uint64_t *out_offset) {
     int32_t id = -1;
-    if (!store || !key || !out_offset)
-        return KVSPACE_INVALID;
     *out_offset = 0;
     if (!key_text_valid(key))
         return KVSPACE_INVALID;
@@ -1125,8 +1121,6 @@ int subtree_key(const char *base, size_t base_length, const char *key) {
            separator_at(rest, 0, strlen(rest)) != SEPARATOR_NONE;
 }
 static int storage_key_exists(kvspace_t *store, const char *key) {
-    if (!store || !key)
-        return 0;
     adaptive_radix_tree_header_t *node_header = adaptive_radix_tree_search(store, store->header->adaptive_radix_tree_root, (const uint8_t *)key,
                               (int)strlen(key));
     if (node_header && ADAPTIVE_RADIX_TREE_VALUE_HAS(adaptive_radix_tree_value_load(node_header)))
@@ -1180,8 +1174,6 @@ static int storage_list_prefix(const char *key, char *out, size_t capacity) {
 }
 int listlen_key(kvspace_t *store, const char *key, int64_t *out_count,
                              uint32_t *out_max_name_length) {
-    if (!store || !key || !out_count || !out_max_name_length)
-        return KVSPACE_INVALID;
     *out_count = 0;
     *out_max_name_length = 0;
     if (!key_text_valid(key))
@@ -1213,8 +1205,6 @@ int listlen_key(kvspace_t *store, const char *key, int64_t *out_count,
 int list_names_raw(kvspace_t *store, const char *key, char *out_names,
                           uint32_t out_capacity, uint32_t *out_length,
                           uint32_t *out_count, uint64_t *out_generation) {
-    if (!store || !key)
-        return KVSPACE_INVALID;
     if (out_length)
         *out_length = 0;
     if (out_count)
