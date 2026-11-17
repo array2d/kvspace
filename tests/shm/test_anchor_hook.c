@@ -1,4 +1,4 @@
-#define _GNU_SOURCE 
+#define _GNU_SOURCE
 #include "kvspace/kvspace.h"
 #include "kvspace_shm.h"
 #include <stdio.h>
@@ -36,6 +36,13 @@ int main(void) {
     uint64_t off = 0;
     rc = kvspaceRealloc(h, "/d/x", 8, 0, &off, err, sizeof err);
     CHECK(rc == KVSPACE_OK, "realloc /d/x rc=%d err=%s", rc, err);
+    uint64_t nested_write = 0;
+    rc = kvspaceRealloc(h, "/d/sub/y", 4, 0, &nested_write, err, sizeof err);
+    CHECK(rc == KVSPACE_OK, "realloc /d/sub/y rc=%d err=%s", rc, err);
+    uint64_t nested_off = 0;
+    rc = kvspaceResolveOffset(h, "/d/sub/y", KVSPACE_ANCHOR_ROOT, &nested_off,
+                              err, sizeof err);
+    CHECK(rc == KVSPACE_OK, "resolve /d/sub/y rc=%d err=%s", rc, err);
     uint8_t *base = kvspaceXvalueInProcessAddress(h);
     CHECK(base != NULL, "in-process address must not be NULL for shm");
     if (base) {
@@ -45,19 +52,31 @@ int main(void) {
     int64_t anchor = 0;
     rc = kvspaceShmTestAnchorOf(kv, "/d/", &anchor);
     CHECK(rc == KVSPACE_OK, "anchor_of /d/ rc=%d", rc);
-    CHECK(anchor > 0, "anchor 必须是正的 key 区偏移，实际 %lld",
+    CHECK(anchor > 0, "anchor 必须是正的目录节点偏移，实际 %lld",
           (long long)anchor);
     uint64_t child_off = 0;
     memset(err, 0, sizeof err);
-    rc = kvspaceResolveOffset(h, "/d/x", (uint64_t)anchor, &child_off, err,
-                        sizeof err);
+    rc = kvspaceResolveOffset(h, "x", (uint64_t)anchor, &child_off, err,
+                              sizeof err);
     CHECK(rc == KVSPACE_OK,
-          "用钩子给的 anchor 解析 /d/x 必须成功（rc=%d err=%s）—— "
-          "否则这个 anchor 就不是可用锚点",
+          "用钩子给的 anchor 解析相对后缀 x 必须成功（rc=%d err=%s）",
           rc, err);
     CHECK(child_off == off,
           "经 anchor 解析出的偏移应与 Realloc 返回的一致：%llu vs %llu",
           (unsigned long long)child_off, (unsigned long long)off);
+    uint64_t nested_by_anchor = 0;
+    memset(err, 0, sizeof err);
+    rc = kvspaceResolveOffset(h, "sub/y", (uint64_t)anchor, &nested_by_anchor,
+                              err, sizeof err);
+    CHECK(rc == KVSPACE_OK, "anchor 相对多段后缀 rc=%d err=%s", rc, err);
+    CHECK(nested_by_anchor == nested_off,
+          "多段相对解析偏移 %llu != 绝对解析偏移 %llu",
+          (unsigned long long)nested_by_anchor,
+          (unsigned long long)nested_off);
+    rc = kvspaceResolveOffset(h, "/d/x", (uint64_t)anchor, &child_off, err,
+                              sizeof err);
+    CHECK(rc == KVSPACE_INVALID,
+          "非零 anchor 下绝对 key 必须 INVALID（rc=%d）", rc);
     int64_t untouched = -12345;
     rc = kvspaceShmTestAnchorOf(kv, "/no-such-parent/", &untouched);
     CHECK(rc == KVSPACE_MISSING,

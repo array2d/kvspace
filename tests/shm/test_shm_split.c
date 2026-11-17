@@ -10,15 +10,22 @@
 #include <unistd.h>
 #include "test_public_io.h"
 #define SBO_DATA_SIZE (8UL * 64 * 64 * 64 * 64)
-#define ART_SLAB_INIT (64UL * 1024 * 1024)
-#define GROW_KEYS 16000
+#define INDEX_SLAB_INIT (64UL * 1024 * 1024)
+#define GROW_KEYS 4000
 #define GROW_KEY_LEN 600
+#define GROW_SEGMENT_LEN 10
 static void key_of(char *buf, size_t n, int i) {
   unsigned x = (unsigned)i * 2654435761u + 12345u;
   int p = snprintf(buf, n, "/L%07d-", i);
-  while (p < GROW_KEY_LEN && p < (int)n - 1) {
-    x = x * 1103515245u + 12345u;
-    buf[p++] = (char)('a' + ((x >> 16) % 26));
+  while (p < GROW_KEY_LEN - 1) {
+    int segment = 0;
+    while (segment < GROW_SEGMENT_LEN && p < GROW_KEY_LEN - 1) {
+      x = x * 1103515245u + 12345u;
+      buf[p++] = (char)('a' + ((x >> 16) % 26));
+      segment++;
+    }
+    if (p < GROW_KEY_LEN - 1)
+      buf[p++] = '/';
   }
   buf[p] = 0;
 }
@@ -72,7 +79,8 @@ static void t_layout(const char *db, const char *head, const char *data) {
   CHECK(fsize(data) == (off_t)SBO_DATA_SIZE, "data file size %ld",
         (long)fsize(data));
   off_t main_sz = fsize(db);
-  CHECK(main_sz > (off_t)ART_SLAB_INIT && main_sz < (off_t)ART_SLAB_INIT + 4096,
+  CHECK(main_sz > (off_t)INDEX_SLAB_INIT &&
+            main_sz < (off_t)INDEX_SLAB_INIT + 4096,
         "main file size %ld", (long)main_sz);
   CHECK(set_int32(kv, "/a", 42) == 0, "set /a");
   CHECK(get_int32(kv, "/a") == 42, "get /a");
@@ -104,7 +112,7 @@ static void t_bad_magic(const char *dir) {
   unlink(p);
 }
 static void t_grow_and_reopen(const char *db) {
-  printf("[grow] %d keys force ART slab growth, then verify across reopen\n",
+  printf("[grow] %d keys force index slab growth, then verify across reopen\n",
          GROW_KEYS);
   kvspace_t *kv = t_open(db, SBO_DATA_SIZE);
   REQUIRE(kv != NULL, "open failed");
@@ -112,7 +120,7 @@ static void t_grow_and_reopen(const char *db) {
   int set_fail = fill_keys(kv);
   CHECK(set_fail == 0, "%d sets failed", set_fail);
   off_t after = fsize(db);
-  CHECK(after >= (off_t)(2 * ART_SLAB_INIT),
+  CHECK(after >= (off_t)(2 * INDEX_SLAB_INIT),
         "main file did not grow: %ld -> %ld", (long)before, (long)after);
   printf("  main file %ld -> %ld bytes\n", (long)before, (long)after);
   int bad = check_keys(kv, 7);
@@ -170,7 +178,7 @@ static void t_cross_process(const char *dir) {
   CHECK(read(to_parent[0], &c, 1) == 1 && c == 'r', "child ready");
   int set_fail = fill_keys(kv);
   CHECK(set_fail == 0, "%d sets failed", set_fail);
-  CHECK(fsize(db) >= (off_t)(2 * ART_SLAB_INIT), "parent did not grow");
+  CHECK(fsize(db) >= (off_t)(2 * INDEX_SLAB_INIT), "parent did not grow");
   c = 'g';
   CHECK(write(to_child[1], &c, 1) == 1, "signal child");
   int status = 0;

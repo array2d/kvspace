@@ -326,17 +326,20 @@ int main(void) {
         CHECK(om == 6, "最长子项名应是 \"child/\"（6 字节），实际 %u",
               (unsigned)om);
         CHECK(kvspaceResolveOffset(h, "/only/", 0, &y, err, sizeof err) ==
-                  KVSPACE_MISSING,
-              "无根值的索引 resolve 应 MISSING（问值，不问子项）");
+                  KVSPACE_OK,
+              "自动创建的祖先索引有 0 字节根值");
         CHECK(kvspaceListlen(h, "/only", &oc, &om, err, sizeof err) ==
                   KVSPACE_MISSING,
               "不存在的值形态 /only 应 MISSING");
         CHECK(kvspaceRealloc(h, "/only/", 1, 0, &y, err, sizeof err) ==
                   KVSPACE_OK,
               "给 /only/ 补根值");
+        CHECK(kvspaceRealloc(h, "/only", 1, 0, &y, err, sizeof err) ==
+                  KVSPACE_OK,
+              "建值形态 /only");
         CHECK(kvspaceListlen(h, "/only", &oc, &om, err, sizeof err) ==
                   KVSPACE_NOT_INDEX,
-              "同名的值形态 /only 在同名目录有根值后应 NOT_INDEX");
+              "值形态 /only 存在后应 NOT_INDEX");
     }
     const int64_t dead_anchor = INT64_C(1) << 40;
     CHECK(kvspaceResolveOffset(h, "/x", dead_anchor, &got, err, sizeof err) ==

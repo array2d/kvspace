@@ -105,11 +105,11 @@ if(BUILD_TESTING)
                                                      
                                                   
     set(KVSPACE_SHM_TEST_PAIRS
-        "art_scan|test_art_scan"
-        "art_alignment|test_art_alignment"
+        "index_scan|test_index_scan"
         "anchor_hook|test_anchor_hook"
         "shm_split|test_shm_split"
         "storage_abi|test_storage_abi"
+        "index_rules|test_index_rules"
                                                                       
                                                   
         )

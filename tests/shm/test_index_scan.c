@@ -114,7 +114,7 @@ static void t_correct(const char *db) {
   int32_t n;
   REQUIRE(do_list(kv, "/d/", &ns, &n) == 0, "list /d/");
   CHECK(n == 2, "list /d/ count %d", n);
-  CHECK(list_has(ns, n, "f") && list_has(ns, n, "g"), "list /d/ names");
+  CHECK(list_has(ns, n, "f/") && list_has(ns, n, "g"), "list /d/ names");
   list_free(ns, n);
   REQUIRE(do_list(kv, "/d/f/", &ns, &n) == 0, "list /d/f/");
   CHECK(n == 2, "list /d/f/ count %d", n);
@@ -122,7 +122,8 @@ static void t_correct(const char *db) {
   list_free(ns, n);
   REQUIRE(do_list(kv, "/lib/", &ns, &n) == 0, "list /lib/");
   CHECK(n == 3, "list /lib/ count %d", n);
-  CHECK(list_has(ns, n, "a") && list_has(ns, n, "b") && list_has(ns, n, "mod"),
+  CHECK(list_has(ns, n, "a") && list_has(ns, n, "b") &&
+            list_has(ns, n, "mod/"),
         "list /lib/ names");
   list_free(ns, n);
   REQUIRE(do_list(kv, "/foo/", &ns, &n) == 0, "list /foo/");
@@ -138,7 +139,8 @@ static void t_correct(const char *db) {
   CHECK(n == 0, "list /food/ count %d", n);
   list_free(ns, n);
   REQUIRE(do_list(kv, "/", &ns, &n) == 0, "list /");
-  CHECK(list_has(ns, n, "lib") && list_has(ns, n, "d") && list_has(ns, n, "foo"),
+  CHECK(list_has(ns, n, "lib/") && list_has(ns, n, "d/") &&
+            list_has(ns, n, "foo/"),
         "list / names");
   CHECK(!list_has(ns, n, ".kvspace-meta"), "hide metadata root");
   list_free(ns, n);
@@ -221,7 +223,7 @@ static void t_scale(const char *db) {
   int32_t n;
   REQUIRE(do_list(kv, "/t/", &ns, &n) == 0, "list /t/");
   CHECK(n == 3 && list_has(ns, n, "a") && list_has(ns, n, "b") &&
-            list_has(ns, n, "c"),
+            list_has(ns, n, "c/"),
         "list /t/ names");
   list_free(ns, n);
   double t_lo = time_list(kv, "/t/", reps);
@@ -270,41 +272,29 @@ static void expect_children(kvspace_t *kv, const char *prefix, bool ex,
   CHECK(kvspaceShmListLen(kv, prefix, ex, 0, &length) == 0 && length == count,
         "%s ListLen %d, expected %d", prefix, length, count);
 }
-static void expect_children_set(kvspace_t *kv, const char *prefix, bool ex,
-                                const char **expected, int32_t count) {
-  char **names = NULL;
-  int32_t n = 0;
-  REQUIRE(t_list(kv, prefix, ex, 0, &names, &n) == 0, "list %s", prefix);
-  CHECK(n == count, "%s count %d, expected %d", prefix, n, count);
-  for (int32_t i = 0; i < count; i++) {
-    CHECK(list_has(names, n, expected[i]), "%s missing child %s", prefix,
-          expected[i]);
-  }
-  list_free(names, n);
-}
 static void t_direct_children(const char *db) {
-  printf("[children] markers, tombstones, split UTF-8, fanout, extindex, reopen\n");
+  printf("[children] markers, auto directories, split UTF-8, fanout, reopen\n");
   kvspace_t *kv = t_open(db, SBO_DATA_SIZE);
   REQUIRE(kv != NULL, "open children failed");
   CHECK(set_int32(kv, "/abc/name·field/value", 5) == 0, "split separator");
-  const char *utf8[] = {"name"};
+  const char *utf8[] = {"name·"};
   expect_children(kv, "/abc/", false, utf8, 1);
   CHECK(set_int32(kv, "/case/a", 1) == 0, "scalar child");
   CHECK(set_int32(kv, "/case/ab", 2) == 0, "shared name prefix");
   CHECK(mkindex(kv, "/case/a/") == 0, "directory marker");
   CHECK(set_int32(kv, "/case/a/deep/value", 3) == 0, "nested child");
   CHECK(set_int32(kv, "/case/a·field", 4) == 0, "attribute child");
-  const char *marked[] = {"a/", "ab"};
-  expect_children(kv, "/case/", false, marked, 2);
+  const char *marked[] = {"a/", "ab", "a·"};
+  expect_children(kv, "/case/", false, marked, 3);
   CHECK(set_int32(kv, "/中文/子项·属性/值", 6) == 0, "UTF-8 child");
-  const char *chinese[] = {"子项"};
+  const char *chinese[] = {"子项·"};
   expect_children(kv, "/中文/", false, chinese, 1);
   CHECK(set_int32(kv, "/coords/[10]/x", 10) == 0, "coord 10");
   CHECK(set_int32(kv, "/coords/[2]/x", 2) == 0, "coord 2");
   CHECK(set_int32(kv, "/coords/[-1]/x", -1) == 0, "coord -1");
   CHECK(mkindex(kv, "/coords/[10]/") == 0, "coord marker");
-  const char *coords[] = {"[-1]", "[2]", "[10]/"};
-  expect_children_set(kv, "/coords/", false, coords, 3);
+  const char *coords[] = {"[-1]/", "[10]/", "[2]/"};
+  expect_children(kv, "/coords/", false, coords, 3);
   for (int c = 1; c < 256; c++) {
     if (c == '/' || c == 0xC2)
       continue;
@@ -313,31 +303,31 @@ static void t_direct_children(const char *db) {
     REQUIRE(set_int32(kv, key, c) == 0, "set fanout %d", c);
     REQUIRE(t_del(kv, key) == 0, "delete fanout %d", c);
   }
-  expect_children(kv, "/dead/", false, NULL, 0);
+  const char *kept[] = {"child/"};
+  expect_children(kv, "/dead/", false, kept, 1);
   CHECK(set_int32(kv, "/dead/child/last/value", 11) == 0, "revive branch");
-  const char *alive[] = {"child"};
-  expect_children(kv, "/dead/", false, alive, 1);
+  expect_children(kv, "/dead/", false, kept, 1);
   CHECK(t_del(kv, "/dead/child/last/value") == 0, "delete revived branch");
+  CHECK(t_deltree(kv, "/dead") == 0, "deltree /dead");
   expect_children(kv, "/dead/", false, NULL, 0);
   for (int i = 0; i < 3000; i++) {
     char key[64];
     snprintf(key, sizeof key, "/many/child/deep/%04d/value", i);
     REQUIRE(set_int32(kv, key, i) == 0, "set descendant %d", i);
   }
-  expect_children(kv, "/many/", false, alive, 1);
+  expect_children(kv, "/many/", false, kept, 1);
   for (int i = 0; i < 3000; i++) {
     char key[64];
     snprintf(key, sizeof key, "/many/child/deep/%04d/value", i);
     REQUIRE(t_del(kv, key) == 0, "delete descendant %d", i);
   }
-  expect_children(kv, "/many/", false, NULL, 0);
-  CHECK(mkindex(kv, "/many/child/") == 0, "marker on dead branch");
-  const char *marker_only[] = {"child/"};
-  expect_children(kv, "/many/", false, marker_only, 1);
+  expect_children(kv, "/many/", false, kept, 1);
+  CHECK(mkindex(kv, "/many/child/") == 0, "marker on existing branch");
+  expect_children(kv, "/many/", false, kept, 1);
   t_close(kv);
   kv = t_open(db, SBO_DATA_SIZE);
   REQUIRE(kv != NULL, "reopen children failed");
-  expect_children(kv, "/many/", false, marker_only, 1);
+  expect_children(kv, "/many/", false, kept, 1);
   expect_children(kv, "/dead/", false, NULL, 0);
   t_close(kv);
 }

@@ -7,6 +7,7 @@
 #define SLOTSBOXMALLOC_IMPLEMENTATION 
 #include "slotsboxmalloc/slotsboxobj.h"
 #include "kvspace_shm.h"
+#include "trie.h"
 #include <kvspace/kvspace.h>
 #include "xvalue_internal.h"
 #include <errno.h>
@@ -26,69 +27,17 @@
 #include <time.h>
 #include <unistd.h>
 #define KVS_MAGIC "kvspace-c"
-#define ART_PREFIX_MAX 10
-#define ART_BLOCK_SZ 104
-#define ART_SLAB_INIT (64UL * 1024 * 1024)
+#define INDEX_BLOCK_SIZE 104
+#define INDEX_SLAB_INIT (64UL * 1024 * 1024)
 #define SBO_HEAD_POOL_INIT (4UL * 1024 * 1024)
 #define REGION_RESERVE (1ULL << 38)
-#define ART_RESERVE (1ULL << 36)
+#define INDEX_RESERVE (1ULL << 36)
 #define DATA_RESERVE (1ULL << 40)
 #define SBO_PUNCH_MIN (64UL * 1024)
 static int reserved_meta_path(const char *key) {
     static const char root[] = "/.kvspace-meta";
     return strncmp(key, root, sizeof root - 1) == 0 &&
            (key[sizeof root - 1] == 0 || key[sizeof root - 1] == '/');
-}
-enum { ART_N4 = 0,
-       ART_N16 = 1,
-       ART_N48 = 2,
-       ART_N256 = 3,
-       ART_MOVED = 255 };
-typedef struct {
-    uint8_t type, prefix[ART_PREFIX_MAX], prefix_len;
-    uint16_t count;
-    uint16_t _pad;
-    uint64_t val;
-} art_hdr_t;
-#define AV_HAS(v) ((int)((v) & 1u))
-#define AV_OFF(v) ((uint64_t)((v) >> 1))
-#define AV_MAKE(has,off) ((((uint64_t)(off)) << 1) | ((has) ? 1ull : 0ull))
-static inline uint64_t art_val_load(const art_hdr_t *h) {
-    return __atomic_load_n(&h->val, __ATOMIC_ACQUIRE);
-}
-static inline void art_val_store(art_hdr_t *h, uint64_t v) {
-    __atomic_store_n(&h->val, v, __ATOMIC_RELEASE);
-}
-static inline bool art_val_cas(art_hdr_t *h, uint64_t *exp, uint64_t nv) {
-    return __atomic_compare_exchange_n(&h->val, exp, nv, false,
-                                       __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE);
-}
-typedef struct {
-    art_hdr_t h;
-    uint8_t keys[4];
-    int32_t children[4];
-} art_n4_t;
-typedef struct {
-    art_hdr_t h;
-    uint8_t keys[16];
-    int32_t children[16];
-} art_n16_t;
-typedef struct {
-    art_hdr_t h;
-    uint8_t index[256];
-    int32_t children[48];
-} art_n48_t;
-typedef struct {
-    art_hdr_t h;
-    int32_t children[256];
-} art_n256_t;
-_Static_assert(sizeof(art_n4_t) <= ART_BLOCK_SZ && sizeof(art_n16_t) <= ART_BLOCK_SZ,
-               "N4/N16 must fit one ART block");
-static int art_node_sz(int t) {
-    return t == ART_N4 ? sizeof(art_n4_t)
-           : t == ART_N16 ? sizeof(art_n16_t)
-           : t == ART_N48 ? sizeof(art_n48_t)
-                          : sizeof(art_n256_t);
 }
 #define P2_SLOT_N 64
 enum { P2_SLOT_FREE = 0, P2_SLOT_MINE = 1, P2_SLOT_CLAIMING = 3 };
@@ -115,10 +64,8 @@ enum { GE_EMPTY = 0, GE_RESERVED = 1, GE_COMMITTED = 2 };
 #define GE_MAKE(st,id) ((((uint32_t)(id)) << 2) | (uint32_t)(st))
 typedef struct {
     char magic[sizeof(KVS_MAGIC)];
-    uint64_t art_slab_size, sbo_head_size, sbo_data_size;
-    int32_t art_root;
-    uint64_t gens_size;
-    uint64_t gen_epoch;
+    uint64_t index_slab_size, sbo_head_size, sbo_data_size;
+    uint64_t trie_root;
     uint32_t recovery_epoch;
     uint32_t ack_seq;
     uint32_t barrier_state;
@@ -132,34 +79,18 @@ typedef struct {
     uint32_t claim_seq;
     p2_slot_t slots[P2_SLOT_N];
 } kvspace_hdr_t;
-#define ART_OFF (sizeof(kvspace_hdr_t) + sizeof(blocks_meta_t))
+#define INDEX_OFF (sizeof(kvspace_hdr_t) + sizeof(blocks_meta_t))
 static size_t kvspace_data_size = 8ULL * 64 * 64 * 64 * 64;
-typedef struct kvspaceAnchor kvspaceAnchor_t;
-static int list_names(kvspace_t *kv, const char *prefix, bool expand_ext,
-                   int resolve, char ***out_names, int32_t *out_count);
-static int delete_key(kvspace_t *kv, const char *key);
-static int delete_tree(kvspace_t *kv, const char *prefix);
-static int copy_key(kvspace_t *kv, const char *src, const char *dst);
-static int copy_tree(kvspace_t *kv, const char *src, const char *dst);
 static uint8_t *storage_data_base(kvspace_t *kv);
-static int resolve_root(kvspace_t *kv, const char *key,
-                             uint64_t *out_offset);
-static int resolve_anchor(kvspace_t *kv, const char *key,
-                                 kvspaceAnchor_t anchor, uint64_t *out_offset);
+static int resolve_root(kvspace_t *kv, const char *key, uint64_t *out_offset);
 static int realloc_key(kvspace_t *kv, const char *key, uint64_t body_len,
-                             uint64_t attr_len, uint64_t *out_offset);
-static int free_key(kvspace_t *kv, const char *key);
-static int makeindex_key(kvspace_t *kv, const char *key);
-static int listlen_key(kvspace_t *kv, const char *key, int64_t *out_count,
-                             uint32_t *out_max_name_length);
-static int list_names_raw(kvspace_t *kv, const char *key, char *out_names,
-                          uint32_t out_capacity, uint32_t *out_length,
-                          uint32_t *out_count, uint64_t *out_generation);
-_Static_assert(ART_SLAB_INIT / (ART_BLOCK_SZ + 2) > 32767ULL / 4,
-               "ART_SLAB_INIT too small: blockmalloc would pick 14-bit ids");
-_Static_assert(ART_RESERVE / (ART_BLOCK_SZ + 8) <= (1ULL << 30),
-               "ART_RESERVE too large for 30-bit block ids");
-_Static_assert((ART_BLOCK_SZ + 8) % 8 == 0, "ART stride must keep 8B alignment");
+                       uint64_t attr_len, uint64_t *out_offset);
+_Static_assert(INDEX_SLAB_INIT / (INDEX_BLOCK_SIZE + 2) > 32767ULL / 4,
+               "index slab initial size too small for 30-bit block ids");
+_Static_assert(INDEX_RESERVE / (INDEX_BLOCK_SIZE + 8) <= (1ULL << 30),
+               "index reserve too large for 30-bit block ids");
+_Static_assert((INDEX_BLOCK_SIZE + 8) % 8 == 0,
+               "index stride must keep 8B alignment");
 _Static_assert(
     SBO_HEAD_POOL_INIT / (sizeof(sbo_box_t) + 2) > 32767ULL / 4,
     "SBO_HEAD_POOL_INIT too small: blockmalloc would pick 14-bit ids");
@@ -185,10 +116,8 @@ typedef struct {
     size_t reserve;
 } shm_region_t;
 struct kvspace {
-    shm_region_t r_art, r_head, r_data, r_gen, r_garb;
+    shm_region_t r_index, r_head, r_data, r_garb;
     garb_ent_t *garb;
-    uint64_t gen_n;
-    uint64_t art_total_seen;
     kvspace_hdr_t *hdr;
     uint64_t store_id;
     int p2_slot;
@@ -199,10 +128,11 @@ struct kvspace {
     uint32_t maint_seq;
     uint32_t maint_started, maint_stop;
     uint32_t reclaim_unavailable;
-    blocks_meta_t *art_meta;
-    uint8_t *art_data;
+    blocks_meta_t *index_meta;
+    uint8_t *index_data;
     sbo_meta_t *sbo_meta;
     uint8_t *sbo_data;
+    trie_env_t trie_env;
 };
 static inline void list_gen_bump(kvspace_t *kv) {
     __atomic_add_fetch(&kv->hdr->list_gen, 1ull, __ATOMIC_RELEASE);
@@ -239,47 +169,6 @@ static void region_close(shm_region_t *r) {
         close(r->fd);
 }
 static void kv_sbo_free(kvspace_t *kv, uint64_t off);
-static art_hdr_t *art_hdr(kvspace_t *kv, int32_t id);
-static int32_t art_child(kvspace_t *kv, void *n, uint8_t b);
-static int pfx_shared(const uint8_t *a, int al, const uint8_t *b, int bl);
-static int32_t art_walk(kvspace_t *kv, int32_t nid, const uint8_t *key, int klen,
-                        int d, int32_t *par, int *pard);
-static int32_t art_follow(kvspace_t *kv, int32_t id);
-typedef struct {
-    uint32_t struct_gen;
-    uint32_t value_gen;
-} kv_gens_t;
-static uint64_t gen_cap(const kvspace_t *kv) {
-    blocks_meta_t *m = kv->art_meta;
-    uint64_t head = (uint64_t)m->sizeof_block_head;
-    return m->total_size / (head + m->block_size);
-}
-static int32_t art_id_of(kvspace_t *kv, const void *p) {
-    if (!p || !kv->art_data)
-        return -1;
-    return (int32_t)blockid_bydataoffset(kv->art_meta,
-                                         (uint64_t)((const uint8_t *)p - kv->art_data));
-}
-static kv_gens_t *gens_at(kvspace_t *kv, int32_t id) {
-    if (id < 0 || !kv->r_gen.base)
-        return NULL;
-    if ((uint64_t)id >= kv->gen_n)
-        return NULL;
-    return (kv_gens_t *)kv->r_gen.base + id;
-}
-static void gen_bump_struct(kvspace_t *kv, int32_t id) {
-    kv_gens_t *g = gens_at(kv, id);
-    if (g)
-        __atomic_add_fetch(&g->struct_gen, 1u, __ATOMIC_ACQ_REL);
-}
-static void gen_bump_value(kvspace_t *kv, int32_t id) {
-    kv_gens_t *g = gens_at(kv, id);
-    if (g)
-        __atomic_add_fetch(&g->value_gen, 2u, __ATOMIC_ACQ_REL);
-}
-static int64_t gen_alloc_epoch(kvspace_t *kv) {
-    return (int64_t)__atomic_add_fetch(&kv->hdr->gen_epoch, 1ull, __ATOMIC_ACQ_REL);
-}
 static int p2_maint_start(kvspace_t *kv);
 static bool p2_claim_alive(kvspace_t *kv, uint32_t claim);
 static int kv_sync(kvspace_t *kv);
@@ -288,9 +177,6 @@ static struct {
     uint32_t garb_threshold_megabytes;
     int barrier_ms;
     uint32_t hold_drain_ms;
-    uint32_t hold_reserve_ms;
-    bool fail_alloc;
-    bool fail_art_insert;
 } g_p2_test_knobs;
 #endif
 static uint64_t p2_garb_threshold(void) {
@@ -362,28 +248,6 @@ static void garb_commit(kvspace_t *kv, uint64_t idx, uint64_t off,
 static void garb_cancel(kvspace_t *kv, uint64_t idx) {
     __atomic_store_n(&kv->garb[idx & (GARB_CAP - 1)].meta, GE_EMPTY,
                      __ATOMIC_RELEASE);
-}
-static int32_t p2_node_at(kvspace_t *kv, const char *key) {
-    int klen = (int)strlen(key);
-    int d = 0;
-    int32_t nid = kv->hdr->art_root;
-    while (nid >= 0) {
-        art_hdr_t *h = art_hdr(kv, nid);
-        if (!h || h->type == ART_MOVED)
-            return -1;
-        if (h->prefix_len) {
-            int s = pfx_shared(h->prefix, h->prefix_len,
-                               (const uint8_t *)key + d, klen - d);
-            if (s != h->prefix_len && d + s != klen)
-                return -1;
-            d += s;
-        }
-        if (d == klen)
-            return nid;
-        nid = art_child(kv, h, (uint8_t)key[d]);
-        d++;
-    }
-    return -1;
 }
 static int p2_proc_starttime(uint32_t pid, uint64_t *out) {
 #if defined(__linux__)
@@ -506,30 +370,6 @@ static void p2_ack_slot(kvspace_t *kv, uint32_t ep) {
                 0);
 #endif
 }
-#define GEN_RESERVE (8ULL << 30)
-static int gens_grow(kvspace_t *kv) {
-    uint64_t want = gen_cap(kv) * sizeof(kv_gens_t);
-    if (want > GEN_RESERVE)
-        return -1;
-    kv->gen_n = want / sizeof(kv_gens_t);
-    kv->art_total_seen = kv->art_meta->total_size;
-    if (want <= kv->r_gen.mapped)
-        return 0;
-    if (!kv->r_gen.base) {
-        void *p = mmap(NULL, GEN_RESERVE, PROT_NONE,
-                       MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
-        if (p == MAP_FAILED)
-            return -1;
-        kv->r_gen.base = p;
-        kv->r_gen.reserve = GEN_RESERVE;
-    }
-    if (ftruncate(kv->r_gen.fd, (off_t)want) != 0)
-        return -1;
-    if (region_map(&kv->r_gen, (size_t)want) != 0)
-        return -1;
-    kv->hdr->gens_size = want;
-    return 0;
-}
 static uint32_t g_fork_gen;
 static pthread_once_t g_atfork_once = PTHREAD_ONCE_INIT;
 static void p2_atfork_child(void) {
@@ -554,12 +394,6 @@ static int head_of(const uint8_t *val, int32_t val_len, kvspaceXvalueHead *out) 
         if (kvspace_c_scan_attrs(val, total, &langtype, &langtype_len) != 0)
             return -1;
     }
-    return 0;
-}
-static int value_ok(const uint8_t *val, int32_t val_len,
-                    kvspaceXvalueHead *out) {
-    if (head_of(val, val_len, out) != 0)
-        return -1;
     return 0;
 }
 static long long p2_now_ms(void) {
@@ -747,7 +581,7 @@ static int p2_round(kvspace_t *kv) {
     (void)kv;
     return 0;
 #else
-    if (!kv || kv->hdr->art_root < 0)
+    if (!kv || kv->hdr->trie_root == 0)
         return 0;
     if (kv->pid != (uint32_t)getpid())
         return -1;
@@ -851,57 +685,32 @@ void kvspaceShmTestSetBarrierMilliseconds(int milliseconds) {
 void kvspaceShmTestSetHoldDrainMilliseconds(uint32_t milliseconds) {
     g_p2_test_knobs.hold_drain_ms = milliseconds;
 }
-void kvspaceShmTestSetHoldReserveMilliseconds(uint32_t milliseconds) {
-    g_p2_test_knobs.hold_reserve_ms = milliseconds;
-}
-void kvspaceShmTestSetFailAlloc(bool enabled) {
-    g_p2_test_knobs.fail_alloc = enabled;
-}
-void kvspaceShmTestSetFailArtInsert(bool enabled) {
-    g_p2_test_knobs.fail_art_insert = enabled;
-}
-#ifdef P2_TEST_HOOKS
 void kvspaceTestSetDataSize(size_t data_size) {
     kvspace_data_size = data_size;
 }
 #endif
-int64_t kvspaceShmArtAlignCheck(kvspace_t *kv) {
-    if (!kv || !kv->art_meta)
-        return -2;
-    blocks_meta_t *m = kv->art_meta;
-    if (m->sizeof_block_head != 8)
-        return -2;
-    uint64_t stride = (uint64_t)m->sizeof_block_head + m->block_size;
-    if (stride % 8)
-        return -2;
-    uint64_t n = m->total_size / stride;
-    for (uint64_t id = 0; id < n; id++) {
-        uint64_t off = blockdata_offset(m, id);
-        uint64_t val = off + offsetof(art_hdr_t, val);
-        if (off % 8 || val % 8 || (val & 63) > 56)
-            return (int64_t)id;
-    }
-    return -1;
-}
-#endif
 static int kv_sync(kvspace_t *kv) {
-    if (region_map(&kv->r_art, ART_OFF + (size_t)kv->hdr->art_slab_size) != 0)
-        return -1;
-    if (kv->art_meta->total_size != kv->art_total_seen &&
-        gens_grow(kv) != 0)
+    if (region_map(&kv->r_index,
+                   INDEX_OFF + (size_t)kv->hdr->index_slab_size) != 0)
         return -1;
     if (region_map(&kv->r_head, (size_t)kv->hdr->sbo_head_size) != 0)
         return -1;
-    return region_map(&kv->r_data, (size_t)kv->hdr->sbo_data_size);
-}
-static int art_slab_grow(kvspace_t *kv) {
-    size_t want = (size_t)kv->hdr->art_slab_size * 2;
-    if (ART_OFF + want > kv->r_art.reserve ||
-        ftruncate(kv->r_art.fd, (off_t)(ART_OFF + want)) != 0 ||
-        region_map(&kv->r_art, ART_OFF + want) != 0)
+    if (region_map(&kv->r_data, (size_t)kv->hdr->sbo_data_size) != 0)
         return -1;
-    kv->hdr->art_slab_size = want;
-    kv->art_meta->total_size = want;
+    kv->trie_env.base = kv->index_data;
+    kv->trie_env.slab_size = kv->hdr->index_slab_size;
+    return 0;
+}
+static int index_slab_grow(kvspace_t *kv) {
+    size_t want = (size_t)kv->hdr->index_slab_size * 2;
+    if (INDEX_OFF + want > kv->r_index.reserve ||
+        ftruncate(kv->r_index.fd, (off_t)(INDEX_OFF + want)) != 0 ||
+        region_map(&kv->r_index, INDEX_OFF + want) != 0)
+        return -1;
+    kv->hdr->index_slab_size = want;
+    kv->index_meta->total_size = want;
+    kv->trie_env.base = kv->index_data;
+    kv->trie_env.slab_size = want;
     return 0;
 }
 #ifdef BLOCKMALLOC_COUNT_MASK
@@ -1027,11 +836,6 @@ static void kv_sbo_free(kvspace_t *kv, uint64_t off) {
 #endif
     sbo_free(kv->sbo_meta, off);
 }
-static void *art_blk(kvspace_t *kv, int32_t id) {
-    if (id < 0)
-        return NULL;
-    return kv->art_data + blockdata_offset(kv->art_meta, (uint64_t)id);
-}
 _Static_assert(offsetof(blocks_meta_t, used_blocks) ==
                    offsetof(blocks_meta_t, block_size) + 2 * sizeof(uint64_t),
                "blockmalloc: sizeof_block_head/malloc_blocks must share one u64 word");
@@ -1067,590 +871,68 @@ static bool bm_layout_ok(void) {
     return t.sizeof_block_head == 8 && t.malloc_blocks == 0x0123456789ABCDEull &&
            t.block_size == 0 && t.used_blocks == 7;
 }
-static int64_t art_bump(kvspace_t *kv, uint32_t k) {
-    blocks_meta_t *m = kv->art_meta;
-    spin_lock(&m->lock);
-    uint64_t id = BM_MALLOC_BLOCKS(m);
-    if ((uint64_t)block_offset(m, id + k) > m->total_size) {
-        spin_unlock(&m->lock);
+static int64_t index_bump(kvspace_t *kv, uint32_t blocks) {
+    blocks_meta_t *meta = kv->index_meta;
+    spin_lock(&meta->lock);
+    uint64_t block_id = BM_MALLOC_BLOCKS(meta);
+    if ((uint64_t)block_offset(meta, block_id + blocks) > meta->total_size) {
+        spin_unlock(&meta->lock);
         return -1;
     }
-    setblock_t(m, kv->art_data + block_offset(m, id), 1, -1);
-    bm_set_malloc_blocks(m, id + k);
-    m->used_blocks += k;
-    spin_unlock(&m->lock);
-    return (int64_t)id;
+    setblock_t(meta, kv->index_data + block_offset(meta, block_id), 1, -1);
+    bm_set_malloc_blocks(meta, block_id + blocks);
+    meta->used_blocks += blocks;
+    spin_unlock(&meta->lock);
+    return (int64_t)block_id;
 }
-static int32_t art_balloc(kvspace_t *kv, int t) {
-    const uint64_t head = BM_HEAD_SIZE(kv->art_meta);
-    const uint64_t stride = head + kv->art_meta->block_size;
-    const uint32_t k = (uint32_t)(((uint64_t)art_node_sz(t) +
-                                   head + stride - 1) /
-                                  stride);
-    int64_t id = art_bump(kv, k);
-    while (id < 0) {
-        if (art_slab_grow(kv) != 0 || gens_grow(kv) != 0)
-            return -1;
-        id = art_bump(kv, k);
-    }
-    if (id >= 0) {
-        kv_gens_t *g = gens_at(kv, (int32_t)id);
-        if (g) {
-            __atomic_store_n(&g->struct_gen,
-                             (uint32_t)gen_alloc_epoch(kv), __ATOMIC_RELEASE);
-            __atomic_store_n(&g->value_gen, 0u, __ATOMIC_RELEASE);
-        }
-    }
-    return (int32_t)id;
-}
-static art_hdr_t *art_hdr(kvspace_t *kv, int32_t id) {
-    return (art_hdr_t *)art_blk(kv, id);
-}
-static int pfx_shared(const uint8_t *a, int al, const uint8_t *b, int bl) {
-    int n = al < bl ? al : bl;
-    for (int i = 0; i < n; i++)
-        if (a[i] != b[i])
-            return i;
-    return n;
-}
-static int32_t art_child(kvspace_t *kv, void *n, uint8_t b) {
-    art_hdr_t *h = (art_hdr_t *)n;
-    switch (h->type) {
-    case ART_N4: {
-        art_n4_t *x = n;
-        for (int i = 0; i < (int)h->count; i++)
-            if (x->keys[i] == b)
-                return x->children[i];
+static int trie_alloc_bytes(void *context, uint64_t bytes,
+                            uint64_t *out_offset) {
+    kvspace_t *kv = context;
+    blocks_meta_t *meta = kv->index_meta;
+    uint64_t stride = BM_HEAD_SIZE(meta) + meta->block_size;
+    uint64_t needed = bytes + BM_HEAD_SIZE(meta);
+    uint64_t blocks = (needed + stride - 1) / stride;
+    if (blocks == 0)
+        blocks = 1;
+    if (blocks > UINT32_MAX)
         return -1;
+    int64_t block_id = index_bump(kv, (uint32_t)blocks);
+    while (block_id < 0) {
+        if (index_slab_grow(kv) != 0)
+            return -1;
+        block_id = index_bump(kv, (uint32_t)blocks);
     }
-    case ART_N16: {
-        art_n16_t *x = n;
-        int lo = 0, hi = (int)h->count - 1;
-        while (lo <= hi) {
-            int m = (lo + hi) / 2;
-            if (x->keys[m] == b)
-                return x->children[m];
-            if (x->keys[m] < b)
-                lo = m + 1;
-            else
-                hi = m - 1;
-        }
+    uint64_t offset = (uint64_t)blockdata_offset(meta, (uint64_t)block_id);
+    memset(kv->index_data + offset, 0, (size_t)bytes);
+    *out_offset = offset;
+    return 0;
+}
+static int trie_make_index_value(void *context, uint64_t *out_value) {
+    kvspace_t *kv = context;
+    uint64_t offset = kv_sbo_alloc(kv, KVSPACE_XVALUE_HEAD_LEN);
+    if (offset == (uint64_t)-1)
         return -1;
-    }
-    case ART_N48: {
-        art_n48_t *x = n;
-        uint8_t idx = x->index[b];
-        return idx == 255 ? -1 : x->children[idx];
-    }
-    case ART_N256: {
-        return ((art_n256_t *)n)->children[b];
-    }
-    }
-    return -1;
+    kvspaceXvalueHead head;
+    memset(&head, 0, sizeof head);
+    kvspaceXvalueHeadSetLen(&head, 0);
+    kvspaceXvalueHeadSetAttrsLen(&head, 0);
+    memcpy(kv->sbo_data + offset, &head, sizeof head);
+    *out_value = TRIE_VALUE_PACK(1, offset);
+    return 0;
 }
-static int32_t art_follow(kvspace_t *kv, int32_t id);
-static int32_t art_walk(kvspace_t *kv, int32_t nid, const uint8_t *key, int klen,
-                        int d, int32_t *par, int *pard) {
-    while (nid >= 0) {
-        art_hdr_t *h = art_hdr(kv, nid);
-        if (!h || h->type == ART_MOVED)
-            return -1;
-        if (h->prefix_len) {
-            if (pfx_shared(h->prefix, h->prefix_len, key + d, klen - d) !=
-                h->prefix_len)
-                return -1;
-            d += h->prefix_len;
-        }
-        if (d == klen)
-            return AV_HAS(art_val_load(h)) ? nid : -1;
-        if (par)
-            *par = nid;
-        if (pard)
-            *pard = d;
-        nid = art_child(kv, h, key[d]);
-        d++;
-    }
-    return -1;
+static int node_at(kvspace_t *kv, const char *key, uint64_t *out_node) {
+    return trie_find_absolute(&kv->trie_env, kv->hdr->trie_root, key, out_node);
 }
-static int32_t art_find2(kvspace_t *kv, int32_t nid, const uint8_t *key, int klen,
-                         int32_t *par, int *pard) {
-    if (nid < 0 || !key)
-        return -1;
-    int32_t parent = -1;
-    int parent_d = 0;
-    int32_t id = art_walk(kv, nid, key, klen, 0, &parent, &parent_d);
-    if (par)
-        *par = parent;
-    if (pard)
-        *pard = parent_d;
-    return id;
-}
-static int32_t art_find(kvspace_t *kv, int32_t nid, const uint8_t *key,
-                        int klen) {
-    return art_find2(kv, nid, key, klen, NULL, NULL);
-}
-static int last_key_sep(const uint8_t *key, int klen, int *seplen) {
-    int slash = -1, mid = -1;
-    for (int i = 0; i < klen; i++) {
-        if (key[i] == '/')
-            slash = i;
-        if (i + 1 < klen && key[i] == 0xC2 && key[i + 1] == 0xB7)
-            mid = i;
-    }
-    if (mid > slash) {
-        *seplen = 2;
-        return mid;
-    }
-    if (slash > 0) {
-        *seplen = 1;
-        return slash;
-    }
-    *seplen = 0;
-    return -1;
-}
-static int32_t art_find_dir(kvspace_t *kv, int32_t nid, const uint8_t *key,
-                            int klen, int last_sep, int seplen, int32_t *dirn,
-                            int *dird) {
-    int d = 0;
-    int32_t dir = -1;
-    int dd = 0;
-    if (nid < 0 || !key)
-        return -1;
-    while (nid >= 0) {
-        art_hdr_t *h = art_hdr(kv, nid);
-        if (!h || h->type == ART_MOVED)
-            return -1;
-        int entry_d = d;
-        if (h->prefix_len) {
-            int s = pfx_shared(h->prefix, h->prefix_len, key + d, klen - d);
-            if (s != h->prefix_len)
-                return -1;
-            d += h->prefix_len;
-            if (d > klen)
-                return -1;
-        }
-        if (dir < 0 && last_sep > 0 && seplen > 0 &&
-            ((entry_d <= last_sep && last_sep < d) ||
-             d == last_sep + seplen)) {
-            dir = nid;
-            dd = d;
-        }
-        if (d == klen) {
-            if (dirn)
-                *dirn = dir;
-            if (dird)
-                *dird = dd;
-            return AV_HAS(art_val_load(h)) ? nid : -1;
-        }
-        nid = art_child(kv, h, key[d]);
-        d++;
-    }
-    return -1;
-}
-static art_hdr_t *art_search(kvspace_t *kv, int32_t nid, const uint8_t *key,
-                             int klen) {
-    int32_t id = art_find(kv, nid, key, klen);
-    return id < 0 ? NULL : art_hdr(kv, id);
-}
-static int32_t art_follow(kvspace_t *kv, int32_t id) {
-    for (int i = 0; i < 8 && id >= 0; i++) {
-        art_hdr_t *h = art_hdr(kv, id);
-        if (!h)
-            return -1;
-        if (h->type != ART_MOVED)
-            return id;
-        id = (int32_t)AV_OFF(art_val_load(h));
-    }
-    return -1;
-}
-static int32_t art_new_leaf(kvspace_t *kv, uint64_t off) {
-    int32_t id = art_balloc(kv, ART_N4);
-    if (id < 0)
-        return -1;
-    art_n4_t *x = art_blk(kv, id);
-    memset(x, 0, sizeof(*x));
-    x->h.type = ART_N4;
-    art_val_store(&x->h, AV_MAKE(1, off));
-    return id;
-}
-static int32_t art_new_node(kvspace_t *kv, int t) {
-    int32_t id = art_balloc(kv, t);
-    if (id < 0)
-        return -1;
-    void *x = art_blk(kv, id);
-    int sz = art_node_sz(t);
-    memset(x, 0, sz);
-    ((art_hdr_t *)x)->type = (uint8_t)t;
-    if (t == ART_N48)
-        memset(((art_n48_t *)x)->index, 255, 256);
-    if (t == ART_N256) {
-        art_n256_t *n = x;
-        for (int i = 0; i < 256; i++)
-            n->children[i] = -1;
-    }
-    return id;
-}
-static int32_t art_grow(kvspace_t *kv, void *on) {
-    art_hdr_t *oh = on;
-    int nt;
-    if (oh->type == ART_N4)
-        nt = ART_N16;
-    else if (oh->type == ART_N16)
-        nt = ART_N48;
-    else if (oh->type == ART_N48)
-        nt = ART_N256;
-    else
-        return -1;
-    int32_t nid = art_new_node(kv, nt);
-    if (nid < 0)
-        return -1;
-    art_hdr_t *nh = art_hdr(kv, nid);
-    nh->prefix_len = oh->prefix_len;
-    memcpy(nh->prefix, oh->prefix, oh->prefix_len);
-    art_val_store(nh, art_val_load(oh));
-    for (int i = 0; i < (int)oh->count; i++) {
-        uint8_t b = 0;
-        int32_t c = -1;
-        switch (oh->type) {
-        case ART_N4: {
-            art_n4_t *x = on;
-            b = x->keys[i];
-            c = x->children[i];
-            break;
-        }
-        case ART_N16: {
-            art_n16_t *x = on;
-            b = x->keys[i];
-            c = x->children[i];
-            break;
-        }
-        case ART_N48: {
-            art_n48_t *x = on;
-            c = x->children[i];
-            for (int j = 0; j < 256; j++)
-                if (x->index[j] == i) {
-                    b = (uint8_t)j;
-                    break;
-                }
-            break;
-        }
-        }
-        switch (nt) {
-        case ART_N16: {
-            art_n16_t *x = (art_n16_t *)nh;
-            x->keys[i] = b;
-            x->children[i] = c;
-            break;
-        }
-        case ART_N48: {
-            art_n48_t *x = (art_n48_t *)nh;
-            x->index[b] = (uint8_t)i;
-            x->children[i] = c;
-            break;
-        }
-        case ART_N256: {
-            ((art_n256_t *)nh)->children[b] = c;
-            break;
-        }
-        }
-    }
-    nh->count = oh->count;
-    if (nt == ART_N16) {
-        art_n16_t *x = (art_n16_t *)nh;
-        for (int i = 0; i < (int)nh->count - 1; i++)
-            for (int j = i + 1; j < (int)nh->count; j++)
-                if (x->keys[i] > x->keys[j]) {
-                    uint8_t tk = x->keys[i];
-                    x->keys[i] = x->keys[j];
-                    x->keys[j] = tk;
-                    int32_t tc = x->children[i];
-                    x->children[i] = x->children[j];
-                    x->children[j] = tc;
-                }
-    }
-    {
-        int32_t oid = art_id_of(kv, oh);
-        gen_bump_struct(kv, nid);
-        gen_bump_struct(kv, oid);
-    }
-    oh->type = ART_MOVED;
-    art_val_store(oh, AV_MAKE(0, (uint32_t)nid));
-    return nid;
-}
-static int art_add(kvspace_t *kv, void *n, uint8_t b, int32_t cid) {
-    gen_bump_struct(kv, art_id_of(kv, n));
-    art_hdr_t *h = n;
-    switch (h->type) {
-    case ART_N4: {
-        if (h->count >= 4)
-            return -1;
-        art_n4_t *x = n;
-        x->keys[h->count] = b;
-        x->children[h->count] = cid;
-        h->count++;
-        return 0;
-    }
-    case ART_N16: {
-        if (h->count >= 16)
-            return -1;
-        art_n16_t *x = n;
-        int p = (int)h->count;
-        while (p > 0 && x->keys[p - 1] > b) {
-            x->keys[p] = x->keys[p - 1];
-            x->children[p] = x->children[p - 1];
-            p--;
-        }
-        x->keys[p] = b;
-        x->children[p] = cid;
-        h->count++;
-        return 0;
-    }
-    case ART_N48: {
-        if (h->count >= 48)
-            return -1;
-        art_n48_t *x = n;
-        int s = (int)h->count;
-        x->index[b] = (uint8_t)s;
-        x->children[s] = cid;
-        h->count++;
-        return 0;
-    }
-    case ART_N256: {
-        art_n256_t *x = n;
-        if (x->children[b] >= 0)
-            return -1;
-        x->children[b] = cid;
-        h->count++;
-        return 0;
-    }
-    }
-    return -1;
-}
-static void art_rm(kvspace_t *kv, void *n, uint8_t b) {
-    art_hdr_t *h = n;
-    switch (h->type) {
-    case ART_N4: {
-        art_n4_t *x = n;
-        for (int i = 0; i < (int)h->count; i++)
-            if (x->keys[i] == b) {
-                for (int j = i; j < (int)h->count - 1; j++) {
-                    x->keys[j] = x->keys[j + 1];
-                    x->children[j] = x->children[j + 1];
-                }
-                h->count--;
-                return;
-            }
-        break;
-    }
-    case ART_N16: {
-        art_n16_t *x = n;
-        int lo = 0, hi = (int)h->count - 1, pos = -1;
-        while (lo <= hi) {
-            int m = (lo + hi) / 2;
-            if (x->keys[m] == b) {
-                pos = m;
-                break;
-            }
-            if (x->keys[m] < b)
-                lo = m + 1;
-            else
-                hi = m - 1;
-        }
-        if (pos < 0)
-            return;
-        for (int j = pos; j < (int)h->count - 1; j++) {
-            x->keys[j] = x->keys[j + 1];
-            x->children[j] = x->children[j + 1];
-        }
-        h->count--;
-        break;
-    }
-    case ART_N48: {
-        art_n48_t *x = n;
-        uint8_t idx = x->index[b];
-        if (idx == 255)
-            return;
-        x->index[b] = 255;
-        int last = (int)h->count - 1;
-        if (idx != last) {
-            x->children[idx] = x->children[last];
-            for (int j = 0; j < 256; j++)
-                if (x->index[j] == last) {
-                    x->index[j] = idx;
-                    break;
-                }
-        }
-        h->count--;
-        break;
-    }
-    case ART_N256: {
-        art_n256_t *x = n;
-        x->children[b] = -1;
-        h->count--;
-        break;
-    }
-    }
-}
-static int32_t art_leaf_chain(kvspace_t *kv, const uint8_t *key, int klen,
-                              int d, uint64_t off) {
-    int rem = klen - d;
-    if (rem <= ART_PREFIX_MAX) {
-        int32_t id = art_new_leaf(kv, off);
-        if (id < 0)
-            return -1;
-        art_n4_t *x = art_blk(kv, id);
-        if (rem > 0)
-            memcpy(x->h.prefix, key + d, (size_t)rem);
-        x->h.prefix_len = (uint8_t)rem;
-        return id;
-    }
-    int32_t id = art_new_node(kv, ART_N4);
-    if (id < 0)
-        return -1;
-    art_hdr_t *x = art_hdr(kv, id);
-    memcpy(x->prefix, key + d, ART_PREFIX_MAX);
-    x->prefix_len = ART_PREFIX_MAX;
-    int32_t sub = art_leaf_chain(kv, key, klen, d + ART_PREFIX_MAX + 1, off);
-    if (sub < 0)
-        return -1;
-    art_add(kv, x, key[d + ART_PREFIX_MAX], sub);
-    return id;
-}
-static int32_t art_ins(kvspace_t *kv, int32_t nid, const uint8_t *key, int klen,
-                       int d, uint64_t off) {
-    if (nid < 0)
-        return art_leaf_chain(kv, key, klen, d, off);
-    art_hdr_t *h = art_hdr(kv, nid);
-    if (!h)
-        return -1;
-    int shared = pfx_shared(h->prefix, h->prefix_len, key + d, klen - d);
-    int mpl = h->prefix_len < (klen - d) ? h->prefix_len : (klen - d);
-    if (shared == mpl && (klen - d) < h->prefix_len) {
-        int32_t nn = art_new_node(kv, ART_N4);
-        if (nn < 0)
-            return -1;
-        art_hdr_t *nh = art_hdr(kv, nn);
-        nh->prefix_len = (uint8_t)shared;
-        if (shared > 0)
-            memcpy(nh->prefix, key + d, (size_t)shared);
-        uint8_t ob = h->prefix[shared];
-        h->prefix_len -= (uint8_t)(shared + 1);
-        if (h->prefix_len > 0)
-            memmove(h->prefix, h->prefix + shared + 1, h->prefix_len);
-        art_add(kv, nh, ob, nid);
-        art_val_store(nh, AV_MAKE(1, off));
-        return nn;
-    }
-    if (shared < mpl) {
-        int32_t nn = art_new_node(kv, ART_N4);
-        if (nn < 0)
-            return -1;
-        art_hdr_t *nh = art_hdr(kv, nn);
-        nh->prefix_len = (uint8_t)shared;
-        memcpy(nh->prefix, key + d, shared);
-        uint8_t ob = h->prefix[shared];
-        h->prefix_len -= (uint8_t)(shared + 1);
-        if (h->prefix_len > 0)
-            memmove(h->prefix, h->prefix + shared + 1, h->prefix_len);
-        art_add(kv, nh, ob, nid);
-        int32_t leaf = art_leaf_chain(kv, key, klen, d + shared + 1, off);
-        if (leaf < 0)
-            return -1;
-        art_add(kv, nh, key[d + shared], leaf);
-        return nn;
-    }
-    d += h->prefix_len;
-    if (d == klen) {
-        art_val_store(h, AV_MAKE(1, off));
-        return nid;
-    }
-    int32_t cid = art_child(kv, h, key[d]);
-    if (cid >= 0) {
-        int32_t nc = art_ins(kv, cid, key, klen, d + 1, off);
-        if (nc < 0)
-            return -1;
-        if (nc != cid) {
-            art_rm(kv, h, key[d]);
-            art_add(kv, h, key[d], nc);
-        }
-        return nid;
-    }
-    int32_t leaf = art_leaf_chain(kv, key, klen, d + 1, off);
-    if (leaf < 0)
-        return -1;
-    if ((h->type == ART_N4 && h->count >= 4) ||
-        (h->type == ART_N16 && h->count >= 16) ||
-        (h->type == ART_N48 && h->count >= 48)) {
-        int32_t g = art_grow(kv, h);
-        if (g < 0)
-            return -1;
-        art_add(kv, art_hdr(kv, g), key[d], leaf);
-        return g;
-    }
-    art_add(kv, h, key[d], leaf);
-    return nid;
-}
-static int32_t art_del(kvspace_t *kv, int32_t nid, const uint8_t *key, int klen,
-                       int d, bool *del) {
-    if (nid < 0)
-        return -1;
-    art_hdr_t *h = art_hdr(kv, nid);
-    if (!h)
-        return -1;
-    if (h->prefix_len) {
-        if (pfx_shared(h->prefix, h->prefix_len, key + d, klen - d) !=
-            h->prefix_len)
-            return nid;
-        d += h->prefix_len;
-    }
-    if (d == klen) {
-        uint64_t hv = art_val_load(h);
-        if (!AV_HAS(hv))
-            return nid;
-        uint64_t gidx;
-        if (garb_reserve(kv, &gidx) != 0)
-            return -1;
-        if (!art_val_cas(h, &hv, 0)) {
-            garb_cancel(kv, gidx);
-            return nid;
-        }
-        gen_bump_value(kv, art_id_of(kv, h));
-        gen_bump_struct(kv, art_id_of(kv, h));
-        garb_commit(kv, gidx, AV_OFF(hv),
-                    sbo_allocated_size(kv->sbo_meta, AV_OFF(hv)));
-        *del = true;
-    } else {
-        int32_t cid = art_child(kv, h, key[d]);
-        if (cid >= 0) {
-            int32_t rc = art_del(kv, cid, key, klen, d + 1, del);
-            if (rc < 0)
-                return rc;
-        }
-    }
-    return nid;
-}
-static char *pjoin(const char *a, const char *b) {
-    size_t al = strlen(a), bl = strlen(b);
-    int sep = (al > 0 && a[al - 1] != '/') ? 1 : 0;
-    char *r = malloc(al + sep + bl + 1);
-    memcpy(r, a, al);
-    if (sep)
-        r[al] = '/';
-    memcpy(r + al + sep, b, bl + 1);
-    return r;
-}
-static void psplit(const char *k, char **p, char **n) {
-    const char *s = strrchr(k, '/');
-    if (!s || s == k) {
-        *p = strdup("/");
-        *n = strdup(s ? s + 1 : k);
-        return;
-    }
-    size_t pl = (size_t)(s - k) + 1;
-    *p = malloc(pl + 1);
-    memcpy(*p, k, pl);
-    (*p)[pl] = '\0';
-    *n = strdup(s + 1);
+static int node_has_value(kvspace_t *kv, uint64_t node, uint64_t *out_offset) {
+    uint64_t value = 0;
+    int status = trie_value_get(&kv->trie_env, node, &value);
+    if (status != KVSPACE_OK)
+        return status;
+    if (!TRIE_VALUE_HAS_VALUE(value))
+        return KVSPACE_MISSING;
+    if (out_offset != NULL)
+        *out_offset = TRIE_VALUE_OFFSET(value);
+    return KVSPACE_OK;
 }
 static int bad_dir_prefix(const char *p) {
     if (!p || !p[0])
@@ -1674,40 +956,6 @@ static char *edir(const char *p) {
     r[l] = '/';
     r[l + 1] = '\0';
     return r;
-}
-static int32_t art_cover(kvspace_t *kv, int32_t nid, const uint8_t *pfx,
-                         int plen, char *buf, int bcap, int *bpos) {
-    int d = 0;
-    if (nid < 0 || !pfx || plen < 0 || !buf || !bpos)
-        return -1;
-    while (nid >= 0) {
-        art_hdr_t *h = art_hdr(kv, nid);
-        if (!h)
-            return -1;
-        int pd = d, cover = 0;
-        if (h->prefix_len) {
-            int s = pfx_shared(h->prefix, h->prefix_len, pfx + d, plen - d);
-            if (s < h->prefix_len) {
-                if (d + s < plen)
-                    return -1;
-                cover = 1;
-            } else
-                d += h->prefix_len;
-        }
-        if (cover || d == plen) {
-            if (pd >= bcap)
-                return -1;
-            if (pd)
-                memcpy(buf, pfx, (size_t)pd);
-            *bpos = pd;
-            return nid;
-        }
-        nid = art_child(kv, h, pfx[d]);
-        if (nid < 0)
-            return -1;
-        d++;
-    }
-    return -1;
 }
 typedef struct {
     char **keys;
@@ -1739,224 +987,6 @@ static int keyscan_add_n(keyscan_t *scan, const char *key, size_t len) {
     scan->keys[scan->count++] = copy;
     return 0;
 }
-static int child_name_len(const char *rest, int restlen) {
-    for (int i = 0; i < restlen; i++) {
-        if (rest[i] == '/')
-            return i;
-        if (i + 1 < restlen && (unsigned char)rest[i] == 0xC2 &&
-            (unsigned char)rest[i + 1] == 0xB7)
-            return i;
-    }
-    return restlen;
-}
-static int art_has_live_value(kvspace_t *kv, int32_t nid) {
-    if (nid < 0)
-        return 0;
-    art_hdr_t *h = art_hdr(kv, nid);
-    if (!h)
-        return -1;
-    if (AV_HAS(art_val_load(h)))
-        return 1;
-    const int32_t *children;
-    int count = h->count;
-    switch (h->type) {
-    case ART_N4:
-        children = ((art_n4_t *)h)->children;
-        break;
-    case ART_N16:
-        children = ((art_n16_t *)h)->children;
-        break;
-    case ART_N48:
-        children = ((art_n48_t *)h)->children;
-        break;
-    case ART_N256:
-        children = ((art_n256_t *)h)->children;
-        count = 256;
-        break;
-    default:
-        return 0;
-    }
-    for (int i = 0; i < count; i++) {
-        int live = art_has_live_value(kv, children[i]);
-        if (live != 0)
-            return live;
-    }
-    return 0;
-}
-static int art_scan_children(kvspace_t *kv, int32_t nid, char *buf, int bpos, int bcap,
-                             int plen, keyscan_t *scan) {
-    if (nid < 0)
-        return 0;
-    art_hdr_t *h = art_hdr(kv, nid);
-    if (!h || h->prefix_len > bcap - bpos - 1)
-        return -1;
-    int start = bpos > plen + 1 ? bpos - plen - 2 : 0;
-    for (int i = 0; i < h->prefix_len; i++)
-        buf[bpos++] = h->prefix[i];
-    buf[bpos] = 0;
-    if (bpos > plen) {
-        const char *rest = buf + plen;
-        int restlen = bpos - plen;
-        int len = start + child_name_len(rest + start, restlen - start);
-        if (len < restlen) {
-            if (len == 0)
-                return 0;
-            int live = art_has_live_value(kv, nid);
-            if (live <= 0)
-                return live;
-            if (rest[len] == '/' && len + 1 == restlen &&
-                AV_HAS(art_val_load(h)))
-                len++;
-            return keyscan_add_n(scan, rest, (size_t)len);
-        }
-        if (AV_HAS(art_val_load(h)) &&
-            keyscan_add_n(scan, rest, (size_t)len) != 0)
-            return -1;
-    }
-    switch (h->type) {
-    case ART_N4: {
-        art_n4_t *x = (art_n4_t *)h;
-        for (int i = 0; i < (int)h->count; i++) {
-            if (bpos + 1 >= bcap)
-                return -1;
-            buf[bpos] = x->keys[i];
-            if (art_scan_children(kv, x->children[i], buf, bpos + 1, bcap,
-                                  plen, scan) != 0)
-                return -1;
-        }
-        break;
-    }
-    case ART_N16: {
-        art_n16_t *x = (art_n16_t *)h;
-        for (int i = 0; i < (int)h->count; i++) {
-            if (bpos + 1 >= bcap)
-                return -1;
-            buf[bpos] = x->keys[i];
-            if (art_scan_children(kv, x->children[i], buf, bpos + 1, bcap,
-                                  plen, scan) != 0)
-                return -1;
-        }
-        break;
-    }
-    case ART_N48: {
-        art_n48_t *x = (art_n48_t *)h;
-        for (int i = 0; i < 256; i++) {
-            if (x->index[i] == 255)
-                continue;
-            if (bpos + 1 >= bcap)
-                return -1;
-            buf[bpos] = (uint8_t)i;
-            if (art_scan_children(kv, x->children[x->index[i]], buf, bpos + 1,
-                                  bcap, plen, scan) != 0)
-                return -1;
-        }
-        break;
-    }
-    case ART_N256: {
-        art_n256_t *x = (art_n256_t *)h;
-        for (int i = 0; i < 256; i++) {
-            if (x->children[i] < 0)
-                continue;
-            if (bpos + 1 >= bcap)
-                return -1;
-            buf[bpos] = (uint8_t)i;
-            if (art_scan_children(kv, x->children[i], buf, bpos + 1, bcap,
-                                  plen, scan) != 0)
-                return -1;
-        }
-        break;
-    }
-    }
-    return 0;
-}
-static int art_scan_pfx(kvspace_t *kv, const char *pfx, int plen, char *buf,
-                        int bcap, keyscan_t *scan) {
-    if (plen >= bcap)
-        return -1;
-    int bpos = 0;
-    int32_t nid = art_cover(kv, kv->hdr->art_root, (const uint8_t *)pfx,
-                            plen, buf, bcap, &bpos);
-    if (nid < 0)
-        return 0;
-    return art_scan_children(kv, nid, buf, bpos, bcap, plen, scan);
-}
-static int art_collect_keys(kvspace_t *kv, int32_t nid, char *buf, int bpos,
-                            int bcap, keyscan_t *scan) {
-    if (nid < 0)
-        return 0;
-    art_hdr_t *h = art_hdr(kv, nid);
-    if (!h || h->prefix_len > bcap - bpos - 1)
-        return -1;
-    for (int i = 0; i < h->prefix_len; i++)
-        buf[bpos++] = h->prefix[i];
-    if (AV_HAS(art_val_load(h)) && keyscan_add_n(scan, buf, (size_t)bpos) != 0)
-        return -1;
-    const uint8_t *keys = NULL;
-    const int32_t *children = NULL;
-    int n = 0;
-    switch (h->type) {
-    case ART_N4:
-        keys = ((art_n4_t *)h)->keys;
-        children = ((art_n4_t *)h)->children;
-        n = h->count;
-        break;
-    case ART_N16:
-        keys = ((art_n16_t *)h)->keys;
-        children = ((art_n16_t *)h)->children;
-        n = h->count;
-        break;
-    case ART_N48: {
-        art_n48_t *x = (art_n48_t *)h;
-        for (int i = 0; i < 256; i++) {
-            if (x->index[i] == 255)
-                continue;
-            if (bpos + 1 >= bcap)
-                return -1;
-            buf[bpos] = (char)i;
-            if (art_collect_keys(kv, x->children[x->index[i]], buf, bpos + 1,
-                                 bcap, scan) != 0)
-                return -1;
-        }
-        return 0;
-    }
-    case ART_N256: {
-        art_n256_t *x = (art_n256_t *)h;
-        for (int i = 0; i < 256; i++) {
-            if (x->children[i] < 0)
-                continue;
-            if (bpos + 1 >= bcap)
-                return -1;
-            buf[bpos] = (char)i;
-            if (art_collect_keys(kv, x->children[i], buf, bpos + 1, bcap,
-                                 scan) != 0)
-                return -1;
-        }
-        return 0;
-    }
-    default:
-        return 0;
-    }
-    for (int i = 0; i < n; i++) {
-        if (bpos + 1 >= bcap)
-            return -1;
-        buf[bpos] = (char)keys[i];
-        if (art_collect_keys(kv, children[i], buf, bpos + 1, bcap, scan) != 0)
-            return -1;
-    }
-    return 0;
-}
-static int art_scan_keys(kvspace_t *kv, const char *pfx, int plen,
-                         keyscan_t *scan) {
-    char buf[4096];
-    if (plen >= (int)sizeof buf)
-        return -1;
-    int bpos = 0;
-    int32_t nid = art_cover(kv, kv->hdr->art_root, (const uint8_t *)pfx, plen,
-                            buf, (int)sizeof buf, &bpos);
-    if (nid < 0)
-        return 0;
-    return art_collect_keys(kv, nid, buf, bpos, (int)sizeof buf, scan);
-}
 static bool sbo_data_size_ok(size_t n) {
     for (uint64_t s = 8; s <= (1ULL << 45); s *= 64)
         if (s == n)
@@ -1970,14 +1000,11 @@ static kvspace_t *open_shm_store(const char *path, size_t data_size) {
         fprintf(stderr, "kvspace: unexpected blockmalloc blocks_meta_t layout\n");
         return NULL;
     }
-    char head_path[PATH_MAX], data_path[PATH_MAX], gen_path[PATH_MAX],
-        garb_path[PATH_MAX];
+    char head_path[PATH_MAX], data_path[PATH_MAX], garb_path[PATH_MAX];
     if (snprintf(head_path, sizeof head_path, "%s.sbo.head", path) >=
             (int)sizeof head_path ||
         snprintf(data_path, sizeof data_path, "%s.sbo.data", path) >=
             (int)sizeof data_path ||
-        snprintf(gen_path, sizeof gen_path, "%s.gen", path) >=
-            (int)sizeof gen_path ||
         snprintf(garb_path, sizeof garb_path, "%s.garb", path) >=
             (int)sizeof garb_path)
         return NULL;
@@ -1985,67 +1012,79 @@ static kvspace_t *open_shm_store(const char *path, size_t data_size) {
     if (!kv)
         return NULL;
     kv->p2_slot = -1;
-    kv->r_art.fd = kv->r_head.fd = kv->r_data.fd = kv->r_gen.fd =
-        kv->r_garb.fd = -1;
+    kv->r_index.fd = kv->r_head.fd = kv->r_data.fd = kv->r_garb.fd = -1;
     bool created = false;
-    kv->r_art.fd = open(path, O_RDWR);
-    if (kv->r_art.fd < 0) {
+    kv->r_index.fd = open(path, O_RDWR);
+    if (kv->r_index.fd < 0) {
         if (!sbo_data_size_ok(data_size))
             goto fail;
-        kv->r_art.fd = open(path, O_RDWR | O_CREAT | O_EXCL, 0644);
-        if (kv->r_art.fd < 0)
+        kv->r_index.fd = open(path, O_RDWR | O_CREAT | O_EXCL, 0644);
+        if (kv->r_index.fd < 0)
             goto fail;
         created = true;
     }
-    size_t art_slab, sbo_head;
+    size_t index_slab, sbo_head;
     if (created) {
-        art_slab = ART_SLAB_INIT;
+        index_slab = INDEX_SLAB_INIT;
         sbo_head = sbo_meta_size(data_size, SBO_HEAD_POOL_INIT);
     } else {
-        kvspace_hdr_t tmp;
-        if (pread(kv->r_art.fd, &tmp, sizeof tmp, 0) != (ssize_t)sizeof tmp ||
-            memcmp(tmp.magic, KVS_MAGIC, sizeof(KVS_MAGIC) - 1) != 0)
+        kvspace_hdr_t stored;
+        if (pread(kv->r_index.fd, &stored, sizeof stored, 0) !=
+                (ssize_t)sizeof stored ||
+            memcmp(stored.magic, KVS_MAGIC, sizeof(KVS_MAGIC) - 1) != 0)
             goto fail;
-        art_slab = (size_t)tmp.art_slab_size;
-        sbo_head = (size_t)tmp.sbo_head_size;
-        data_size = (size_t)tmp.sbo_data_size;
+        index_slab = (size_t)stored.index_slab_size;
+        sbo_head = (size_t)stored.sbo_head_size;
+        data_size = (size_t)stored.sbo_data_size;
     }
-    int fl = created ? O_RDWR | O_CREAT | O_TRUNC : O_RDWR;
-    if (region_attach(&kv->r_art, created, ART_OFF + art_slab,
-                      ART_RESERVE) != 0 ||
-        (kv->r_head.fd = open(head_path, fl, 0644)) < 0 ||
+    int flags = created ? O_RDWR | O_CREAT | O_TRUNC : O_RDWR;
+    if (region_attach(&kv->r_index, created, INDEX_OFF + index_slab,
+                      INDEX_RESERVE) != 0 ||
+        (kv->r_head.fd = open(head_path, flags, 0644)) < 0 ||
         region_attach(&kv->r_head, created, sbo_head, REGION_RESERVE) != 0 ||
-        (kv->r_data.fd = open(data_path, fl, 0644)) < 0 ||
+        (kv->r_data.fd = open(data_path, flags, 0644)) < 0 ||
         region_attach(&kv->r_data, created, data_size, DATA_RESERVE) != 0 ||
-        (kv->r_gen.fd = open(gen_path, fl, 0644)) < 0 ||
-        (kv->r_garb.fd = open(garb_path, fl, 0644)) < 0 ||
+        (kv->r_garb.fd = open(garb_path, flags, 0644)) < 0 ||
         region_attach(&kv->r_garb, created,
                       (size_t)GARB_CAP * sizeof(garb_ent_t),
                       (size_t)GARB_CAP * sizeof(garb_ent_t)) != 0)
         goto fail;
-    kv->hdr = (kvspace_hdr_t *)kv->r_art.base;
-    kv->art_meta = (blocks_meta_t *)(kv->r_art.base + sizeof(kvspace_hdr_t));
-    kv->art_data = kv->r_art.base + ART_OFF;
+    kv->hdr = (kvspace_hdr_t *)kv->r_index.base;
+    kv->index_meta =
+        (blocks_meta_t *)(kv->r_index.base + sizeof(kvspace_hdr_t));
+    kv->index_data = kv->r_index.base + INDEX_OFF;
     kv->sbo_meta = (sbo_meta_t *)kv->r_head.base;
     kv->sbo_data = kv->r_data.base;
     kv->garb = (garb_ent_t *)kv->r_garb.base;
+    kv->trie_env.context = kv;
+    kv->trie_env.alloc_bytes = trie_alloc_bytes;
+    kv->trie_env.make_index_value = trie_make_index_value;
+    kv->trie_env.base = kv->index_data;
+    kv->trie_env.slab_size = 0;
     {
         static uint32_t store_seq;
         kv->store_id = ((uint64_t)getpid() << 32) | (uint64_t)++store_seq;
     }
     if (created) {
         memset(kv->hdr, 0, sizeof(*kv->hdr));
-        kv->hdr->art_slab_size = art_slab;
+        kv->hdr->index_slab_size = index_slab;
         kv->hdr->sbo_head_size = sbo_head;
         kv->hdr->sbo_data_size = data_size;
-        kv->hdr->art_root = -1;
-        if (blocks_init(kv->art_meta, art_slab, ART_BLOCK_SZ) != 0 ||
+        kv->hdr->trie_root = 0;
+        if (blocks_init(kv->index_meta, index_slab, INDEX_BLOCK_SIZE) != 0 ||
             sbo_init(kv->sbo_meta, sbo_head, data_size) != 0)
             goto fail;
-        kv->art_meta->sizeof_block_head = 8;
+        kv->index_meta->sizeof_block_head = 8;
         memcpy(kv->hdr->magic, KVS_MAGIC, sizeof(KVS_MAGIC) - 1);
+        kv->trie_env.slab_size = index_slab;
+        uint64_t root = 0;
+        if (trie_root_create(&kv->trie_env, &root) != KVSPACE_OK)
+            goto fail;
+        kv->hdr->trie_root = root;
     }
-    if (gens_grow(kv) != 0)
+    kv->trie_env.base = kv->index_data;
+    kv->trie_env.slab_size = kv->hdr->index_slab_size;
+    if (kv->hdr->trie_root == 0)
         goto fail;
     kv->p2_slot = p2_reg_claim(kv);
     if (kv->p2_slot == -2) {
@@ -2073,17 +1112,15 @@ fail:
     p2_maint_stop(kv);
     if (kv->p2_slot >= 0 && kv->hdr)
         p2_reg_release(kv);
-    region_close(&kv->r_art);
+    region_close(&kv->r_index);
     region_close(&kv->r_head);
     region_close(&kv->r_data);
-    region_close(&kv->r_gen);
     region_close(&kv->r_garb);
     free(kv);
     if (created) {
         unlink(path);
         unlink(head_path);
         unlink(data_path);
-        unlink(gen_path);
         unlink(garb_path);
     }
     return NULL;
@@ -2131,10 +1168,9 @@ static void close_shm_store(kvspace_t *kv) {
     }
     p2_maint_stop(kv);
     p2_reg_release(kv);
-    region_close(&kv->r_art);
+    region_close(&kv->r_index);
     region_close(&kv->r_head);
     region_close(&kv->r_data);
-    region_close(&kv->r_gen);
     region_close(&kv->r_garb);
     free(kv);
 }
@@ -2150,10 +1186,6 @@ static int parse_value(const uint8_t *s, uint64_t bound, int32_t *ol) {
     *ol = (int32_t)total;
     return 0;
 }
-static int read_value(kvspace_t *kv, uint64_t off, uint8_t **out, int32_t *ol) {
-    *out = kv->sbo_data + off;
-    return parse_value(*out, sbo_allocated_size(kv->sbo_meta, off), ol);
-}
 static uint64_t ro_bound(const kvspace_t *kv, uint64_t off) {
     uint64_t m = kv->r_data.mapped;
     return off < m ? m - off : 0;
@@ -2163,271 +1195,100 @@ static int read_value_ro(kvspace_t *kv, uint64_t off, uint8_t **out,
     *out = kv->sbo_data + off;
     return parse_value(*out, ro_bound(kv, off), ol);
 }
-static art_hdr_t *resolve_fetch(kvspace_t *kv, const char *path, char *out, int osz,
-                                uint8_t **raw, int32_t *rl, int *fetched) {
+static int resolve_fetch(kvspace_t *kv, const char *path, char *out, int osz,
+                         uint8_t **raw, int32_t *raw_length, int *fetched) {
     *fetched = 0;
     strncpy(out, path, osz - 1);
     out[osz - 1] = '\0';
     for (int depth = 0; depth < 16; depth++) {
-        art_hdr_t *h =
-            art_search(kv, kv->hdr->art_root, (const uint8_t *)out, (int)strlen(out));
-        if (!h)
-            return h;
-        uint64_t hv = art_val_load(h);
-        if (!AV_HAS(hv))
-            return h;
-        uint8_t *s = kv->sbo_data + AV_OFF(hv);
-        uint64_t sz = ro_bound(kv, AV_OFF(hv));
+        uint64_t node = 0;
+        if (node_at(kv, out, &node) != KVSPACE_OK)
+            return -1;
+        uint64_t offset = 0;
+        if (node_has_value(kv, node, &offset) != KVSPACE_OK)
+            return -1;
+        uint8_t *bytes = kv->sbo_data + offset;
+        uint64_t size = ro_bound(kv, offset);
         kvspaceXvalueHead wire;
-        if (head_of(s, sz > INT32_MAX ? INT32_MAX : (int32_t)sz, &wire) == 0) {
-            uint64_t l3 = kvspaceXvalueHeadLen(&wire);
-            if (kvspace_c_reference_of(s, sz) != KVSPACE_XVALUE_REFERENCE_PTR ||
-                l3 >= (uint64_t)osz) {
-                if (parse_value(s, sz, rl) != 0)
-                    return NULL;
-                *raw = s;
+        if (head_of(bytes, size > INT32_MAX ? INT32_MAX : (int32_t)size,
+                    &wire) == 0) {
+            uint64_t length = kvspaceXvalueHeadLen(&wire);
+            if (kvspace_c_reference_of(bytes, size) !=
+                    KVSPACE_XVALUE_REFERENCE_PTR ||
+                length >= (uint64_t)osz) {
+                if (parse_value(bytes, size, raw_length) != 0)
+                    return -1;
+                *raw = bytes;
                 *fetched = 1;
-                return h;
+                return 0;
             }
-            memcpy(out, s + KVSPACE_XVALUE_HEAD_LEN, (size_t)l3);
-            out[l3] = 0;
+            memcpy(out, bytes + KVSPACE_XVALUE_HEAD_LEN, (size_t)length);
+            out[length] = 0;
             continue;
         }
-        return NULL;
+        return -1;
     }
-    return NULL;
+    return -1;
 }
 static void resolve_path(kvspace_t *kv, const char *path, char *out, int osz) {
     uint8_t *raw;
-    int32_t rl;
+    int32_t raw_length;
     int fetched;
-    (void)resolve_fetch(kv, path, out, osz, &raw, &rl, &fetched);
+    (void)resolve_fetch(kv, path, out, osz, &raw, &raw_length, &fetched);
 }
-static int dir_ext_path(kvspace_t *kv, const char *dir, char *out, int osz) {
+static int dir_ext_path(kvspace_t *kv, const char *directory, char *out,
+                        int osz) {
     out[0] = 0;
-    art_hdr_t *h =
-        art_search(kv, kv->hdr->art_root, (const uint8_t *)dir, (int)strlen(dir));
-    if (!h)
+    uint64_t node = 0;
+    if (node_at(kv, directory, &node) != KVSPACE_OK)
         return 0;
-    uint64_t hv = art_val_load(h);
-    if (!AV_HAS(hv))
+    uint64_t offset = 0;
+    if (node_has_value(kv, node, &offset) != KVSPACE_OK)
         return 0;
     uint8_t *raw;
-    int32_t rl;
-    if (read_value_ro(kv, AV_OFF(hv), &raw, &rl) < 0)
+    int32_t raw_length;
+    if (read_value_ro(kv, offset, &raw, &raw_length) < 0)
         return 0;
     kvspaceXvalueHead wire;
-    if (head_of(raw, rl, &wire) != 0 ||
-        kvspace_c_reference_of(raw, (uint64_t)rl) != KVSPACE_XVALUE_REFERENCE_EXT)
+    if (head_of(raw, raw_length, &wire) != 0 ||
+        kvspace_c_reference_of(raw, (uint64_t)raw_length) !=
+            KVSPACE_XVALUE_REFERENCE_EXT)
         return 0;
-    uint64_t l4 = kvspaceXvalueHeadLen(&wire);
-    if (l4 == 0 || l4 >= (uint64_t)osz)
+    uint64_t length = kvspaceXvalueHeadLen(&wire);
+    if (length == 0 || length >= (uint64_t)osz)
         return 0;
-    memcpy(out, raw + KVSPACE_XVALUE_HEAD_LEN, (size_t)l4);
-    out[l4] = 0;
+    memcpy(out, raw + KVSPACE_XVALUE_HEAD_LEN, (size_t)length);
+    out[length] = 0;
     return 1;
 }
-#define KVSPACE_STATUS_MAX_LEN 16u
-#define KVSPACE_STATUS_MIN_CAP 80u
-static int is_vthread_status_key(const char *key) {
-    static const char pfx[] = "/vthread/";
-    static const char suf[] = "/\xE2\x80\xA5status";
-    if (!key)
-        return 0;
-    size_t n = strlen(key), sl = sizeof suf - 1;
-    return n > sl && strncmp(key, pfx, sizeof pfx - 1) == 0 &&
-           memcmp(key + n - sl, suf, sl) == 0;
-}
-static int is_char_langtype(const uint8_t *langtype, uint16_t length) {
-    if (!langtype || length == 0)
-        return 0;
-    uint16_t at = 0;
-    if (langtype[0] == '[') {
-        while (at < length && langtype[at] != ']')
-            ++at;
-        if (at >= length)
-            return 0;
-        ++at;
-    }
-    return (uint16_t)(length - at) >= 5 &&
-           memcmp(langtype + at, "char/", 5) == 0;
-}
-static int shm_set_local(kvspace_t *kv, const char *key, const uint8_t *val,
-                         int32_t val_len, art_hdr_t *old, size_t reserve) {
-    size_t alloc_len = (size_t)val_len;
-    if (reserve > alloc_len)
-        alloc_len = reserve;
-    if (is_vthread_status_key(key) && alloc_len < KVSPACE_STATUS_MIN_CAP)
-        alloc_len = KVSPACE_STATUS_MIN_CAP;
-    uint64_t ohv = old ? art_val_load(old) : 0;
-    bool retiring = old && AV_HAS(ohv);
-    uint64_t gidx = 0;
-    uint64_t cap = 0;
-    if (retiring) {
-        cap = sbo_allocated_size(kv->sbo_meta, AV_OFF(ohv));
-        if ((uint64_t)alloc_len <= cap) {
-            kv_gens_t *g = gens_at(kv, art_id_of(kv, old));
-            if (g)
-                __atomic_add_fetch(&g->value_gen, 1u, __ATOMIC_ACQ_REL);
-            memcpy(kv->sbo_data + AV_OFF(ohv), val, (size_t)val_len);
-            if (g)
-                __atomic_add_fetch(&g->value_gen, 1u, __ATOMIC_ACQ_REL);
-            return 0;
-        }
-        if (garb_reserve(kv, &gidx) != 0)
-            return -1;
-#ifdef P2_TEST_HOOKS
-        if (g_p2_test_knobs.hold_reserve_ms)
-            usleep((useconds_t)g_p2_test_knobs.hold_reserve_ms * 1000);
-        if (g_p2_test_knobs.fail_alloc) {
-            garb_cancel(kv, gidx);
-            return -1;
-        }
-#endif
-    }
-    uint64_t off = kv_sbo_alloc(kv, alloc_len);
-    if (off == (uint64_t)-1) {
-        if (retiring)
-            garb_cancel(kv, gidx);
-        return -1;
-    }
-    memcpy(kv->sbo_data + off, val, val_len);
-#ifdef P2_TEST_HOOKS
-    if (retiring && g_p2_test_knobs.fail_art_insert) {
-        garb_cancel(kv, gidx);
-        kv_sbo_free(kv, off);
-        return -1;
-    }
-#endif
-    int32_t root = art_ins(kv, kv->hdr->art_root, (const uint8_t *)key,
-                           (int)strlen(key), 0, off);
-    if (root < 0) {
-        if (retiring)
-            garb_cancel(kv, gidx);
-        kv_sbo_free(kv, off);
-        return -1;
-    }
-    kv->hdr->art_root = root;
-    {
-        int32_t nid = p2_node_at(kv, key);
-        kv_gens_t *g = gens_at(kv, nid);
-        if (g) {
-            gen_bump_struct(kv, nid);
-            gen_bump_value(kv, nid);
-        }
-    }
-    if (retiring)
-        garb_commit(kv, gidx, AV_OFF(ohv), cap);
-    else
-        list_gen_bump(kv);
-    return 0;
-}
-static int shm_set_raw(kvspace_t *kv, const char *key, const uint8_t *val,
-                       int32_t val_len, size_t reserve) {
-    art_hdr_t *old = art_search(kv, kv->hdr->art_root, (const uint8_t *)key,
-                                (int)strlen(key));
-    return shm_set_local(kv, key, val, val_len, old, reserve);
-}
-static int frame_operand_ptr(const char *key, const uint8_t *wire_bytes,
-                             uint64_t wire_len) {
-    if (kvspace_c_reference_of(wire_bytes, wire_len) !=
-            KVSPACE_XVALUE_REFERENCE_PTR ||
-        strncmp(key, "/vthread/", 9) != 0)
-        return 0;
-    const char *slot = strrchr(key, '/');
-    if (!slot || slot[1] != '[')
-        return 0;
-    char *end;
-    long row = strtol(slot + 2, &end, 10);
-    if (row <= 0 || *end++ != ',')
-        return 0;
-    long col = strtol(end, &end, 10);
-    return col != 0 && *end++ == ']' && *end == '\0';
-}
-static int shm_set_validated(kvspace_t *kv, const char *key,
-                            const uint8_t *val, int32_t val_len,
-                            const kvspaceXvalueHead *wire) {
-    if (kv_sync(kv) != 0)
-        return -1;
-    char kbuf[1024];
-    if (strlen(key) >= sizeof kbuf || strstr(key, "//") ||
-        reserved_meta_path(key))
-        return -1;
-    strcpy(kbuf, key);
-    art_hdr_t *local = art_search(kv, kv->hdr->art_root,
-                                   (const uint8_t *)kbuf, (int)strlen(kbuf));
-    uint64_t lhv = local ? art_val_load(local) : 0;
-    if (!local || !AV_HAS(lhv)) {
-        char *pp = NULL, *nn = NULL;
-        psplit(kbuf, &pp, &nn);
-        char extpath[1024];
-        if (pp && nn && dir_ext_path(kv, pp, extpath, sizeof extpath)) {
-            char *tgt = pjoin(extpath, nn);
-            art_hdr_t *eh = art_search(kv, kv->hdr->art_root,
-                                       (const uint8_t *)tgt, (int)strlen(tgt));
-            free(tgt);
-            if (eh && AV_HAS(art_val_load(eh)) &&
-                !frame_operand_ptr(kbuf, val, (uint64_t)val_len)) {
-                free(pp);
-                free(nn);
-                return -1;
-            }
-        }
-        free(pp);
-        free(nn);
-    }
-    if (is_vthread_status_key(kbuf)) {
-        const uint8_t *status_langtype = NULL;
-        uint16_t status_langtype_len = 0;
-        if (kvspace_c_scan_attrs(val, (uint64_t)val_len, &status_langtype,
-                                 &status_langtype_len) != 0)
-            return -1;
-        uint64_t effective = 0;
-        if (kvspaceXvalueHeadEffectiveLen(val, (uint64_t)val_len, &effective) != 0 ||
-            effective > KVSPACE_STATUS_MAX_LEN ||
-            !is_char_langtype(status_langtype, status_langtype_len))
-            return -1;
-        if (local && AV_HAS(lhv)) {
-            uint8_t *old_raw = kv->sbo_data + AV_OFF(lhv);
-            uint64_t old_sz = sbo_allocated_size(kv->sbo_meta, AV_OFF(lhv));
-            kvspaceXvalueHead old;
-            const uint8_t *old_langtype = NULL;
-            uint16_t old_langtype_len = 0;
-            if (kvspace_c_scan_attrs(old_raw, (uint64_t)old_sz, &old_langtype,
-                                     &old_langtype_len) != 0)
-                return -1;
-            uint64_t old_effective = 0;
-            if (head_of(old_raw, (int32_t)old_sz, &old) != 0 ||
-                kvspaceXvalueHeadEffectiveLen(old_raw, (uint64_t)old_sz,
-                                              &old_effective) != 0 ||
-                old_effective > KVSPACE_STATUS_MAX_LEN ||
-                old_sz < KVSPACE_STATUS_MIN_CAP ||
-                !is_char_langtype(old_langtype, old_langtype_len))
-                return -1;
-        }
-    }
-    return shm_set_local(kv, kbuf, val, val_len, local, 0);
-}
 static int shm_del_key(kvspace_t *kv, const char *key) {
-    bool d = false;
-    int32_t root = art_del(kv, kv->hdr->art_root, (const uint8_t *)key,
-                           (int)strlen(key), 0, &d);
-    if (root < 0)
+    uint64_t node = 0;
+    int status = node_at(kv, key, &node);
+    if (status == KVSPACE_MISSING)
+        return 0;
+    if (status != KVSPACE_OK)
         return -1;
-    kv->hdr->art_root = root;
-    return d ? 1 : 0;
-}
-static int delete_key(kvspace_t *kv, const char *key) {
-    if (!kv || !key)
+    uint64_t value = 0;
+    if (trie_value_get(&kv->trie_env, node, &value) != KVSPACE_OK)
         return -1;
-    if (kv_sync(kv) != 0)
+    if (!TRIE_VALUE_HAS_VALUE(value))
+        return 0;
+    uint64_t garbage_index = 0;
+    if (garb_reserve(kv, &garbage_index) != 0)
         return -1;
-    if (strlen(key) >= 1024)
+    uint64_t offset = TRIE_VALUE_OFFSET(value);
+    uint64_t capacity = sbo_allocated_size(kv->sbo_meta, offset);
+    status = trie_remove(&kv->trie_env, kv->hdr->trie_root, key);
+    if (status == TRIE_HAS_CHILDREN) {
+        garb_cancel(kv, garbage_index);
+        return KVSPACE_HAS_CHILDREN;
+    }
+    if (status != KVSPACE_OK) {
+        garb_cancel(kv, garbage_index);
         return -1;
-    if (shm_del_key(kv, key) != 1)
-        return -1;
-    list_gen_bump(kv);
-    return 0;
+    }
+    garb_commit(kv, garbage_index, offset, capacity);
+    return 1;
 }
 static char *memdir(const char *p) {
     size_t l = strlen(p);
@@ -2438,78 +1299,182 @@ static char *memdir(const char *p) {
     r[l + 2] = 0;
     return r;
 }
-static int subtree_key(const char *base, size_t bl, const char *key) {
-    if (bl == 0)
-        return key[0] == '/';
-    if (strncmp(key, base, bl) != 0)
-        return 0;
-    const unsigned char *r = (const unsigned char *)key + bl;
-    return r[0] == 0 || r[0] == '/' || (r[0] == 0xC2 && r[1] == 0xB7) ||
-           (r[0] == 0xE2 && r[1] == 0x80 && r[2] == 0xA5);
+typedef struct {
+    keyscan_t keys;
+    const char *prefix;
+} subtree_scan_t;
+static int ends_with_middle_dot(const char *text, size_t length) {
+    return length >= 2 && (unsigned char)text[length - 2] == 0xC2 &&
+           (unsigned char)text[length - 1] == 0xB7;
 }
-static int is_ptr_key(kvspace_t *kv, const char *key) {
-    art_hdr_t *h = art_search(kv, kv->hdr->art_root, (const uint8_t *)key,
-                              (int)strlen(key));
-    uint64_t hv = h ? art_val_load(h) : 0;
-    if (!h || !AV_HAS(hv))
-        return 0;
-    uint8_t *raw = NULL;
-    int32_t rl = 0;
-    kvspaceXvalueHead wire;
-    return read_value(kv, AV_OFF(hv), &raw, &rl) == 0 && rl > 0 &&
-           head_of(raw, rl, &wire) == 0 &&
-           kvspace_c_reference_of(raw, (uint64_t)rl) ==
-               KVSPACE_XVALUE_REFERENCE_PTR;
+static int subtree_collect(void *context, const char *suffix,
+                           uint64_t node_offset, uint64_t value) {
+    subtree_scan_t *scan = context;
+    (void)node_offset;
+    (void)value;
+    size_t prefix_length = strlen(scan->prefix);
+    size_t suffix_length = strlen(suffix);
+    if (prefix_length + suffix_length >= TRIE_KEY_LIMIT)
+        return -1;
+    char *key = malloc(prefix_length + suffix_length + 1);
+    if (key == NULL)
+        return -1;
+    memcpy(key, scan->prefix, prefix_length);
+    memcpy(key + prefix_length, suffix, suffix_length + 1);
+    int status = keyscan_add_n(&scan->keys, key, prefix_length + suffix_length);
+    free(key);
+    return status;
+}
+static int delete_subtree(kvspace_t *kv, uint64_t node, const char *key) {
+    subtree_scan_t scan;
+    memset(&scan, 0, sizeof scan);
+    scan.prefix = key;
+    uint32_t count = 0;
+    if (trie_subtree_visit(&kv->trie_env, node, subtree_collect, &scan,
+                           &count) != KVSPACE_OK) {
+        keyscan_free(&scan.keys);
+        return -1;
+    }
+    int status = 0;
+    int deleted_any = 0;
+    for (int32_t index = scan.keys.count - 1; index >= 0; index--) {
+        int deleted = shm_del_key(kv, scan.keys.keys[index]);
+        if (deleted == 1)
+            deleted_any = 1;
+        else if (deleted < 0)
+            status = -1;
+    }
+    keyscan_free(&scan.keys);
+    if (deleted_any)
+        list_gen_bump(kv);
+    return status;
+}
+static int delete_root_children(kvspace_t *kv) {
+    subtree_scan_t scan;
+    memset(&scan, 0, sizeof scan);
+    scan.prefix = "/";
+    uint32_t count = 0;
+    if (trie_subtree_visit(&kv->trie_env, kv->hdr->trie_root, subtree_collect,
+                           &scan, &count) != KVSPACE_OK) {
+        keyscan_free(&scan.keys);
+        return -1;
+    }
+    int status = 0;
+    int deleted_any = 0;
+    for (int32_t index = scan.keys.count - 1; index >= 0; index--) {
+        const char *key = scan.keys.keys[index];
+        if (key[0] == '/' && key[1] == 0)
+            continue;
+        int deleted = shm_del_key(kv, key);
+        if (deleted == 1)
+            deleted_any = 1;
+        else if (deleted < 0)
+            status = -1;
+    }
+    keyscan_free(&scan.keys);
+    if (deleted_any)
+        list_gen_bump(kv);
+    return status;
+}
+static size_t last_segment_start(const char *base, size_t length) {
+    size_t start = 1;
+    for (size_t index = 1; index < length; index++) {
+        if (base[index] == '/') {
+            start = index + 1;
+        } else if ((unsigned char)base[index] == 0xC2 &&
+                   index + 1 < length &&
+                   (unsigned char)base[index + 1] == 0xB7) {
+            start = index + 2;
+            index++;
+        }
+    }
+    return start;
 }
 static int delete_tree(kvspace_t *kv, const char *prefix) {
     if (!kv || !prefix || reserved_meta_path(prefix))
         return -1;
     if (kv_sync(kv) != 0)
         return -1;
-    size_t pl = strlen(prefix);
-    if (pl >= 1024)
+    size_t length = strlen(prefix);
+    if (length >= TRIE_KEY_LIMIT)
         return -1;
-    char base[1024];
-    memcpy(base, prefix, pl + 1);
-    size_t bl = pl;
-    if (strcmp(prefix, "/") == 0)
-        bl = 0;
-    else if (bl && base[bl - 1] == '/')
-        bl--;
-    else if (bl >= 2 && (unsigned char)base[bl - 2] == 0xC2 &&
-             (unsigned char)base[bl - 1] == 0xB7)
-        bl -= 2;
-    base[bl] = 0;
-    if (bl && reserved_meta_path(base))
+    char base[TRIE_KEY_LIMIT];
+    memcpy(base, prefix, length + 1);
+    size_t base_length = length;
+    while (base_length > 1 && base[base_length - 1] == '/')
+        base_length--;
+    if (ends_with_middle_dot(base, base_length))
+        base_length -= 2;
+    base[base_length] = 0;
+    if (base_length == 0 || base[0] != '/')
+        return 0;
+    if (base_length > 1 && reserved_meta_path(base))
         return -1;
-    if (pl && is_ptr_key(kv, prefix))
-        return delete_key(kv, prefix);
-    if (bl && bl != pl && is_ptr_key(kv, base)) {
-        int rc = delete_key(kv, base);
-        delete_key(kv, prefix);
-        return rc;
-    }
-    keyscan_t keys = {0};
-    if (art_scan_keys(kv, bl ? base : "/", bl ? (int)bl : 1, &keys) != 0) {
-        keyscan_free(&keys);
+    if (base_length == 1)
+        return delete_root_children(kv);
+    size_t parent_length = last_segment_start(base, base_length);
+    const char *segment = base + parent_length;
+    size_t segment_length = base_length - parent_length;
+    char parent_key[TRIE_KEY_LIMIT];
+    memcpy(parent_key, base, parent_length);
+    parent_key[parent_length] = 0;
+    uint64_t parent = 0;
+    int status = node_at(kv, parent_key, &parent);
+    if (status == KVSPACE_MISSING)
+        return 0;
+    if (status != KVSPACE_OK)
         return -1;
-    }
-    int rc = 0, any = 0;
-    for (int32_t i = 0; i < keys.count; i++) {
-        const char *k = keys.keys[i];
-        if (!subtree_key(base, bl, k) || reserved_meta_path(k) ||
-            strlen(k) >= 1024)
+    uint32_t count = 0;
+    if (trie_child_count(&kv->trie_env, parent, &count) != KVSPACE_OK)
+        return -1;
+    keyscan_t matches;
+    memset(&matches, 0, sizeof matches);
+    for (uint32_t index = 0; index < count; index++) {
+        const uint8_t *name = NULL;
+        uint16_t name_length = 0;
+        uint64_t child = 0;
+        if (trie_child_at(&kv->trie_env, parent, index, &name, &name_length,
+                          &child) != KVSPACE_OK) {
+            keyscan_free(&matches);
+            return -1;
+        }
+        (void)child;
+        int matched =
+            (name_length == segment_length &&
+             memcmp(name, segment, segment_length) == 0) ||
+            (name_length == segment_length + 1 &&
+             memcmp(name, segment, segment_length) == 0 &&
+             name[segment_length] == '/') ||
+            (name_length == segment_length + 2 &&
+             memcmp(name, segment, segment_length) == 0 &&
+             name[segment_length] == 0xC2 &&
+             name[segment_length + 1] == 0xB7);
+        if (!matched)
             continue;
-        int d = shm_del_key(kv, k);
-        if (d < 0)
-            rc = -1;
-        else if (d)
-            any = 1;
+        char key[TRIE_KEY_LIMIT];
+        if (parent_length + name_length >= TRIE_KEY_LIMIT) {
+            keyscan_free(&matches);
+            return -1;
+        }
+        memcpy(key, parent_key, parent_length);
+        memcpy(key + parent_length, name, name_length);
+        key[parent_length + name_length] = 0;
+        if (keyscan_add_n(&matches, key, parent_length + name_length) != 0) {
+            keyscan_free(&matches);
+            return -1;
+        }
     }
-    keyscan_free(&keys);
-    if (any)
-        list_gen_bump(kv);
-    return rc;
+    status = 0;
+    for (int32_t index = 0; index < matches.count; index++) {
+        uint64_t child = 0;
+        if (node_at(kv, matches.keys[index], &child) != KVSPACE_OK ||
+            delete_subtree(kv, child, matches.keys[index]) != 0) {
+            status = -1;
+            break;
+        }
+    }
+    keyscan_free(&matches);
+    return status;
 }
 static int read_wire(kvspace_t *kv, const char *key, const uint8_t **out,
                      uint64_t *out_len) {
@@ -2554,104 +1519,191 @@ static int copy_key(kvspace_t *kv, const char *src, const char *dst) {
     if (!kv || !src || !dst)
         return -1;
     const uint8_t *raw = NULL;
-    uint64_t rl = 0;
-    if (read_wire(kv, src, &raw, &rl) != 0)
+    uint64_t length = 0;
+    if (read_wire(kv, src, &raw, &length) != 0)
         return -1;
-    uint8_t *tmp = malloc((size_t)rl);
-    if (!tmp)
+    uint8_t *temporary = malloc((size_t)length);
+    if (temporary == NULL)
         return -1;
-    memcpy(tmp, raw, (size_t)rl);
-    int rc = write_wire(kv, dst, tmp, rl);
-    free(tmp);
-    return rc;
+    memcpy(temporary, raw, (size_t)length);
+    int status = write_wire(kv, dst, temporary, length);
+    free(temporary);
+    return status;
 }
-static int cptree_rec(kvspace_t *kv, const char *src, const char *dst) {
-    {
-        const uint8_t *raw = NULL;
-        uint64_t rl = 0;
-        if (read_wire(kv, src, &raw, &rl) == 0) {
-            if (copy_key(kv, src, dst) != 0)
-                return -1;
-        }
+static int ends_with_slash(const char *text) {
+    size_t length = strlen(text);
+    return length > 0 && text[length - 1] == '/';
+}
+static char *make_directory(const char *path, int middle_dot) {
+    size_t length = strlen(path);
+    if (middle_dot ? ends_with_middle_dot(path, length) : ends_with_slash(path))
+        return strdup(path);
+    char *result = malloc(length + (middle_dot ? 2u : 1u) + 1u);
+    if (result == NULL)
+        return NULL;
+    memcpy(result, path, length);
+    if (middle_dot) {
+        result[length] = (char)0xC2;
+        result[length + 1] = (char)0xB7;
+        result[length + 2] = 0;
+    } else {
+        result[length] = '/';
+        result[length + 1] = 0;
     }
-    char *es = edir(src), *ed = edir(dst);
-    char **ns;
-    int32_t nc;
-    if (list_names(kv, es, false, 1, &ns, &nc) != 0) {
-        free(es);
-        free(ed);
+    return result;
+}
+static char *join_child(const char *directory, const uint8_t *name,
+                        uint16_t name_length) {
+    size_t directory_length = strlen(directory);
+    char *result = malloc(directory_length + name_length + 1);
+    if (result == NULL)
+        return NULL;
+    memcpy(result, directory, directory_length);
+    memcpy(result + directory_length, name, name_length);
+    result[directory_length + name_length] = 0;
+    return result;
+}
+static int copy_node(kvspace_t *kv, const char *src, const char *dst);
+static int copy_children(kvspace_t *kv, const char *src_directory,
+                         const char *dst_directory) {
+    uint64_t node = 0;
+    int status = node_at(kv, src_directory, &node);
+    if (status == KVSPACE_MISSING)
+        return 0;
+    if (status != KVSPACE_OK)
         return -1;
-    }
-    int rc = 0;
-    for (int i = 0; i < nc; i++) {
-        char *cs = pjoin(es, ns[i]), *cd = pjoin(ed, ns[i]);
-        if (!cs || !cd || cptree_rec(kv, cs, cd) != 0)
-            rc = -1;
-        free(cs);
-        free(cd);
-        if (rc != 0)
+    uint32_t count = 0;
+    if (trie_child_count(&kv->trie_env, node, &count) != KVSPACE_OK)
+        return -1;
+    int result = 0;
+    for (uint32_t index = 0; index < count; index++) {
+        const uint8_t *name = NULL;
+        uint16_t name_length = 0;
+        uint64_t child = 0;
+        if (trie_child_at(&kv->trie_env, node, index, &name, &name_length,
+                          &child) != KVSPACE_OK) {
+            result = -1;
+            break;
+        }
+        (void)child;
+        char *src_key = join_child(src_directory, name, name_length);
+        char *dst_key = join_child(dst_directory, name, name_length);
+        if (src_key == NULL || dst_key == NULL ||
+            copy_node(kv, src_key, dst_key) != 0)
+            result = -1;
+        free(src_key);
+        free(dst_key);
+        if (result != 0)
             break;
     }
-    for (int i = 0; i < nc; i++)
-        free(ns[i]);
-    free(ns);
-    free(es);
-    free(ed);
-    if (rc != 0)
+    return result;
+}
+static int copy_node(kvspace_t *kv, const char *src, const char *dst) {
+    size_t src_length = strlen(src);
+    int src_is_directory =
+        ends_with_slash(src) || ends_with_middle_dot(src, src_length);
+    char *dst_value = NULL;
+    if (ends_with_slash(src))
+        dst_value = make_directory(dst, 0);
+    else if (ends_with_middle_dot(src, src_length))
+        dst_value = make_directory(dst, 1);
+    else
+        dst_value = strdup(dst);
+    if (dst_value == NULL)
         return -1;
-    char *ms = memdir(src), *md = memdir(dst);
-    char **mms;
-    int32_t mc;
-    if (list_names(kv, ms, false, 1, &mms, &mc) != 0) {
-        free(ms);
-        free(md);
+    const uint8_t *raw = NULL;
+    uint64_t length = 0;
+    if (read_wire(kv, src, &raw, &length) == 0 &&
+        copy_key(kv, src, dst_value) != 0) {
+        free(dst_value);
         return -1;
     }
-    for (int i = 0; i < mc; i++) {
-        size_t msl = strlen(ms), mdl = strlen(md), nl = strlen(mms[i]);
-        char *cs = malloc(msl + nl + 1);
-        char *cd = malloc(mdl + nl + 1);
-        if (!cs || !cd) {
-            rc = -1;
-        } else {
-            memcpy(cs, ms, msl);
-            memcpy(cs + msl, mms[i], nl + 1);
-            memcpy(cd, md, mdl);
-            memcpy(cd + mdl, mms[i], nl + 1);
-            if (cptree_rec(kv, cs, cd) != 0)
-                rc = -1;
+    int status = 0;
+    if (src_is_directory) {
+        status = copy_children(kv, src, dst_value);
+    } else {
+        char *src_directory = make_directory(src, 0);
+        char *dst_directory = make_directory(dst_value, 0);
+        if (src_directory == NULL || dst_directory == NULL) {
+            free(src_directory);
+            free(dst_directory);
+            free(dst_value);
+            return -1;
         }
-        free(cs);
-        free(cd);
-        if (rc != 0)
+        status = copy_children(kv, src_directory, dst_directory);
+        free(src_directory);
+        free(dst_directory);
+        if (status == 0) {
+            src_directory = make_directory(src, 1);
+            dst_directory = make_directory(dst_value, 1);
+            if (src_directory == NULL || dst_directory == NULL) {
+                free(src_directory);
+                free(dst_directory);
+                status = -1;
+            } else {
+                status = copy_children(kv, src_directory, dst_directory);
+                free(src_directory);
+                free(dst_directory);
+            }
+        }
+    }
+    free(dst_value);
+    return status;
+}
+static int copy_direct_children(kvspace_t *kv, const char *src_directory,
+                                const char *dst_directory) {
+    uint64_t node = 0;
+    int status = node_at(kv, src_directory, &node);
+    if (status == KVSPACE_MISSING)
+        return 0;
+    if (status != KVSPACE_OK)
+        return -1;
+    uint32_t count = 0;
+    if (trie_child_count(&kv->trie_env, node, &count) != KVSPACE_OK)
+        return -1;
+    int result = 0;
+    for (uint32_t index = 0; index < count; index++) {
+        const uint8_t *name = NULL;
+        uint16_t name_length = 0;
+        uint64_t child = 0;
+        if (trie_child_at(&kv->trie_env, node, index, &name, &name_length,
+                          &child) != KVSPACE_OK) {
+            result = -1;
+            break;
+        }
+        (void)child;
+        char *src_key = join_child(src_directory, name, name_length);
+        char *dst_key = join_child(dst_directory, name, name_length);
+        if (src_key == NULL || dst_key == NULL ||
+            copy_key(kv, src_key, dst_key) != 0)
+            result = -1;
+        free(src_key);
+        free(dst_key);
+        if (result != 0)
             break;
     }
-    for (int i = 0; i < mc; i++)
-        free(mms[i]);
-    free(mms);
-    free(ms);
-    free(md);
-    return rc;
+    return result;
 }
 static int copy_tree(kvspace_t *kv, const char *src, const char *dst) {
     if (!kv || !src || !dst || reserved_meta_path(src) ||
         reserved_meta_path(dst))
         return -1;
-    size_t sl = strlen(src);
-    while (sl > 1 && src[sl - 1] == '/')
-        sl--;
-    if (sl == 1 && src[0] == '/' && dst[0] == '/')
+    size_t src_length = strlen(src);
+    while (src_length > 1 && src[src_length - 1] == '/')
+        src_length--;
+    if (src_length == 1 && src[0] == '/' && dst[0] == '/')
         return dst[1] ? -1 : 0;
-    if (strncmp(src, dst, sl) == 0) {
-        if (dst[sl] == 0 || (dst[sl] == '/' && dst[sl + 1] == 0))
+    if (strncmp(src, dst, src_length) == 0) {
+        if (dst[src_length] == 0 ||
+            (dst[src_length] == '/' && dst[src_length + 1] == 0))
             return 0;
-        if (dst[sl] == '/' ||
-            ((unsigned char)dst[sl] == 0xc2 &&
-             (unsigned char)dst[sl + 1] == 0xb7))
+        if (dst[src_length] == '/' ||
+            ((unsigned char)dst[src_length] == 0xc2 &&
+             (unsigned char)dst[src_length + 1] == 0xb7))
             return -1;
     }
     delete_tree(kv, dst);
-    return cptree_rec(kv, src, dst);
+    return copy_node(kv, src, dst);
 }
 int kvspaceShmCplist(kvspace_t *kv, const char *src, const char *dst) {
     if (!kv || !src || !dst || reserved_meta_path(src) ||
@@ -2661,44 +1713,22 @@ int kvspaceShmCplist(kvspace_t *kv, const char *src, const char *dst) {
         return 0;
     delete_tree(kv, dst);
     const uint8_t *raw = NULL;
-    uint64_t rl = 0;
-    if (read_wire(kv, src, &raw, &rl) == 0 && copy_key(kv, src, dst) != 0)
+    uint64_t length = 0;
+    if (read_wire(kv, src, &raw, &length) == 0 && copy_key(kv, src, dst) != 0)
         return -1;
-    char *ms = memdir(src), *md = memdir(dst);
-    char **mms;
-    int32_t mc;
-    if (list_names(kv, ms, false, 1, &mms, &mc) != 0) {
-        free(ms);
-        free(md);
+    if (ends_with_slash(src) || ends_with_middle_dot(src, strlen(src)))
+        return 0;
+    char *src_directory = make_directory(src, 1);
+    char *dst_directory = make_directory(dst, 1);
+    if (src_directory == NULL || dst_directory == NULL) {
+        free(src_directory);
+        free(dst_directory);
         return -1;
     }
-    size_t msl = strlen(ms), mdl = strlen(md);
-    int rc = 0;
-    for (int i = 0; i < mc; i++) {
-        size_t nl = strlen(mms[i]);
-        char *cs = malloc(msl + nl + 1);
-        char *cd = malloc(mdl + nl + 1);
-        if (!cs || !cd) {
-            rc = -1;
-        } else {
-            memcpy(cs, ms, msl);
-            memcpy(cs + msl, mms[i], nl + 1);
-            memcpy(cd, md, mdl);
-            memcpy(cd + mdl, mms[i], nl + 1);
-            if (copy_key(kv, cs, cd) != 0)
-                rc = -1;
-        }
-        free(cs);
-        free(cd);
-        if (rc != 0)
-            break;
-    }
-    for (int i = 0; i < mc; i++)
-        free(mms[i]);
-    free(mms);
-    free(ms);
-    free(md);
-    return rc;
+    int status = copy_direct_children(kv, src_directory, dst_directory);
+    free(src_directory);
+    free(dst_directory);
+    return status;
 }
 static int same_child(const char *a, const char *b) {
     size_t na = strlen(a), nb = strlen(b);
@@ -2706,196 +1736,207 @@ static int same_child(const char *a, const char *b) {
     if (nb && b[nb - 1] == '/') nb--;
     return na == nb && memcmp(a, b, na) == 0;
 }
-static int list_target(kvspace_t *kv, const char *prefix, bool ex, int resolve,
-                       char *target, size_t tcap, char *ext, size_t ecap) {
+static int list_target(kvspace_t *kv, const char *prefix, bool expand_ext,
+                       int resolve, char *target, size_t target_capacity,
+                       char *ext, size_t ext_capacity) {
     ext[0] = 0;
     if (reserved_meta_path(prefix))
         return 1;
     if (kv_sync(kv) != 0 || bad_dir_prefix(prefix))
         return -1;
     if (resolve) {
-        if (strlen(prefix) >= 1024)
+        if (strlen(prefix) >= TRIE_KEY_LIMIT)
             return -1;
-        resolve_path(kv, prefix, target, 1024);
+        resolve_path(kv, prefix, target, (int)target_capacity);
     } else {
-        size_t l = strlen(prefix);
-        if (l >= tcap)
+        size_t length = strlen(prefix);
+        if (length >= target_capacity)
             return -1;
-        memcpy(target, prefix, l + 1);
+        memcpy(target, prefix, length + 1);
     }
     if (reserved_meta_path(target))
         return 1;
-    if (ex) {
-        char *dir = edir(target);
-        if (!dir)
+    if (expand_ext) {
+        char *directory = edir(target);
+        if (directory == NULL)
             return -1;
-        if (!dir_ext_path(kv, dir, ext, (int)ecap))
+        if (!dir_ext_path(kv, directory, ext, (int)ext_capacity))
             ext[0] = 0;
-        free(dir);
+        free(directory);
     }
     return 0;
 }
-static int list_scan(kvspace_t *kv, const char *pfx, const char *ext,
-                     char ***on, int32_t *oc) {
-    keyscan_t children = {0};
-    char buf[4096];
-    if (kv->hdr->art_root >= 0 &&
-        art_scan_pfx(kv, pfx, (int)strlen(pfx), buf, (int)sizeof buf, &children) != 0)
+typedef struct {
+    keyscan_t names;
+    int hide_root_meta;
+} children_scan_t;
+static int name_contains_marker(const char *name, size_t length) {
+    for (size_t index = 0; index + 2 < length; index++)
+        if ((unsigned char)name[index] == 0xE2 &&
+            (unsigned char)name[index + 1] == 0x80 &&
+            (unsigned char)name[index + 2] == 0xA5)
+            return 1;
+    return 0;
+}
+static int single_segment_name(const char *name, size_t length) {
+    for (size_t index = 0; index < length; index++) {
+        if (name[index] == '/')
+            return index + 1 == length;
+        if ((unsigned char)name[index] == 0xC2 && index + 1 < length &&
+            (unsigned char)name[index + 1] == 0xB7)
+            return index + 2 == length;
+    }
+    return 1;
+}
+static int list_scan_visit(void *context, const char *suffix,
+                           uint64_t node_offset, uint64_t value) {
+    children_scan_t *scan = context;
+    (void)node_offset;
+    (void)value;
+    size_t length = strlen(suffix);
+    if (length == 0 || !single_segment_name(suffix, length))
+        return 0;
+    if (scan->hide_root_meta && length == sizeof(".kvspace-meta") - 1 &&
+        memcmp(suffix, ".kvspace-meta", length) == 0)
+        return 0;
+    if (name_contains_marker(suffix, length))
+        return 0;
+    return keyscan_add_n(&scan->names, suffix, length) == 0 ? 0 : -1;
+}
+static int list_scan_directory(kvspace_t *kv, const char *directory,
+                               children_scan_t *scan) {
+    uint64_t node = 0;
+    int status = node_at(kv, directory, &node);
+    if (status == KVSPACE_MISSING)
+        return 0;
+    if (status != KVSPACE_OK)
+        return -1;
+    uint32_t count = 0;
+    if (trie_subtree_visit(&kv->trie_env, node, list_scan_visit, scan,
+                           &count) != KVSPACE_OK)
+        return -1;
+    return 0;
+}
+static int list_scan(kvspace_t *kv, const char *prefix, const char *ext,
+                     char ***out_names, int32_t *out_count) {
+    children_scan_t children;
+    memset(&children, 0, sizeof children);
+    children.hide_root_meta = strcmp(prefix, "/") == 0;
+    if (list_scan_directory(kv, prefix, &children) != 0)
         goto fail;
-    if (ext[0] && art_scan_pfx(kv, ext, (int)strlen(ext), buf, (int)sizeof buf,
-                               &children) != 0)
+    if (ext[0] && list_scan_directory(kv, ext, &children) != 0)
         goto fail;
     int32_t keep = 0;
-    if (children.count > 1) {
+    if (children.names.count > 1) {
         uint32_t buckets = 8u;
-        while (buckets < (uint32_t)children.count * 2u)
+        while (buckets < (uint32_t)children.names.count * 2u)
             buckets <<= 1u;
-        int32_t *table = (int32_t *)malloc((size_t)buckets * sizeof *table);
-        if (!table)
+        int32_t *table = malloc((size_t)buckets * sizeof *table);
+        if (table == NULL)
             goto fail;
-        int32_t *next = (int32_t *)malloc((size_t)children.count * sizeof *next);
-        if (!next) {
+        int32_t *next = malloc((size_t)children.names.count * sizeof *next);
+        if (next == NULL) {
             free(table);
             goto fail;
         }
-        for (uint32_t b = 0; b < buckets; b++)
-            table[b] = -1;
-        for (int32_t i = 0; i < children.count; i++) {
-            const char *name = children.keys[i];
-            if ((strcmp(pfx, "/") == 0 && strcmp(name, ".kvspace-meta") == 0) ||
-                strstr(name, "\xE2\x80\xA5") != NULL) {
-                free(children.keys[i]);
-                continue;
-            }
-            const size_t name_len = strlen(name);
-            size_t base_len = name_len;
-            if (base_len && name[base_len - 1] == '/')
-                base_len--;
+        for (uint32_t bucket = 0; bucket < buckets; bucket++)
+            table[bucket] = -1;
+        for (int32_t index = 0; index < children.names.count; index++) {
+            const char *name = children.names.keys[index];
+            const size_t name_length = strlen(name);
+            size_t base_length = name_length;
+            if (base_length > 0 && name[base_length - 1] == '/')
+                base_length--;
             uint32_t hash = 2166136261u;
-            for (size_t c = 0; c < base_len; c++)
-                hash = (hash ^ (unsigned char)name[c]) * 16777619u;
-            const uint32_t bucket = hash & (buckets - 1u);
+            for (size_t at = 0; at < base_length; at++)
+                hash = (hash ^ (unsigned char)name[at]) * 16777619u;
+            uint32_t bucket = hash & (buckets - 1u);
             int32_t twin = -1;
-            for (int32_t slot = table[bucket]; slot >= 0; slot = next[slot]) {
-                if (same_child(children.keys[slot], name)) {
+            for (int32_t slot = table[bucket]; slot >= 0; slot = next[slot])
+                if (same_child(children.names.keys[slot], name)) {
                     twin = slot;
                     break;
                 }
-            }
             if (twin >= 0) {
-                if (name[name_len - 1] == '/') {
-                    free(children.keys[twin]);
-                    children.keys[twin] = children.keys[i];
+                if (name[name_length - 1] == '/') {
+                    free(children.names.keys[twin]);
+                    children.names.keys[twin] = children.names.keys[index];
                 } else {
-                    free(children.keys[i]);
+                    free(children.names.keys[index]);
                 }
                 continue;
             }
-            children.keys[keep] = children.keys[i];
+            children.names.keys[keep] = children.names.keys[index];
             next[keep] = table[bucket];
             table[bucket] = keep;
             keep++;
         }
         free(next);
         free(table);
-        children.count = keep;
-        *on = children.keys;
-        *oc = children.count;
+        children.names.count = keep;
+        *out_names = children.names.keys;
+        *out_count = children.names.count;
         return 0;
     }
-    for (int32_t i = 0; i < children.count; i++) {
-        const char *name = children.keys[i];
-        const int hidden = (strcmp(pfx, "/") == 0 &&
-                            strcmp(name, ".kvspace-meta") == 0) ||
-                           strstr(name, "\xE2\x80\xA5") != NULL;
-        if (hidden) {
-            free(children.keys[i]);
-            continue;
-        }
-        children.keys[keep++] = children.keys[i];
-    }
-    children.count = keep;
-    *on = children.keys;
-    *oc = children.count;
+    for (int32_t index = 0; index < children.names.count; index++)
+        children.names.keys[keep++] = children.names.keys[index];
+    children.names.count = keep;
+    *out_names = children.names.keys;
+    *out_count = children.names.count;
     return 0;
 fail:
-    keyscan_free(&children);
+    keyscan_free(&children.names);
     return -1;
 }
-static int list_names(kvspace_t *kv, const char *prefix, bool ex, int resolve,
-                   char ***on, int32_t *oc) {
-    if (!kv || !prefix || !on || !oc)
+static int list_names(kvspace_t *kv, const char *prefix, bool expand_ext,
+                      int resolve, char ***out_names, int32_t *out_count) {
+    if (!kv || !prefix || !out_names || !out_count)
         return -1;
-    *on = NULL;
-    *oc = 0;
+    *out_names = NULL;
+    *out_count = 0;
     char target[4096], ext[1024];
-    int rc = list_target(kv, prefix, ex, resolve, target, sizeof target, ext,
-                         sizeof ext);
-    if (rc != 0)
-        return rc > 0 ? 0 : -1;
-    return list_scan(kv, target, ext, on, oc);
+    int status = list_target(kv, prefix, expand_ext, resolve, target,
+                             sizeof target, ext, sizeof ext);
+    if (status != 0)
+        return status > 0 ? 0 : -1;
+    return list_scan(kv, target, ext, out_names, out_count);
 }
-int kvspaceShmListLen(kvspace_t *kv, const char *prefix, bool ex, int resolve,
-                      int32_t *out_count) {
+int kvspaceShmListLen(kvspace_t *kv, const char *prefix, bool expand_ext,
+                      int resolve, int32_t *out_count) {
     if (!out_count)
         return -1;
     *out_count = 0;
     if (!kv || !prefix)
         return -1;
-    char target[4096], ext[1024];
-    int rc = list_target(kv, prefix, ex, resolve, target, sizeof target, ext,
-                         sizeof ext);
-    if (rc != 0)
-        return rc > 0 ? 0 : -1;
     char **names = NULL;
     int32_t count = 0;
-    if (list_scan(kv, target, ext, &names, &count) != 0)
+    int status = list_names(kv, prefix, expand_ext, resolve, &names, &count);
+    if (status != 0)
         return -1;
-    for (int32_t i = 0; i < count; i++)
-        free(names[i]);
+    for (int32_t index = 0; index < count; index++)
+        free(names[index]);
     free(names);
     *out_count = count;
     return 0;
 }
-static int storage_locate(kvspace_t *kv, const char *key, int32_t *out_id,
+static int storage_locate(kvspace_t *kv, const char *key, uint64_t *out_node,
                           uint64_t *out_offset) {
-    art_hdr_t *h = art_search(kv, kv->hdr->art_root, (const uint8_t *)key,
-                              (int)strlen(key));
-    if (!h)
-        return KVSPACE_MISSING;
-    uint64_t hv = art_val_load(h);
-    if (!AV_HAS(hv))
-        return KVSPACE_MISSING;
-    *out_id = art_id_of(kv, h);
-    *out_offset = AV_OFF(hv);
-    return KVSPACE_OK;
+    uint64_t node = 0;
+    int status = node_at(kv, key, &node);
+    if (status != KVSPACE_OK)
+        return status;
+    if (out_node != NULL)
+        *out_node = node;
+    return node_has_value(kv, node, out_offset);
 }
-static int anchor_from_offset(kvspace_t *kv, int64_t key_offset,
-                              kvspaceAnchor_t *out) {
-    if (!kv || !out || key_offset <= 0)
-        return -1;
-    if ((uint64_t)key_offset >= kv->art_meta->total_size)
-        return -1;
-    int64_t block_id = blockid_bydataoffset(kv->art_meta, (uint64_t)key_offset);
-    if (block_id < 0 || (uint64_t)block_id >= kv->art_meta->used_blocks)
-        return -1;
-    out->key_offset = key_offset;
-    out->block_id = (int32_t)block_id;
-    return 0;
+static int storage_anchor_ok(kvspace_t *kv, uint64_t anchor) {
+    trie_hdr_t *header = NULL;
+    if (trie_node_header(&kv->trie_env, anchor, &header) != KVSPACE_OK)
+        return 0;
+    return (header->flags & TRIE_FLAG_DEAD) == 0;
 }
-static int storage_anchor_ok(kvspace_t *kv, const kvspaceAnchor_t *anchor) {
-    if (!kv || !anchor || anchor->block_id < 0)
-        return 0;
-    if ((uint64_t)anchor->block_id >= kv->art_meta->used_blocks)
-        return 0;
-    art_hdr_t *h = art_hdr(kv, anchor->block_id);
-    if (!h || h->type == ART_MOVED)
-        return 0;
-    return 1;
-}
-static int resolve_anchor(kvspace_t *kv, const char *key,
-                                 kvspaceAnchor_t anchor, uint64_t *out_offset) {
-    int32_t id = -1;
+static int resolve_anchor(kvspace_t *kv, const char *key, uint64_t anchor,
+                          uint64_t *out_offset) {
     if (!kv || !key || !out_offset)
         return KVSPACE_INVALID;
     *out_offset = 0;
@@ -2903,16 +1944,18 @@ static int resolve_anchor(kvspace_t *kv, const char *key,
         return KVSPACE_INVALID;
     if (kv_sync(kv) != 0)
         return KVSPACE_BACKEND;
-    if (!storage_anchor_ok(kv, &anchor))
+    if (!storage_anchor_ok(kv, anchor))
         return KVSPACE_ANCHOR_INVALID;
-    return storage_locate(kv, key, &id, out_offset);
+    uint64_t node = 0;
+    int status = trie_find_relative(&kv->trie_env, anchor, key, &node);
+    if (status != KVSPACE_OK)
+        return status;
+    return node_has_value(kv, node, out_offset);
 }
 static uint8_t *storage_data_base(kvspace_t *kv) {
     return kv ? kv->sbo_data : NULL;
 }
-static int resolve_root(kvspace_t *kv, const char *key,
-                             uint64_t *out_offset) {
-    int32_t id = -1;
+static int resolve_root(kvspace_t *kv, const char *key, uint64_t *out_offset) {
     if (!kv || !key || !out_offset)
         return KVSPACE_INVALID;
     *out_offset = 0;
@@ -2920,7 +1963,7 @@ static int resolve_root(kvspace_t *kv, const char *key,
         return KVSPACE_INVALID;
     if (kv_sync(kv) != 0)
         return KVSPACE_BACKEND;
-    return storage_locate(kv, key, &id, out_offset);
+    return storage_locate(kv, key, NULL, out_offset);
 }
 #ifdef P2_TEST_HOOKS
 int kvspaceShmTestAnchorOf(kvspace_t *kv, const char *parent_key,
@@ -2931,22 +1974,13 @@ int kvspaceShmTestAnchorOf(kvspace_t *kv, const char *parent_key,
         return KVSPACE_INVALID;
     if (kv_sync(kv) != 0)
         return KVSPACE_BACKEND;
-    art_hdr_t *h = art_search(kv, kv->hdr->art_root,
-                              (const uint8_t *)parent_key,
-                              (int)strlen(parent_key));
-    if (!h || !AV_HAS(art_val_load(h)))
-        return KVSPACE_MISSING;
-    int32_t id = art_id_of(kv, h);
-    if (id < 0)
+    uint64_t node = 0;
+    int status = node_at(kv, parent_key, &node);
+    if (status != KVSPACE_OK)
+        return status;
+    if (node == 0)
         return KVSPACE_BACKEND;
-    if ((uint64_t)id >= kv->art_meta->used_blocks)
-        return KVSPACE_BACKEND;
-    if (art_hdr(kv, id)->type == ART_MOVED)
-        return KVSPACE_BACKEND;
-    int64_t offset = (int64_t)blockdata_offset(kv->art_meta, (uint64_t)id);
-    if (offset <= 0)
-        return KVSPACE_BACKEND;
-    *out_anchor = offset;
+    *out_anchor = (int64_t)node;
     return KVSPACE_OK;
 }
 #endif
@@ -2958,14 +1992,13 @@ static void storage_write_head(uint8_t *dst, uint64_t body_len,
     kvspaceXvalueHeadSetAttrsLen(&h, (uint16_t)attr_len);
     memcpy(dst, &h, sizeof h);
 }
-static int realloc_key(kvspace_t *kv, const char *key,
-                             uint64_t body_len, uint64_t attr_len,
-                             uint64_t *out_offset) {
+static int realloc_key(kvspace_t *kv, const char *key, uint64_t body_len,
+                       uint64_t attr_len, uint64_t *out_offset) {
     if (!kv || !key || !out_offset)
         return KVSPACE_INVALID;
     *out_offset = 0;
     if (reserved_meta_path(key) || strstr(key, "//") ||
-        strlen(key) >= 1024)
+        strlen(key) >= TRIE_KEY_LIMIT)
         return KVSPACE_INVALID;
     if (attr_len > UINT16_MAX)
         return KVSPACE_INVALID;
@@ -2975,105 +2008,111 @@ static int realloc_key(kvspace_t *kv, const char *key,
     need += attr_len;
     if (need > INT32_MAX)
         return KVSPACE_INVALID;
+    trie_segment_t segments[TRIE_MAX_SEGMENTS];
+    int segment_count = 0;
+    int parse = trie_key_segments(key, segments, TRIE_MAX_SEGMENTS,
+                                  &segment_count);
+    if (parse != KVSPACE_OK)
+        return parse;
     if (kv_sync(kv) != 0)
         return KVSPACE_BACKEND;
-    art_hdr_t *node = art_search(kv, kv->hdr->art_root, (const uint8_t *)key,
-                                 (int)strlen(key));
-    uint64_t ohv = node ? art_val_load(node) : 0;
-    bool retiring = node && AV_HAS(ohv);
-    uint64_t gidx = 0;
-    uint64_t old_cap = 0;
-    if (retiring) {
-        uint64_t off = AV_OFF(ohv);
-        old_cap = sbo_allocated_size(kv->sbo_meta, off);
-        if (need <= old_cap) {
-            kv_gens_t *g = gens_at(kv, art_id_of(kv, node));
-            if (g)
-                __atomic_add_fetch(&g->value_gen, 1u, __ATOMIC_ACQ_REL);
-            storage_write_head(kv->sbo_data + off, body_len, attr_len);
-            if (g)
-                __atomic_add_fetch(&g->value_gen, 1u, __ATOMIC_ACQ_REL);
-            *out_offset = off;
+    uint64_t node = 0;
+    int found = trie_find_absolute(&kv->trie_env, kv->hdr->trie_root, key,
+                                   &node);
+    if (found != KVSPACE_OK && found != KVSPACE_MISSING)
+        return found == KVSPACE_INVALID ? KVSPACE_INVALID : KVSPACE_BACKEND;
+    uint64_t old_value = 0;
+    int has_old = 0;
+    if (found == KVSPACE_OK) {
+        if (trie_value_get(&kv->trie_env, node, &old_value) != KVSPACE_OK)
+            return KVSPACE_BACKEND;
+        has_old = TRIE_VALUE_HAS_VALUE(old_value);
+    }
+    uint64_t garbage_index = 0;
+    uint64_t old_capacity = 0;
+    if (has_old) {
+        uint64_t old_offset = TRIE_VALUE_OFFSET(old_value);
+        old_capacity = sbo_allocated_size(kv->sbo_meta, old_offset);
+        if (need <= old_capacity) {
+            (void)trie_value_set(&kv->trie_env, node,
+                                 TRIE_VALUE_PACK(1, old_offset));
+            storage_write_head(kv->sbo_data + old_offset, body_len, attr_len);
+            (void)trie_value_set(&kv->trie_env, node,
+                                 TRIE_VALUE_PACK(1, old_offset));
+            *out_offset = old_offset;
             return KVSPACE_OK;
         }
-        if (garb_reserve(kv, &gidx) != 0)
+        if (garb_reserve(kv, &garbage_index) != 0)
             return KVSPACE_BACKEND;
     }
-    uint64_t off = kv_sbo_alloc(kv, (size_t)need);
-    if (off == (uint64_t)-1) {
-        if (retiring)
-            garb_cancel(kv, gidx);
+    uint64_t offset = kv_sbo_alloc(kv, (size_t)need);
+    if (offset == (uint64_t)-1) {
+        if (has_old)
+            garb_cancel(kv, garbage_index);
         return KVSPACE_BACKEND;
     }
-    memset(kv->sbo_data + off, 0, (size_t)need);
-    storage_write_head(kv->sbo_data + off, body_len, attr_len);
-    int32_t root = art_ins(kv, kv->hdr->art_root, (const uint8_t *)key,
-                           (int)strlen(key), 0, off);
-    if (root < 0) {
-        if (retiring)
-            garb_cancel(kv, gidx);
-        kv_sbo_free(kv, off);
-        return KVSPACE_BACKEND;
+    memset(kv->sbo_data + offset, 0, (size_t)need);
+    storage_write_head(kv->sbo_data + offset, body_len, attr_len);
+    uint64_t new_value = TRIE_VALUE_PACK(1, offset);
+    int status;
+    if (found == KVSPACE_OK)
+        status = trie_value_set(&kv->trie_env, node, new_value);
+    else
+        status = trie_write(&kv->trie_env, kv->hdr->trie_root, key, new_value,
+                            &node);
+    if (status != KVSPACE_OK) {
+        if (has_old)
+            garb_cancel(kv, garbage_index);
+        kv_sbo_free(kv, offset);
+        return status == KVSPACE_INVALID ? KVSPACE_INVALID : KVSPACE_BACKEND;
     }
-    kv->hdr->art_root = root;
-    {
-        int32_t nid = p2_node_at(kv, key);
-        kv_gens_t *g = gens_at(kv, nid);
-        if (g) {
-            gen_bump_struct(kv, nid);
-            gen_bump_value(kv, nid);
-        }
-    }
-    if (retiring)
-        garb_commit(kv, gidx, AV_OFF(ohv), old_cap);
+    if (has_old)
+        garb_commit(kv, garbage_index, TRIE_VALUE_OFFSET(old_value),
+                    old_capacity);
     else
         list_gen_bump(kv);
-    *out_offset = off;
+    *out_offset = offset;
     return KVSPACE_OK;
 }
 static int storage_is_index_key(const char *key) {
-    size_t n = strlen(key);
-    if (n == 0)
+    size_t length = strlen(key);
+    if (length == 0)
         return 0;
-    if (key[n - 1] == '/')
+    if (key[length - 1] == '/')
         return 1;
-    return n >= 2 && (unsigned char)key[n - 2] == 0xC2 &&
-           (unsigned char)key[n - 1] == 0xB7;
+    return length >= 2 && (unsigned char)key[length - 2] == 0xC2 &&
+           (unsigned char)key[length - 1] == 0xB7;
 }
 static int storage_has_children(kvspace_t *kv, const char *key) {
-    keyscan_t children = {0};
-    char buf[4096];
-    int rc = 0;
-    if (kv->hdr->art_root < 0)
+    uint64_t node = 0;
+    int status = node_at(kv, key, &node);
+    if (status == KVSPACE_MISSING)
         return KVSPACE_OK;
-    if (art_scan_pfx(kv, key, (int)strlen(key), buf, (int)sizeof buf,
-                     &children) != 0) {
-        keyscan_free(&children);
+    if (status != KVSPACE_OK)
         return KVSPACE_BACKEND;
-    }
-    if (children.count > 0)
-        rc = KVSPACE_HAS_CHILDREN;
-    keyscan_free(&children);
-    return rc;
+    uint32_t count = 0;
+    if (trie_child_count(&kv->trie_env, node, &count) != KVSPACE_OK)
+        return KVSPACE_BACKEND;
+    return count > 0 ? KVSPACE_HAS_CHILDREN : KVSPACE_OK;
 }
 static int free_key(kvspace_t *kv, const char *key) {
     if (!kv || !key)
         return KVSPACE_INVALID;
-    if (reserved_meta_path(key) || strlen(key) >= 1024)
+    if (reserved_meta_path(key) || strlen(key) >= TRIE_KEY_LIMIT)
         return KVSPACE_INVALID;
     if (kv_sync(kv) != 0)
         return KVSPACE_BACKEND;
     if (storage_is_index_key(key)) {
-        char *d = edir(key);
-        int child_rc = storage_has_children(kv, d);
-        free(d);
-        if (child_rc != KVSPACE_OK)
-            return child_rc;
+        int child_status = storage_has_children(kv, key);
+        if (child_status != KVSPACE_OK)
+            return child_status;
     }
-    int rc = shm_del_key(kv, key);
-    if (rc < 0)
+    int status = shm_del_key(kv, key);
+    if (status == KVSPACE_HAS_CHILDREN)
+        return KVSPACE_HAS_CHILDREN;
+    if (status < 0)
         return KVSPACE_BACKEND;
-    if (rc == 0)
+    if (status == 0)
         return KVSPACE_MISSING;
     list_gen_bump(kv);
     return KVSPACE_OK;
@@ -3081,103 +2120,74 @@ static int free_key(kvspace_t *kv, const char *key) {
 static int makeindex_key(kvspace_t *kv, const char *key) {
     if (!kv || !key)
         return KVSPACE_INVALID;
-    if (reserved_meta_path(key) || strlen(key) >= 1024 ||
+    if (reserved_meta_path(key) || strlen(key) >= TRIE_KEY_LIMIT ||
         strstr(key, "//"))
         return KVSPACE_INVALID;
     if (!storage_is_index_key(key))
         return KVSPACE_INVALID;
-    uint64_t off = 0;
-    int rc = resolve_root(kv, key, &off);
-    if (rc == KVSPACE_OK)
+    uint64_t offset = 0;
+    int status = resolve_root(kv, key, &offset);
+    if (status == KVSPACE_OK)
         return KVSPACE_OK;
-    if (rc != KVSPACE_MISSING)
-        return rc;
-    rc = realloc_key(kv, key, 0, 0, &off);
-    return rc;
-}
-static int storage_key_exists(kvspace_t *kv, const char *key) {
-    if (!kv || !key)
-        return 0;
-    art_hdr_t *h = art_search(kv, kv->hdr->art_root, (const uint8_t *)key,
-                              (int)strlen(key));
-    if (h && AV_HAS(art_val_load(h)))
-        return 1;
-    if (storage_is_index_key(key)) {
-        keyscan_t children = {0};
-        char buf[4096];
-        int rc = 0;
-        if (kv->hdr->art_root >= 0)
-            rc = art_scan_pfx(kv, key, (int)strlen(key), buf, (int)sizeof buf,
-                              &children);
-        int has = rc == 0 && children.count > 0;
-        keyscan_free(&children);
-        return has;
-    }
-    size_t n = strlen(key);
-    char dir[1024];
-    if (n == 0 || n + 2 > sizeof dir)
-        return 0;
-    memcpy(dir, key, n);
-    dir[n] = '/';
-    dir[n + 1] = 0;
-    h = art_search(kv, kv->hdr->art_root, (const uint8_t *)dir, (int)strlen(dir));
-    return h && AV_HAS(art_val_load(h));
+    if (status != KVSPACE_MISSING)
+        return status;
+    return realloc_key(kv, key, 0, 0, &offset);
 }
 static int storage_index_state(kvspace_t *kv, const char *key) {
+    uint64_t node = 0;
+    int status = node_at(kv, key, &node);
     if (!storage_is_index_key(key))
-        return storage_key_exists(kv, key) ? KVSPACE_NOT_INDEX : KVSPACE_MISSING;
-    if (!storage_key_exists(kv, key))
+        return status == KVSPACE_OK ? KVSPACE_NOT_INDEX : KVSPACE_MISSING;
+    if (status != KVSPACE_OK)
         return KVSPACE_MISSING;
     return KVSPACE_OK;
 }
 static int storage_children(kvspace_t *kv, const char *key, keyscan_t *out) {
-    char buf[4096];
-    if (kv->hdr->art_root >= 0 &&
-        art_scan_pfx(kv, key, (int)strlen(key), buf, (int)sizeof buf, out) != 0) {
-        keyscan_free(out);
-        return KVSPACE_BACKEND;
-    }
-    if (out->count == 0 && !storage_key_exists(kv, key))
+    uint64_t node = 0;
+    int status = node_at(kv, key, &node);
+    if (status == KVSPACE_MISSING)
         return KVSPACE_MISSING;
-    return KVSPACE_OK;
-}
-static int storage_list_prefix(const char *key, char *out, size_t cap) {
-    size_t n = strlen(key);
-    if (n == 0 || n >= cap)
-        return KVSPACE_INVALID;
-    memcpy(out, key, n + 1);
+    if (status != KVSPACE_OK)
+        return KVSPACE_BACKEND;
+    uint32_t count = 0;
+    if (trie_child_count(&kv->trie_env, node, &count) != KVSPACE_OK)
+        return KVSPACE_BACKEND;
+    for (uint32_t index = 0; index < count; index++) {
+        const uint8_t *name = NULL;
+        uint16_t name_length = 0;
+        uint64_t child = 0;
+        if (trie_child_at(&kv->trie_env, node, index, &name, &name_length,
+                          &child) != KVSPACE_OK)
+            return KVSPACE_BACKEND;
+        if (keyscan_add_n(out, (const char *)name, name_length) != 0)
+            return KVSPACE_BACKEND;
+    }
     return KVSPACE_OK;
 }
 static int listlen_key(kvspace_t *kv, const char *key, int64_t *out_count,
-                             uint32_t *out_max_name_length) {
+                       uint32_t *out_max_name_length) {
     if (!kv || !key || !out_count || !out_max_name_length)
         return KVSPACE_INVALID;
     *out_count = 0;
     *out_max_name_length = 0;
-    if (reserved_meta_path(key) || strlen(key) >= 1024)
+    if (reserved_meta_path(key) || strlen(key) >= TRIE_KEY_LIMIT)
         return KVSPACE_INVALID;
     if (kv_sync(kv) != 0)
         return KVSPACE_BACKEND;
-    int rc = storage_index_state(kv, key);
-    if (rc != KVSPACE_OK)
-        return rc;
-    char pfx[1024];
-    rc = storage_list_prefix(key, pfx, sizeof pfx);
-    if (rc != KVSPACE_OK)
-        return rc;
-    keyscan_t children = {0};
-    rc = storage_children(kv, pfx, &children);
-    if (rc != KVSPACE_OK)
-        return rc;
-    uint32_t max_len = 0;
-    for (int32_t i = 0; i < children.count; i++) {
-        size_t n = strlen(children.keys[i]);
-        if (n > max_len)
-            max_len = (uint32_t)n;
-    }
-    *out_count = children.count;
-    *out_max_name_length = max_len;
-    keyscan_free(&children);
+    int status = storage_index_state(kv, key);
+    if (status != KVSPACE_OK)
+        return status;
+    uint64_t node = 0;
+    if (node_at(kv, key, &node) != KVSPACE_OK)
+        return KVSPACE_BACKEND;
+    uint32_t count = 0;
+    if (trie_child_count(&kv->trie_env, node, &count) != KVSPACE_OK)
+        return KVSPACE_BACKEND;
+    uint16_t longest = 0;
+    if (trie_longest_child_name(&kv->trie_env, node, &longest) != KVSPACE_OK)
+        return KVSPACE_BACKEND;
+    *out_count = count;
+    *out_max_name_length = longest;
     return KVSPACE_OK;
 }
 static int list_names_raw(kvspace_t *kv, const char *key, char *out_names,
@@ -3191,24 +2201,23 @@ static int list_names_raw(kvspace_t *kv, const char *key, char *out_names,
         *out_count = 0;
     if (out_generation)
         *out_generation = 0;
-    if (reserved_meta_path(key) || strlen(key) >= 1024)
+    if (reserved_meta_path(key) || strlen(key) >= TRIE_KEY_LIMIT)
         return KVSPACE_INVALID;
     if (kv_sync(kv) != 0)
         return KVSPACE_BACKEND;
-    int rc = storage_index_state(kv, key);
-    if (rc != KVSPACE_OK)
-        return rc;
-    char pfx[1024];
-    rc = storage_list_prefix(key, pfx, sizeof pfx);
-    if (rc != KVSPACE_OK)
-        return rc;
-    keyscan_t children = {0};
-    rc = storage_children(kv, pfx, &children);
-    if (rc != KVSPACE_OK)
-        return rc;
+    int status = storage_index_state(kv, key);
+    if (status != KVSPACE_OK)
+        return status;
+    keyscan_t children;
+    memset(&children, 0, sizeof children);
+    status = storage_children(kv, key, &children);
+    if (status != KVSPACE_OK) {
+        keyscan_free(&children);
+        return status;
+    }
     uint64_t total = 0;
-    for (int32_t i = 0; i < children.count; i++)
-        total += (uint64_t)strlen(children.keys[i]) + 1;
+    for (int32_t index = 0; index < children.count; index++)
+        total += (uint64_t)strlen(children.keys[index]) + 1;
     if (out_generation)
         *out_generation = __atomic_load_n(&kv->hdr->list_gen, __ATOMIC_ACQUIRE);
     if (out_count)
@@ -3220,11 +2229,11 @@ static int list_names_raw(kvspace_t *kv, const char *key, char *out_names,
             keyscan_free(&children);
             return KVSPACE_CAPACITY;
         }
-        char *p = out_names;
-        for (int32_t i = 0; i < children.count; i++) {
-            size_t n = strlen(children.keys[i]) + 1;
-            memcpy(p, children.keys[i], n);
-            p += n;
+        char *cursor = out_names;
+        for (int32_t index = 0; index < children.count; index++) {
+            size_t name_length = strlen(children.keys[index]) + 1;
+            memcpy(cursor, children.keys[index], name_length);
+            cursor += name_length;
         }
     }
     keyscan_free(&children);
@@ -3285,17 +2294,12 @@ KVSPACE_PUBLIC int kvspaceResolveOffset(void *handle, const char *key,
         return KVSPACE_INVALID;
     *out_value_offset = 0;
     int internal;
-    if (parent_key_anchor == KVSPACE_ANCHOR_ROOT) {
-        internal = resolve_root((kvspace_t *)handle, key,
-                                            out_value_offset);
+    if (parent_key_anchor == (int64_t)KVSPACE_ANCHOR_ROOT) {
+        internal = resolve_root((kvspace_t *)handle, key, out_value_offset);
     } else {
-        kvspaceAnchor_t anchor;
-        if (anchor_from_offset((kvspace_t *)handle, parent_key_anchor,
-                               &anchor) != 0)
-            return kvspace_fail(KVSPACE_ANCHOR_INVALID, err, err_cap,
-                                "resolve", key);
         internal = resolve_anchor((kvspace_t *)handle, key,
-                                                anchor, out_value_offset);
+                                  (uint64_t)parent_key_anchor,
+                                  out_value_offset);
     }
     if (internal == KVSPACE_OK)
         return KVSPACE_OK;
