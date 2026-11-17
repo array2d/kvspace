@@ -35,17 +35,15 @@ int main(void) {
     }
     const char *directory_suffix = kvspaceConstStorage("KVSPACE_DIR_INDEX_SUF");
     const char *separator = kvspaceConstStorage("KVSPACE_MEMBER_SEP");
-    const char *error = kvspaceConstStorage(
-        "KVSPACE_ERR_INDEX_MUST_END_WITH_SEPARATOR");
     if (directory_suffix == NULL || strcmp(directory_suffix, "/") != 0 ||
-        separator == NULL || strcmp(separator, "·") != 0 ||
-        error == NULL || strcmp(error, "kvspace: index must end with /·") != 0) {
+        separator == NULL || strcmp(separator, "·") != 0) {
         fprintf(stderr, "FAIL export_surface: const values changed\n");
         return 1;
     }
     if (kvspaceConstStorage("KVSPACE_PATH_SEP") != NULL ||
         kvspaceConstStorage("KVSPACE_RUNTIME_MEMBER_SEP") != NULL ||
-        kvspaceConstStorage("KVSPACE_ERR_DIR_MUST_END_WITH_SLASH") != NULL) {
+        kvspaceConstStorage("KVSPACE_ERR_INDEX_MUST_END_WITH_SEPARATOR") != NULL ||
+        kvspaceConstStorage("KVSPACE_ERR_INVALID_PATH") != NULL) {
         fprintf(stderr, "FAIL export_surface: removed const still present\n");
         return 1;
     }

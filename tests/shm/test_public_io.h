@@ -29,8 +29,7 @@ static int t_set_wire(void *kv, const char *key, const uint8_t *wire,
     uint64_t body = kvspaceXvalueHeadLen(head);
     uint64_t attrs = kvspaceXvalueHeadAttrsLen(head);
     uint64_t off = 0;
-    char err[128] = {0};
-    if (kvspaceRealloc(kv, key, body, attrs, &off, err, sizeof err) != 0)
+    if (kvspaceRealloc(kv, key, body, attrs, &off) != 0)
         return -1;
     uint8_t *base = kvspaceXvalueInProcessAddress(kv);
     if (!base)
@@ -45,9 +44,7 @@ static int t_set_wire(void *kv, const char *key, const uint8_t *wire,
 static uint8_t *t_get_wire_depth(void *kv, const char *key, int resolve,
                                  int32_t *out_len, int depth) {
     uint64_t off = 0;
-    char err[128] = {0};
-    if (kvspaceResolveOffset(kv, key, NULL, &off, err,
-                             sizeof err) != 0)
+    if (kvspaceResolveOffset(kv, key, NULL, &off) != 0)
         return NULL;
     uint8_t *base = kvspaceXvalueInProcessAddress(kv);
     if (!base)
@@ -80,30 +77,23 @@ static uint8_t *t_get_wire(void *kv, const char *key, int resolve,
     return t_get_wire_depth(kv, key, resolve, out_len, 0);
 }
 static int t_del(void *kv, const char *key) {
-    char err[128] = {0};
-    return kvspaceFree(kv, key, err, sizeof err) == KVSPACE_OK ? 0 : -1;
+    return kvspaceFree(kv, key) == KVSPACE_OK ? 0 : -1;
 }
 static int t_deltree(void *kv, const char *key) {
-    char err[128] = {0};
-    return kvspaceDeltree(kv, key, err, sizeof err) == KVSPACE_OK ? 0 : -1;
+    return kvspaceDeltree(kv, key) == KVSPACE_OK ? 0 : -1;
 }
 static int t_cp(void *kv, const char *src, const char *dst) {
-    char err[128] = {0};
-    return kvspaceCp(kv, src, dst, err, sizeof err) == KVSPACE_OK ? 0 : -1;
+    return kvspaceCp(kv, src, dst) == KVSPACE_OK ? 0 : -1;
 }
 static int t_cptree(void *kv, const char *src, const char *dst) {
-    char err[128] = {0};
-    return kvspaceCpdir(kv, src, dst, err, sizeof err) == KVSPACE_OK ? 0 : -1;
+    return kvspaceCpdir(kv, src, dst) == KVSPACE_OK ? 0 : -1;
 }
 static int t_mkindex(void *kv, const char *key) {
-    char err[128] = {0};
-    return kvspaceMkindex(kv, key, err, sizeof err) == KVSPACE_OK ? 0 : -1;
+    return kvspaceMkindex(kv, key) == KVSPACE_OK ? 0 : -1;
 }
 static int t_realloc(void *kv, const char *key, uint64_t body_len,
                      uint64_t attr_len, uint64_t *out_offset) {
-    char err[128] = {0};
-    return kvspaceRealloc(kv, key, body_len, attr_len, out_offset, err,
-                          sizeof err) == KVSPACE_OK ? 0 : -1;
+    return kvspaceRealloc(kv, key, body_len, attr_len, out_offset) == KVSPACE_OK ? 0 : -1;
 }
 static uint8_t *t_data_base(void *kv) {
     return kvspaceXvalueInProcessAddress(kv);
@@ -114,9 +104,7 @@ static int t_list(void *kv, const char *prefix, bool expand_ext, int resolve,
     (void)resolve;
     uint32_t length = 0, count = 0;
     uint64_t generation = 0;
-    char err[128] = {0};
-    int status = kvspaceList(kv, prefix, NULL, 0, &length, &count, &generation,
-                             err, sizeof err);
+    int status = kvspaceList(kv, prefix, NULL, 0, &length, &count, &generation);
     if (status == KVSPACE_MISSING || status == KVSPACE_NOT_INDEX) {
         *out_names = NULL;
         *out_count = 0;
@@ -127,8 +115,7 @@ static int t_list(void *kv, const char *prefix, bool expand_ext, int resolve,
     char *buffer = malloc(length ? length : 1);
     if (!buffer)
         return -1;
-    if (kvspaceList(kv, prefix, buffer, length, &length, &count, &generation,
-                    err, sizeof err) != KVSPACE_OK) {
+    if (kvspaceList(kv, prefix, buffer, length, &length, &count, &generation) != KVSPACE_OK) {
         free(buffer);
         return -1;
     }

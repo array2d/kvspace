@@ -42,8 +42,7 @@ static int install_scalar(void *kv, const char *key, const uint8_t *raw,
     free(wire);
     if (rc != 0)
         return -1;
-    char err[128] = {0};
-    return kvspaceResolveOffset(kv, key, NULL, out_offset, err, sizeof err) ==
+    return kvspaceResolveOffset(kv, key, NULL, out_offset) ==
                    KVSPACE_OK
                ? 0
                : -1;
@@ -192,7 +191,7 @@ int main(void) {
                                    (int32_t)wire40_len) == 0,
               "40-byte write failed");
         free(wire40);
-        CHECK(kvspaceResolveOffset(kv, "/cap/grow", NULL, &at40, NULL, 0) ==
+        CHECK(kvspaceResolveOffset(kv, "/cap/grow", NULL, &at40) ==
                       KVSPACE_OK &&
                   at40 == uint64_offset,
               "40-byte write must stay at capacity boundary offset %llu",
@@ -209,12 +208,12 @@ int main(void) {
                                    (int32_t)wire41_len) == 0,
               "41-byte write failed");
         free(wire41);
-        CHECK(kvspaceResolveOffset(kv, "/cap/grow", NULL, &at41, NULL, 0) ==
+        CHECK(kvspaceResolveOffset(kv, "/cap/grow", NULL, &at41) ==
                       KVSPACE_OK &&
                   at41 != at40,
               "41-byte write must move past 40-byte capacity");
         uint64_t resolved = 0;
-        CHECK(kvspaceResolveOffset(kv, "/cap/grow", NULL, &resolved, NULL, 0) ==
+        CHECK(kvspaceResolveOffset(kv, "/cap/grow", NULL, &resolved) ==
                   KVSPACE_OK,
               "resolve /cap/grow failed");
         head = (const kvspaceXvalueHead *)(const void *)(base + resolved);

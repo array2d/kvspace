@@ -34,7 +34,6 @@ static int gate_read(int fd, char *value) {
 static int child_main(const char *dsn, void *inherited,
                       const kvspace_anchor_t *anchor, uint64_t parent_offset,
                       const uint8_t *expected, int up_fd, int down_fd) {
-    char err[256] = {0};
     char gate = 0;
     int failures = 0;
     uint64_t offset = 0;
@@ -49,10 +48,10 @@ static int child_main(const char *dsn, void *inherited,
         fprintf(stderr, "child: in-process address is NULL\n");
         return 1;
     }
-    int rc = kvspaceResolveOffset(h, "c", anchor, &offset, err, sizeof err);
+    int rc = kvspaceResolveOffset(h, "c", anchor, &offset);
     if (rc != KVSPACE_OK) {
-        fprintf(stderr, "child: resolve c via inherited anchor rc=%d err=%s\n",
-                rc, err);
+        fprintf(stderr,"child: resolve c via inherited anchor rc=%d\n",
+                rc);
         ++failures;
     } else if (offset != parent_offset) {
         fprintf(stderr,
@@ -68,7 +67,7 @@ static int child_main(const char *dsn, void *inherited,
     }
     kvspace_anchor_t bad = *anchor;
     bad.node_offset = 16;
-    rc = kvspaceResolveOffset(h, "c", &bad, &offset, err, sizeof err);
+    rc = kvspaceResolveOffset(h, "c", &bad, &offset);
     if (rc != KVSPACE_ANCHOR_INVALID) {
         fprintf(stderr, "child: misaligned anchor rc=%d, expected %d\n", rc,
                 KVSPACE_ANCHOR_INVALID);
@@ -76,13 +75,13 @@ static int child_main(const char *dsn, void *inherited,
     }
     bad = *anchor;
     bad.flags = 0;
-    rc = kvspaceResolveOffset(h, "c", &bad, &offset, err, sizeof err);
+    rc = kvspaceResolveOffset(h, "c", &bad, &offset);
     if (rc != KVSPACE_ANCHOR_INVALID) {
         fprintf(stderr, "child: anchor without INDEX flag rc=%d, expected %d\n",
                 rc, KVSPACE_ANCHOR_INVALID);
         ++failures;
     }
-    rc = kvspaceResolveOffset(h, "/p/c", anchor, &offset, err, sizeof err);
+    rc = kvspaceResolveOffset(h, "/p/c", anchor, &offset);
     if (rc != KVSPACE_INVALID) {
         fprintf(stderr, "child: absolute suffix rc=%d, expected %d\n", rc,
                 KVSPACE_INVALID);
@@ -93,11 +92,10 @@ static int child_main(const char *dsn, void *inherited,
         fprintf(stderr, "child: stage 2 gate failed\n");
         return 1;
     }
-    rc = kvspaceResolveOffset(h, "c", anchor, &offset, err, sizeof err);
+    rc = kvspaceResolveOffset(h, "c", anchor, &offset);
     if (rc != KVSPACE_OK || offset != parent_offset) {
-        fprintf(stderr,
-                "child: resolve after unrelated insert rc=%d offset=%llu err=%s\n",
-                rc, (unsigned long long)offset, err);
+        fprintf(stderr,"child: resolve after unrelated insert rc=%d offset=%llu\n",
+                rc, (unsigned long long)offset);
         ++failures;
     } else if (memcmp(base + offset + KVSPACE_XVALUE_HEAD_LEN, expected, 8) !=
                0) {
@@ -109,7 +107,7 @@ static int child_main(const char *dsn, void *inherited,
         fprintf(stderr, "child: stage 3 gate failed\n");
         return 1;
     }
-    rc = kvspaceResolveOffset(h, "c", anchor, &offset, err, sizeof err);
+    rc = kvspaceResolveOffset(h, "c", anchor, &offset);
     if (rc != KVSPACE_MISSING) {
         fprintf(stderr, "child: resolve freed child rc=%d, expected %d\n", rc,
                 KVSPACE_MISSING);
@@ -126,7 +124,6 @@ static int child_resolve_relative(const char *dsn, void *inherited,
                                   const kvspace_anchor_t *anchor,
                                   const char *suffix, uint64_t expected_offset,
                                   const uint8_t *expected, uint32_t expected_len) {
-    char err[256] = {0};
     int failures = 0;
     uint64_t offset = 0;
     kvspaceClose(inherited);
@@ -141,9 +138,9 @@ static int child_resolve_relative(const char *dsn, void *inherited,
         kvspaceClose(h);
         return 1;
     }
-    int rc = kvspaceResolveOffset(h, suffix, anchor, &offset, err, sizeof err);
+    int rc = kvspaceResolveOffset(h, suffix, anchor, &offset);
     if (rc != KVSPACE_OK) {
-        fprintf(stderr, "child: resolve \"%s\" rc=%d err=%s\n", suffix, rc, err);
+        fprintf(stderr,"child: resolve \"%s\" rc=%d\n", suffix, rc);
         ++failures;
     } else if (offset != expected_offset) {
         fprintf(stderr,
@@ -261,26 +258,21 @@ int main(void) {
         fprintf(stderr, "FAIL: connect %s\n", dsn);
         return 1;
     }
-    char err[256] = {0};
-    CHECK(kvspaceMkindex(h, "/p/", err, sizeof err) == KVSPACE_OK,
-          "mkindex /p/ err=%s", err);
+    CHECK(kvspaceMkindex(h, "/p/") == KVSPACE_OK,"mkindex /p/");
     uint64_t parent_offset = 0;
-    CHECK(kvspaceRealloc(h, "/p/c", 8, 0, &parent_offset, err, sizeof err) ==
-              KVSPACE_OK,
-          "realloc /p/c err=%s", err);
+    CHECK(kvspaceRealloc(h, "/p/c", 8, 0, &parent_offset) ==
+              KVSPACE_OK,"realloc /p/c");
     uint8_t expected[8] = {1, 2, 3, 4, 5, 6, 7, 8};
     uint8_t *base = kvspaceXvalueInProcessAddress(h);
     CHECK(base != NULL, "in-process address is NULL");
     if (base)
         memcpy(base + parent_offset + KVSPACE_XVALUE_HEAD_LEN, expected, 8);
     kvspace_anchor_t anchor = {0};
-    CHECK(kvspaceAnchorOf(h, "/p/", &anchor, err, sizeof err) == KVSPACE_OK,
-          "anchor_of /p/ err=%s", err);
+    CHECK(kvspaceAnchorOf(h, "/p/", &anchor) == KVSPACE_OK,"anchor_of /p/");
     uint64_t resolved = 0;
-    CHECK(kvspaceResolveOffset(h, "c", &anchor, &resolved, err, sizeof err) ==
+    CHECK(kvspaceResolveOffset(h, "c", &anchor, &resolved) ==
                   KVSPACE_OK &&
-              resolved == parent_offset,
-          "parent relative resolve differs err=%s", err);
+              resolved == parent_offset,"parent relative resolve differs");
     int up[2], down[2];
     CHECK(pipe(up) == 0 && pipe(down) == 0, "pipe failed");
     pid_t pid = fork();
@@ -301,20 +293,17 @@ int main(void) {
     CHECK(gate_read(up[0], &gate) == 0 && gate == 1,
           "child stage 1 failed (gate %d)", (int)gate);
     uint64_t other_offset = 0;
-    CHECK(kvspaceRealloc(h, "/other/x", 4, 0, &other_offset, err, sizeof err) ==
-              KVSPACE_OK,
-          "realloc /other/x err=%s", err);
+    CHECK(kvspaceRealloc(h, "/other/x", 4, 0, &other_offset) ==
+              KVSPACE_OK,"realloc /other/x");
     kvspace_anchor_t after = {0};
-    CHECK(kvspaceAnchorOf(h, "/p/", &after, err, sizeof err) == KVSPACE_OK,
-          "anchor_of /p/ after insert err=%s", err);
+    CHECK(kvspaceAnchorOf(h, "/p/", &after) == KVSPACE_OK,"anchor_of /p/ after insert");
     CHECK(after.epoch != anchor.epoch,
           "gen_epoch 应变化：before=%llu after=%llu",
           (unsigned long long)anchor.epoch, (unsigned long long)after.epoch);
     CHECK(gate_write(down[1], '2') == 0, "write gate 2 failed");
     CHECK(gate_read(up[0], &gate) == 0 && gate == 1,
           "child stage 2 failed (gate %d)", (int)gate);
-    CHECK(kvspaceFree(h, "/p/c", err, sizeof err) == KVSPACE_OK,
-          "free /p/c err=%s", err);
+    CHECK(kvspaceFree(h, "/p/c") == KVSPACE_OK,"free /p/c");
     CHECK(gate_write(down[1], '3') == 0, "write gate 3 failed");
     CHECK(gate_read(up[0], &gate) == 0 && gate == 1,
           "child stage 3 failed (gate %d)", (int)gate);
@@ -328,21 +317,15 @@ int main(void) {
     {
         uint8_t y[4] = {0x11, 0x22, 0x33, 0x44};
         uint64_t y_offset = 0;
-        CHECK(kvspaceMkindex(h, "/ms/", err, sizeof err) == KVSPACE_OK,
-              "mkindex /ms/ err=%s", err);
-        CHECK(kvspaceRealloc(h, "/ms/sub/y", sizeof y, 0, &y_offset, err,
-                             sizeof err) == KVSPACE_OK,
-              "realloc /ms/sub/y err=%s", err);
+        CHECK(kvspaceMkindex(h, "/ms/") == KVSPACE_OK,"mkindex /ms/");
+        CHECK(kvspaceRealloc(h, "/ms/sub/y", sizeof y, 0, &y_offset) == KVSPACE_OK,"realloc /ms/sub/y");
         if (base)
             memcpy(base + y_offset + KVSPACE_XVALUE_HEAD_LEN, y, sizeof y);
         uint64_t absolute = 0;
-        CHECK(kvspaceResolveOffset(h, "/ms/sub/y", NULL, &absolute, err,
-                                   sizeof err) == KVSPACE_OK &&
-                  absolute == y_offset,
-              "parent absolute /ms/sub/y err=%s", err);
+        CHECK(kvspaceResolveOffset(h, "/ms/sub/y", NULL, &absolute) == KVSPACE_OK &&
+                  absolute == y_offset,"parent absolute /ms/sub/y");
         kvspace_anchor_t anchor = {0};
-        CHECK(kvspaceAnchorOf(h, "/ms/", &anchor, err, sizeof err) == KVSPACE_OK,
-              "anchor_of /ms/ err=%s", err);
+        CHECK(kvspaceAnchorOf(h, "/ms/", &anchor) == KVSPACE_OK,"anchor_of /ms/");
         CHECK(run_child_relative(dsn, h, &anchor, "sub/y", y_offset, y,
                                  sizeof y) == 0,
               "multi-segment relative suffix failed across process");
@@ -350,30 +333,24 @@ int main(void) {
     {
         uint8_t body[8] = {9, 8, 7, 6, 5, 4, 3, 2};
         uint64_t c_offset = 0;
-        CHECK(kvspaceMkindex(h, "/mv/", err, sizeof err) == KVSPACE_OK,
-              "mkindex /mv/ err=%s", err);
-        CHECK(kvspaceRealloc(h, "/mv/c", sizeof body, 0, &c_offset, err,
-                             sizeof err) == KVSPACE_OK,
-              "realloc /mv/c err=%s", err);
+        CHECK(kvspaceMkindex(h, "/mv/") == KVSPACE_OK,"mkindex /mv/");
+        CHECK(kvspaceRealloc(h, "/mv/c", sizeof body, 0, &c_offset) == KVSPACE_OK,"realloc /mv/c");
         if (base)
             memcpy(base + c_offset + KVSPACE_XVALUE_HEAD_LEN, body,
                    sizeof body);
         kvspace_anchor_t old_anchor = {0};
-        CHECK(kvspaceAnchorOf(h, "/mv/", &old_anchor, err, sizeof err) ==
-                  KVSPACE_OK,
-              "anchor_of /mv/ err=%s", err);
+        CHECK(kvspaceAnchorOf(h, "/mv/", &old_anchor) ==
+                  KVSPACE_OK,"anchor_of /mv/");
         static const char extra[] = "abdefghi";
         for (size_t i = 0; i < sizeof extra - 1; i++) {
             char key[32];
             uint64_t temporary = 0;
             snprintf(key, sizeof key, "/mv/%c", extra[i]);
-            CHECK(kvspaceRealloc(h, key, 1, 0, &temporary, err, sizeof err) ==
-                      KVSPACE_OK,
-                  "realloc %s err=%s", key, err);
+            CHECK(kvspaceRealloc(h, key, 1, 0, &temporary) ==
+                      KVSPACE_OK,"realloc %s", key);
         }
         kvspace_anchor_t moved = {0};
-        CHECK(kvspaceAnchorOf(h, "/mv/", &moved, err, sizeof err) == KVSPACE_OK,
-              "anchor_of /mv/ after growth err=%s", err);
+        CHECK(kvspaceAnchorOf(h, "/mv/", &moved) == KVSPACE_OK,"anchor_of /mv/ after growth");
         CHECK(moved.node_offset != old_anchor.node_offset,
               "anchor node did not move after growth (offset %llu)",
               (unsigned long long)old_anchor.node_offset);
@@ -387,17 +364,13 @@ int main(void) {
     {
         uint8_t dbody[2] = {0x5a, 0x5b};
         uint64_t x_offset = 0;
-        CHECK(kvspaceMkindex(h, "/m·", err, sizeof err) == KVSPACE_OK,
-              "mkindex /m· err=%s", err);
-        CHECK(kvspaceRealloc(h, "/m·x", sizeof dbody, 0, &x_offset, err,
-                             sizeof err) == KVSPACE_OK,
-              "realloc /m·x err=%s", err);
+        CHECK(kvspaceMkindex(h, "/m·") == KVSPACE_OK,"mkindex /m·");
+        CHECK(kvspaceRealloc(h, "/m·x", sizeof dbody, 0, &x_offset) == KVSPACE_OK,"realloc /m·x");
         if (base)
             memcpy(base + x_offset + KVSPACE_XVALUE_HEAD_LEN, dbody,
                    sizeof dbody);
         kvspace_anchor_t anchor = {0};
-        CHECK(kvspaceAnchorOf(h, "/m·", &anchor, err, sizeof err) == KVSPACE_OK,
-              "anchor_of /m· err=%s", err);
+        CHECK(kvspaceAnchorOf(h, "/m·", &anchor) == KVSPACE_OK,"anchor_of /m·");
         CHECK(run_child_relative(dsn, h, &anchor, "x", x_offset, dbody,
                                  sizeof dbody) == 0,
               "dot separator anchor relative resolve failed across process");
@@ -405,23 +378,18 @@ int main(void) {
     {
         uint8_t pbody[4] = {1, 2, 3, 4};
         uint64_t p_offset = 0;
-        CHECK(kvspaceMkindex(h, "/pc/", err, sizeof err) == KVSPACE_OK,
-              "mkindex /pc/ err=%s", err);
-        CHECK(kvspaceRealloc(h, "/pc/v", sizeof pbody, 0, &p_offset, err,
-                             sizeof err) == KVSPACE_OK,
-              "realloc /pc/v err=%s", err);
+        CHECK(kvspaceMkindex(h, "/pc/") == KVSPACE_OK,"mkindex /pc/");
+        CHECK(kvspaceRealloc(h, "/pc/v", sizeof pbody, 0, &p_offset) == KVSPACE_OK,"realloc /pc/v");
         if (base)
             memcpy(base + p_offset + KVSPACE_XVALUE_HEAD_LEN, pbody,
                    sizeof pbody);
         kvspace_anchor_t anchor = {0};
-        CHECK(kvspaceAnchorOf(h, "/pc/", &anchor, err, sizeof err) ==
-                  KVSPACE_OK,
-              "anchor_of /pc/ err=%s", err);
+        CHECK(kvspaceAnchorOf(h, "/pc/", &anchor) ==
+                  KVSPACE_OK,"anchor_of /pc/");
         CHECK(run_child_after_parent_close(dsn, &h, &anchor, "v", p_offset,
                                            pbody, sizeof pbody) == 0,
               "anchor after parent close failed across process");
     }
-    kvspaceClose(h);
     char cmd[600];
     snprintf(cmd, sizeof cmd, "rm -rf '%s'", dir);
     if (system(cmd) != 0)
