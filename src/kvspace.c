@@ -39,6 +39,14 @@ static int reserved_meta_path(const char *key) {
     return strncmp(key, root, sizeof root - 1) == 0 &&
            (key[sizeof root - 1] == 0 || key[sizeof root - 1] == '/');
 }
+static int key_text_valid(const char *key) {
+    if (!key)
+        return 0;
+    size_t length = strlen(key);
+    if (length == 0 || length >= 1024)
+        return 0;
+    return !reserved_meta_path(key) && strstr(key, "//") == NULL;
+}
 enum { ART_N4 = 0,
        ART_N16 = 1,
        ART_N48 = 2,
@@ -141,7 +149,7 @@ static int resolve_anchor(kvspace_t *kv, const char *key,
                           const kvspace_anchor_t *anchor,
                           uint64_t *out_offset);
 static int art_resume(kvspace_t *kv, int32_t node_id, const char *suffix,
-                      int suffix_len, uint64_t *out_offset);
+                      int suffix_len, uint64_t *out_offset, int follow_moved);
 static int realloc_key(kvspace_t *kv, const char *key, uint64_t body_len,
                              uint64_t attr_len, uint64_t *out_offset);
 static int free_key(kvspace_t *kv, const char *key);
@@ -2188,8 +2196,8 @@ static int anchor_offset_valid(kvspace_t *kv, uint64_t offset,
     return 1;
 }
 static int art_resume(kvspace_t *kv, int32_t node_id, const char *suffix,
-                      int suffix_len, uint64_t *out_offset) {
-    int32_t id = art_follow(kv, node_id);
+                      int suffix_len, uint64_t *out_offset, int follow_moved) {
+    int32_t id = follow_moved ? art_follow(kv, node_id) : node_id;
     if (id < 0)
         return KVSPACE_ANCHOR_INVALID;
     art_hdr_t *node = art_hdr(kv, id);
@@ -2220,7 +2228,7 @@ static int resolve_anchor(kvspace_t *kv, const char *key,
     *out_offset = 0;
     if (!anchor || anchor->node_offset == 0)
         return resolve_root(kv, key, out_offset);
-    if (reserved_meta_path(key))
+    if (reserved_meta_path(key) || strstr(key, "//"))
         return KVSPACE_INVALID;
     uint64_t suffix_len = (uint64_t)strlen(key);
     if (key[0] == '/' || (uint64_t)anchor->depth + suffix_len >= 1024)
@@ -2235,7 +2243,8 @@ static int resolve_anchor(kvspace_t *kv, const char *key,
     for (int attempt = 0; attempt < 3; attempt++) {
         uint64_t before =
             __atomic_load_n(&kv->hdr->gen_epoch, __ATOMIC_ACQUIRE);
-        int status = art_resume(kv, node_id, key, (int)suffix_len, out_offset);
+        int status = art_resume(kv, node_id, key, (int)suffix_len, out_offset,
+                                anchor->epoch != before);
         uint64_t after =
             __atomic_load_n(&kv->hdr->gen_epoch, __ATOMIC_ACQUIRE);
         if (before == after)
@@ -2252,7 +2261,7 @@ static int resolve_root(kvspace_t *kv, const char *key,
     if (!kv || !key || !out_offset)
         return KVSPACE_INVALID;
     *out_offset = 0;
-    if (reserved_meta_path(key))
+    if (!key_text_valid(key))
         return KVSPACE_INVALID;
     if (kv_sync(kv) != 0)
         return KVSPACE_BACKEND;
@@ -2272,8 +2281,7 @@ static int realloc_key(kvspace_t *kv, const char *key,
     if (!kv || !key || !out_offset)
         return KVSPACE_INVALID;
     *out_offset = 0;
-    if (reserved_meta_path(key) || strstr(key, "//") ||
-        strlen(key) >= 1024)
+    if (!key_text_valid(key))
         return KVSPACE_INVALID;
     if (attr_len > UINT16_MAX)
         return KVSPACE_INVALID;
@@ -2367,7 +2375,7 @@ static int storage_has_children(kvspace_t *kv, const char *key) {
 static int free_key(kvspace_t *kv, const char *key) {
     if (!kv || !key)
         return KVSPACE_INVALID;
-    if (reserved_meta_path(key) || strlen(key) >= 1024)
+    if (!key_text_valid(key))
         return KVSPACE_INVALID;
     if (kv_sync(kv) != 0)
         return KVSPACE_BACKEND;
@@ -2389,8 +2397,7 @@ static int free_key(kvspace_t *kv, const char *key) {
 static int makeindex_key(kvspace_t *kv, const char *key) {
     if (!kv || !key)
         return KVSPACE_INVALID;
-    if (reserved_meta_path(key) || strlen(key) >= 1024 ||
-        strstr(key, "//"))
+    if (!key_text_valid(key))
         return KVSPACE_INVALID;
     if (!storage_is_index_key(key))
         return KVSPACE_INVALID;
@@ -2462,7 +2469,7 @@ static int listlen_key(kvspace_t *kv, const char *key, int64_t *out_count,
         return KVSPACE_INVALID;
     *out_count = 0;
     *out_max_name_length = 0;
-    if (reserved_meta_path(key) || strlen(key) >= 1024)
+    if (!key_text_valid(key))
         return KVSPACE_INVALID;
     if (kv_sync(kv) != 0)
         return KVSPACE_BACKEND;
@@ -2499,7 +2506,7 @@ static int list_names_raw(kvspace_t *kv, const char *key, char *out_names,
         *out_count = 0;
     if (out_generation)
         *out_generation = 0;
-    if (reserved_meta_path(key) || strlen(key) >= 1024)
+    if (!key_text_valid(key))
         return KVSPACE_INVALID;
     if (kv_sync(kv) != 0)
         return KVSPACE_BACKEND;
@@ -2598,8 +2605,7 @@ KVSPACE_PUBLIC int kvspaceAnchorOf(void *handle, const char *directory_key,
     if (!handle || !directory_key || !out_anchor)
         return KVSPACE_INVALID;
     size_t key_len = strlen(directory_key);
-    if (reserved_meta_path(directory_key) || strstr(directory_key, "//") ||
-        key_len == 0 || key_len >= 1024)
+    if (!key_text_valid(directory_key))
         return kvspace_fail(KVSPACE_INVALID, err, err_cap, "anchor",
                             directory_key);
     if (!storage_is_index_key(directory_key))
