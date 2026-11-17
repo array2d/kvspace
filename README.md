@@ -49,7 +49,7 @@ reallen）：**任何读写路径见到它都必须拒**——那是「写读双
 ## Build
 
 ```bash
-# 生产（16 个导出符号：12 存储 + 3 字节层 + 1 常量；内部 kvspaceShm* 隐藏）
+# 生产（17 个导出符号：13 存储 + 3 字节层 + 1 常量；内部 kvspaceShm* 隐藏）
 cmake -S . -B build -DBUILD_TESTING=OFF
 cmake --build build -j
 

@@ -7,6 +7,7 @@ static const void *const exported_symbols[] = {
     (const void *)&kvspaceConnect,
     (const void *)&kvspaceClose,
     (const void *)&kvspaceResolveOffset,
+    (const void *)&kvspaceAnchorOf,
     (const void *)&kvspaceRealloc,
     (const void *)&kvspaceFree,
     (const void *)&kvspaceCp,
@@ -21,7 +22,7 @@ static const void *const exported_symbols[] = {
     (const void *)&kvspaceXvalueHeadEffectiveLen,
     (const void *)&kvspaceConstStorage,
 };
-_Static_assert(sizeof(exported_symbols) / sizeof(exported_symbols[0]) == 16U,
+_Static_assert(sizeof(exported_symbols) / sizeof(exported_symbols[0]) == 17U,
                "export surface changed: update this table and README together");
 int main(void) {
     for (size_t at = 0; at < sizeof(exported_symbols) / sizeof(exported_symbols[0]);

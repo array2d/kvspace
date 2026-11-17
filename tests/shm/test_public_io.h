@@ -45,7 +45,7 @@ static uint8_t *t_get_wire_depth(void *kv, const char *key, int resolve,
                                  int32_t *out_len, int depth) {
     uint64_t off = 0;
     char err[128] = {0};
-    if (kvspaceResolveOffset(kv, key, KVSPACE_ANCHOR_ROOT, &off, err,
+    if (kvspaceResolveOffset(kv, key, NULL, &off, err,
                              sizeof err) != 0)
         return NULL;
     uint8_t *base = kvspaceXvalueInProcessAddress(kv);

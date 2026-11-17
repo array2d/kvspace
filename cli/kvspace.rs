@@ -24,6 +24,14 @@ use std::env;
 use std::os::raw::{c_char, c_int, c_void};
 use std::process::exit;
 
+#[repr(C)]
+struct KvspaceAnchor {
+    node_offset: u64,
+    epoch: u64,
+    depth: u32,
+    flags: u32,
+}
+
                                                                             
                                                                
                                                
@@ -53,7 +61,7 @@ extern "C" {
     fn kvspaceResolveOffset(
         h: *mut c_void,
         key: *const c_char,
-        parent_key_anchor: u64,
+        anchor: *const KvspaceAnchor,
         out_value_offset: *mut u64,
         err: *mut c_char,
         err_cap: u32,
@@ -188,7 +196,7 @@ fn resolve_view<'a>(kv: *mut c_void, key: &str) -> Option<&'a [u8]> {
         kvspaceResolveOffset(
             kv,
             cs(key),
-            0,
+            std::ptr::null(),
             &mut offset,
             err.as_mut_ptr() as *mut c_char,
             256,

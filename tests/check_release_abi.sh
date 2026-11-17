@@ -149,10 +149,10 @@ else
         done < <(printf '%s\n' "${actual_syms[@]}")
 
         if [ ${#missing_syms[@]} -eq 0 ] && [ ${#extra_syms[@]} -eq 0 ] &&
-           [ ${#actual_syms[@]} -eq 16 ]; then
-            ok "导出 T 符号恰好 16 个，与 test_export_surface.c 的表逐个同名"
+           [ ${#actual_syms[@]} -eq 17 ]; then
+            ok "导出 T 符号恰好 17 个，与 test_export_surface.c 的表逐个同名"
         else
-            bad "导出符号集合不符（实际 ${#actual_syms[@]} 个，期望 16）"
+            bad "导出符号集合不符（实际 ${#actual_syms[@]} 个，期望 17）"
             [ ${#missing_syms[@]} -gt 0 ] && say "      库里缺少（${#missing_syms[@]}）：${missing_syms[*]}"
             [ ${#extra_syms[@]} -gt 0 ]   && say "      库里多出（${#extra_syms[@]}）：${extra_syms[*]}"
             failures=$((failures + 1))

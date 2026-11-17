@@ -5,7 +5,13 @@
 #ifdef __cplusplus
 extern "C" {
 #endif
-#define KVSPACE_ANCHOR_ROOT UINT64_C(0)
+typedef struct kvspace_anchor {
+    uint64_t node_offset;
+    uint64_t epoch;
+    uint32_t depth;
+    uint32_t flags;
+} kvspace_anchor_t;
+#define KVSPACE_ANCHOR_FLAG_INDEX UINT32_C(1)
 enum {
     KVSPACE_OK = 0,
     KVSPACE_INVALID = -EINVAL,
@@ -19,8 +25,11 @@ enum {
 void *kvspaceConnect(const char *dsn);
 void kvspaceClose(void *h);
 uint8_t *kvspaceXvalueInProcessAddress(void *handle);
-int kvspaceResolveOffset(void *handle, const char *key, int64_t parent_key_anchor,
-                   uint64_t *out_value_offset, char *err, uint32_t err_cap);
+int kvspaceResolveOffset(void *handle, const char *key,
+                         const kvspace_anchor_t *anchor,
+                         uint64_t *out_value_offset, char *err, uint32_t err_cap);
+int kvspaceAnchorOf(void *handle, const char *directory_key,
+                    kvspace_anchor_t *out_anchor, char *err, uint32_t err_cap);
 int kvspaceRealloc(void *handle, const char *key, uint64_t body_length,
                    uint64_t attr_length, uint64_t *out_value_offset,
                    char *err, uint32_t err_cap);
