@@ -33,19 +33,19 @@ typedef struct {
     uint32_t quiesced;
     uint32_t claim_id;
 } recovery_slot_t;
-#define GARBAGE_CAPACITY (1u << 21)
-#define GARBAGE_THRESHOLD (64ull << 20)
+#define RETIREMENT_CAPACITY (1u << 21)
+#define RETIREMENT_THRESHOLD (64ull << 20)
 #define RECOVERY_BARRIER_MILLISECONDS_DEFAULT 200
-#define GARBAGE_MAX_CLAIM ((1u << 30) - 1u)
+#define RETIREMENT_MAX_CLAIM ((1u << 30) - 1u)
 typedef struct {
     uint64_t offset;
     uint32_t epoch;
     uint32_t meta;
-} garbage_entry_t;
-enum { GARBAGE_ENTRY_EMPTY = 0, GARBAGE_ENTRY_RESERVED = 1, GARBAGE_ENTRY_COMMITTED = 2 };
-#define GARBAGE_ENTRY_STATE(metadata) ((uint32_t)((metadata) & 3u))
-#define GARBAGE_ENTRY_CLAIM(metadata) ((uint32_t)((metadata) >> 2))
-#define GARBAGE_ENTRY_MAKE(state,claim_id) ((((uint32_t)(claim_id)) << 2) | (uint32_t)(state))
+} retirement_entry_t;
+enum { RETIREMENT_ENTRY_EMPTY = 0, RETIREMENT_ENTRY_RESERVED = 1, RETIREMENT_ENTRY_COMMITTED = 2 };
+#define RING_ENTRY_STATE(metadata) ((uint32_t)((metadata) & 3u))
+#define RING_ENTRY_CLAIM(metadata) ((uint32_t)((metadata) >> 2))
+#define RING_ENTRY_MAKE(state,claim_id) ((((uint32_t)(claim_id)) << 2) | (uint32_t)(state))
 typedef struct {
     char magic[sizeof(KVSPACE_MAGIC)];
     uint64_t adaptive_radix_tree_slab_size, slots_box_head_size, slots_box_data_size;
@@ -54,10 +54,10 @@ typedef struct {
     uint32_t recovery_epoch;
     uint32_t ack_sequence;
     uint32_t barrier_state;
-    uint64_t garbage_head, garbage_tail;
+    uint64_t retirement_head, retirement_tail;
     uint64_t committed_bytes;
     uint64_t freed_bytes;
-    uint64_t garbage_freeing;
+    uint64_t retirement_freeing;
     uint64_t list_generation;
     uint32_t claim_sequence;
     recovery_slot_t slots[RECOVERY_SLOT_COUNT];
@@ -83,8 +83,8 @@ typedef struct {
     size_t reserve;
 } shared_memory_region_t;
 struct kvspace {
-    shared_memory_region_t region_adaptive_radix_tree, region_header, region_data, region_generations, region_garbage;
-    garbage_entry_t *garbage;
+    shared_memory_region_t region_adaptive_radix_tree, region_header, region_data, region_generations, region_retirement;
+    retirement_entry_t *retirement;
     uint64_t generation_count;
     uint64_t adaptive_radix_tree_total_seen;
     kvspace_header_t *header;

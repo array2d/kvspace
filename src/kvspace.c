@@ -156,7 +156,7 @@ static int recovery_register_claim(kvspace_t *store) {
             continue;
         uint32_t claim_id = __atomic_add_fetch(&store->header->claim_sequence, 1u,
                                           __ATOMIC_ACQ_REL);
-        if (claim_id > GARBAGE_MAX_CLAIM) {
+        if (claim_id > RETIREMENT_MAX_CLAIM) {
             __atomic_store_n(&slot->state, RECOVERY_SLOT_FREE, __ATOMIC_RELEASE);
             return -3;
         }
@@ -243,21 +243,21 @@ static bool recovery_elect(kvspace_t *store) {
     uint32_t mine = recovery_my_claim(store);
     if (!mine)
         return false;
-    uint32_t own = GARBAGE_ENTRY_MAKE(RECOVERY_BARRIER_OWNED, mine);
+    uint32_t own = RING_ENTRY_MAKE(RECOVERY_BARRIER_OWNED, mine);
     for (;;) {
         uint32_t current = __atomic_load_n(&store->header->barrier_state, __ATOMIC_ACQUIRE);
-        if (current == GARBAGE_ENTRY_MAKE(RECOVERY_BARRIER_FREE, 0)) {
+        if (current == RING_ENTRY_MAKE(RECOVERY_BARRIER_FREE, 0)) {
             if (__atomic_compare_exchange_n(&store->header->barrier_state, &current, own,
                                             false, __ATOMIC_ACQ_REL,
                                             __ATOMIC_ACQUIRE))
                 return true;
             continue;
         }
-        if (GARBAGE_ENTRY_STATE(current) != RECOVERY_BARRIER_OWNED)
+        if (RING_ENTRY_STATE(current) != RECOVERY_BARRIER_OWNED)
             return false;
-        if (GARBAGE_ENTRY_CLAIM(current) == mine)
+        if (RING_ENTRY_CLAIM(current) == mine)
             return false;
-        if (recovery_claim_alive(store, GARBAGE_ENTRY_CLAIM(current)))
+        if (recovery_claim_alive(store, RING_ENTRY_CLAIM(current)))
             return false;
         if (__atomic_compare_exchange_n(&store->header->barrier_state, &current, own, false,
                                         __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE))
@@ -265,9 +265,9 @@ static bool recovery_elect(kvspace_t *store) {
     }
 }
 static void recovery_release_busy(kvspace_t *store) {
-    uint32_t mine = GARBAGE_ENTRY_MAKE(RECOVERY_BARRIER_OWNED, recovery_my_claim(store));
+    uint32_t mine = RING_ENTRY_MAKE(RECOVERY_BARRIER_OWNED, recovery_my_claim(store));
     __atomic_compare_exchange_n(&store->header->barrier_state, &mine,
-                                GARBAGE_ENTRY_MAKE(RECOVERY_BARRIER_FREE, 0), false,
+                                RING_ENTRY_MAKE(RECOVERY_BARRIER_FREE, 0), false,
                                 __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE);
 }
 static bool recovery_wait_acknowledgements(kvspace_t *store, uint32_t epoch, int deadline_milliseconds) {
@@ -332,7 +332,7 @@ static int recovery_round(kvspace_t *store) {
         recovery_release_busy(store);
         return -1;
     }
-    uint64_t pending = __atomic_exchange_n(&store->header->garbage_freeing, 0,
+    uint64_t pending = __atomic_exchange_n(&store->header->retirement_freeing, 0,
                                            __ATOMIC_ACQ_REL);
     if (pending) {
         fprintf(stderr, "kvspace: previous leader died freeing box %llu: "
@@ -344,7 +344,7 @@ static int recovery_round(kvspace_t *store) {
         recovery_release_busy(store);
         return -2;
     }
-    int freed = garbage_drain(store, epoch);
+    int freed = retirement_drain(store, epoch);
     for (int i = 0; i < RECOVERY_SLOT_COUNT; i++) {
         recovery_slot_t *slot = &store->header->slots[i];
         uint32_t state = RECOVERY_SLOT_MINE;
@@ -370,7 +370,7 @@ static void *recovery_maintenance(void *arg) {
             break;
         if (store->header->committed_bytes -
                 __atomic_load_n(&store->header->freed_bytes, __ATOMIC_ACQUIRE) <
-            garbage_threshold())
+            retirement_threshold())
             continue;
         recovery_round(store);
     }
@@ -452,22 +452,22 @@ static kvspace_t *open_shared_memory_store(const char *path, size_t data_size) {
         return NULL;
     }
     char head_path[PATH_MAX], data_path[PATH_MAX], generation_path[PATH_MAX],
-        garbage_path[PATH_MAX];
+        retirement_path[PATH_MAX];
     if (snprintf(head_path, sizeof head_path, "%s.sbo.head", path) >=
             (int)sizeof head_path ||
         snprintf(data_path, sizeof data_path, "%s.sbo.data", path) >=
             (int)sizeof data_path ||
         snprintf(generation_path, sizeof generation_path, "%s.gen", path) >=
             (int)sizeof generation_path ||
-        snprintf(garbage_path, sizeof garbage_path, "%s.garb", path) >=
-            (int)sizeof garbage_path)
+        snprintf(retirement_path, sizeof retirement_path, "%s.retirement", path) >=
+            (int)sizeof retirement_path)
         return NULL;
     kvspace_t *store = calloc(1, sizeof(*store));
     if (!store)
         return NULL;
     store->recovery_slot = -1;
     store->region_adaptive_radix_tree.file_descriptor = store->region_header.file_descriptor = store->region_data.file_descriptor = store->region_generations.file_descriptor =
-        store->region_garbage.file_descriptor = -1;
+        store->region_retirement.file_descriptor = -1;
     bool created = false;
     store->region_adaptive_radix_tree.file_descriptor = open(path, O_RDWR);
     if (store->region_adaptive_radix_tree.file_descriptor < 0) {
@@ -499,17 +499,17 @@ static kvspace_t *open_shared_memory_store(const char *path, size_t data_size) {
         (store->region_data.file_descriptor = open(data_path, open_flags, 0644)) < 0 ||
         region_attach(&store->region_data, created, data_size, DATA_RESERVE) != 0 ||
         (store->region_generations.file_descriptor = open(generation_path, open_flags, 0644)) < 0 ||
-        (store->region_garbage.file_descriptor = open(garbage_path, open_flags, 0644)) < 0 ||
-        region_attach(&store->region_garbage, created,
-                      (size_t)GARBAGE_CAPACITY * sizeof(garbage_entry_t),
-                      (size_t)GARBAGE_CAPACITY * sizeof(garbage_entry_t)) != 0)
+        (store->region_retirement.file_descriptor = open(retirement_path, open_flags, 0644)) < 0 ||
+        region_attach(&store->region_retirement, created,
+                      (size_t)RETIREMENT_CAPACITY * sizeof(retirement_entry_t),
+                      (size_t)RETIREMENT_CAPACITY * sizeof(retirement_entry_t)) != 0)
         goto fail;
     store->header = (kvspace_header_t *)store->region_adaptive_radix_tree.base;
     store->adaptive_radix_tree_meta = (blocks_meta_t *)(store->region_adaptive_radix_tree.base + sizeof(kvspace_header_t));
     store->adaptive_radix_tree_data = store->region_adaptive_radix_tree.base + ADAPTIVE_RADIX_TREE_OFFSET;
     store->slots_box_meta = (sbo_meta_t *)store->region_header.base;
     store->slots_box_data = store->region_data.base;
-    store->garbage = (garbage_entry_t *)store->region_garbage.base;
+    store->retirement = (retirement_entry_t *)store->region_retirement.base;
     if (created) {
         memset(store->header, 0, sizeof(*store->header));
         store->header->adaptive_radix_tree_slab_size = adaptive_radix_tree_slab;
@@ -542,7 +542,7 @@ static kvspace_t *open_shared_memory_store(const char *path, size_t data_size) {
     store->quiesced = 1;
     if (store->header->committed_bytes -
             __atomic_load_n(&store->header->freed_bytes, __ATOMIC_ACQUIRE) >=
-            garbage_threshold() &&
+            retirement_threshold() &&
         recovery_maintenance_start(store) != 0)
         goto fail;
     return store;
@@ -554,14 +554,14 @@ fail:
     region_close(&store->region_header);
     region_close(&store->region_data);
     region_close(&store->region_generations);
-    region_close(&store->region_garbage);
+    region_close(&store->region_retirement);
     free(store);
     if (created) {
         unlink(path);
         unlink(head_path);
         unlink(data_path);
         unlink(generation_path);
-        unlink(garbage_path);
+        unlink(retirement_path);
     }
     return NULL;
 }
@@ -587,7 +587,7 @@ static void close_shared_memory_store(kvspace_t *store) {
                          __ATOMIC_RELEASE);
         (void)recovery_round(store);
 #else
-        garbage_release_all(store);
+        retirement_release_all(store);
 #endif
     }
     recovery_maintenance_stop(store);
@@ -596,7 +596,7 @@ static void close_shared_memory_store(kvspace_t *store) {
     region_close(&store->region_header);
     region_close(&store->region_data);
     region_close(&store->region_generations);
-    region_close(&store->region_garbage);
+    region_close(&store->region_retirement);
     free(store);
 }
 static int shared_memory_delete_key(kvspace_t *store, const char *key) {
@@ -819,7 +819,7 @@ static int realloc_key(kvspace_t *store, const char *key,
                                  (int)strlen(key));
     uint64_t old_header_value = node ? adaptive_radix_tree_value_load(node) : 0;
     bool retiring = node && ADAPTIVE_RADIX_TREE_VALUE_HAS(old_header_value);
-    uint64_t garbage_index = 0;
+    uint64_t retirement_index = 0;
     uint64_t old_capacity = 0;
     if (retiring) {
         uint64_t offset = ADAPTIVE_RADIX_TREE_VALUE_OFFSET(old_header_value);
@@ -834,13 +834,13 @@ static int realloc_key(kvspace_t *store, const char *key,
             *out_offset = offset;
             return KVSPACE_OK;
         }
-        if (garbage_reserve(store, &garbage_index) != 0)
+        if (retirement_reserve(store, &retirement_index) != 0)
             return KVSPACE_BACKEND;
     }
     uint64_t offset = store_slots_box_alloc(store, (size_t)need);
     if (offset == (uint64_t)-1) {
         if (retiring)
-            garbage_cancel(store, garbage_index);
+            retirement_cancel(store, retirement_index);
         return KVSPACE_BACKEND;
     }
     memset(store->slots_box_data + offset, 0, (size_t)need);
@@ -849,7 +849,7 @@ static int realloc_key(kvspace_t *store, const char *key,
                            (int)strlen(key), 0, offset);
     if (root < 0) {
         if (retiring)
-            garbage_cancel(store, garbage_index);
+            retirement_cancel(store, retirement_index);
         store_slots_box_free(store, offset);
         return KVSPACE_BACKEND;
     }
@@ -863,7 +863,7 @@ static int realloc_key(kvspace_t *store, const char *key,
         }
     }
     if (retiring)
-        garbage_commit(store, garbage_index, ADAPTIVE_RADIX_TREE_VALUE_OFFSET(old_header_value), old_capacity);
+        retirement_commit(store, retirement_index, ADAPTIVE_RADIX_TREE_VALUE_OFFSET(old_header_value), old_capacity);
     else
         list_generation_bump(store);
     *out_offset = offset;
