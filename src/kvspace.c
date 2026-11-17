@@ -6,7 +6,7 @@
 #define SBO_MIN_SHARD_BYTES (1ULL << 40)
 #define SLOTSBOXMALLOC_IMPLEMENTATION 
 #include "slotsboxmalloc/slotsboxobj.h"
-#include "kvspace_shm.h"
+#include "kvspace_shared_memory.h"
 #include <kvspace/kvspace.h>
 #include <kvspace/kvspace_xvalue.h>
 #include <errno.h>
@@ -25,15 +25,15 @@
 #include <sys/stat.h>
 #include <time.h>
 #include <unistd.h>
-#define KVS_MAGIC "kvspace-c"
-#define ART_PREFIX_MAX 10
-#define ART_BLOCK_SZ 104
-#define ART_SLAB_INIT (64UL * 1024 * 1024)
-#define SBO_HEAD_POOL_INIT (4UL * 1024 * 1024)
-#define REGION_RESERVE (1ULL << 38)
-#define ART_RESERVE (1ULL << 36)
+#define KVSPACE_MAGIC "kvspace-c"
+#define ADAPTIVE_RADIX_TREE_PREFIX_MAX 10
+#define ADAPTIVE_RADIX_TREE_BLOCK_SIZE 104
+#define ADAPTIVE_RADIX_TREE_SLAB_INITIAL (64UL * 1024 * 1024)
+#define SLOTS_BOX_HEAD_POOL_INITIAL (4UL * 1024 * 1024)
+#define SHARED_MEMORY_REGION_RESERVE (1ULL << 38)
+#define ADAPTIVE_RADIX_TREE_RESERVE (1ULL << 36)
 #define DATA_RESERVE (1ULL << 40)
-#define SBO_PUNCH_MIN (64UL * 1024)
+#define SLOTS_BOX_PUNCH_MIN (64UL * 1024)
 enum separator_kind { SEPARATOR_SLASH = 0, SEPARATOR_DOT = 1, SEPARATOR_COUNT = 2, SEPARATOR_NONE = -1 };
 static const struct { const char bytes[3]; uint8_t length; } separator_table[SEPARATOR_COUNT] = {
     {"/", 1}, {"\xC2\xB7", 2}
@@ -45,31 +45,31 @@ static int separator_length(enum separator_kind kind) {
 }
 static enum separator_kind separator_at(const char *text, size_t index, size_t length) {
     for (int kind = SEPARATOR_SLASH; kind < SEPARATOR_COUNT; kind++) {
-        int n = separator_length((enum separator_kind)kind);
-        if (n > 0 && index + (size_t)n <= length &&
-            memcmp(text + index, separator_table[kind].bytes, (size_t)n) == 0)
+        int count = separator_length((enum separator_kind)kind);
+        if (count > 0 && index + (size_t)count <= length &&
+            memcmp(text + index, separator_table[kind].bytes, (size_t)count) == 0)
             return (enum separator_kind)kind;
     }
     return SEPARATOR_NONE;
 }
 static enum separator_kind ending_separator(const char *text, size_t length) {
     for (int kind = SEPARATOR_SLASH; kind < SEPARATOR_COUNT; kind++) {
-        int n = separator_length((enum separator_kind)kind);
-        if (n > 0 && (size_t)n <= length &&
-            separator_at(text, length - (size_t)n, length) == (enum separator_kind)kind)
+        int count = separator_length((enum separator_kind)kind);
+        if (count > 0 && (size_t)count <= length &&
+            separator_at(text, length - (size_t)count, length) == (enum separator_kind)kind)
             return (enum separator_kind)kind;
     }
     return SEPARATOR_NONE;
 }
 static char *append_separator(const char *text, enum separator_kind kind) {
     size_t length = strlen(text);
-    int n = separator_length(kind);
-    char *result = malloc(length + (size_t)n + 1);
+    int count = separator_length(kind);
+    char *result = malloc(length + (size_t)count + 1);
     if (!result)
         return NULL;
     memcpy(result, text, length);
-    memcpy(result + length, separator_table[kind].bytes, (size_t)n);
-    result[length + (size_t)n] = 0;
+    memcpy(result + length, separator_table[kind].bytes, (size_t)count);
+    result[length + (size_t)count] = 0;
     return result;
 }
 static int separator_sequence_valid(const char *text, size_t length) {
@@ -79,10 +79,10 @@ static int separator_sequence_valid(const char *text, size_t length) {
             index++;
             continue;
         }
-        int n = separator_length(kind);
-        if (separator_at(text, index + (size_t)n, length) != SEPARATOR_NONE)
+        int count = separator_length(kind);
+        if (separator_at(text, index + (size_t)count, length) != SEPARATOR_NONE)
             return 0;
-        index += (size_t)n;
+        index += (size_t)count;
     }
     return 1;
 }
@@ -108,569 +108,569 @@ static int key_text_valid(const char *key) {
         first = separator_at(key, index, length);
     return first == SEPARATOR_SLASH;
 }
-enum { ART_N4 = 0,
-       ART_N16 = 1,
-       ART_N48 = 2,
-       ART_N256 = 3,
-       ART_MOVED = 255 };
+enum { ADAPTIVE_RADIX_TREE_N4 = 0,
+       ADAPTIVE_RADIX_TREE_N16 = 1,
+       ADAPTIVE_RADIX_TREE_N48 = 2,
+       ADAPTIVE_RADIX_TREE_N256 = 3,
+       ADAPTIVE_RADIX_TREE_MOVED = 255 };
 typedef struct {
-    uint8_t type, prefix[ART_PREFIX_MAX], prefix_len;
+    uint8_t type, prefix[ADAPTIVE_RADIX_TREE_PREFIX_MAX], prefix_len;
     uint16_t count;
-    uint16_t _pad;
-    uint64_t val;
-} art_hdr_t;
-#define AV_HAS(v) ((int)((v) & 1u))
-#define AV_OFF(v) ((uint64_t)((v) >> 1))
-#define AV_MAKE(has,off) ((((uint64_t)(off)) << 1) | ((has) ? 1ull : 0ull))
-static inline uint64_t art_val_load(const art_hdr_t *h) {
-    return __atomic_load_n(&h->val, __ATOMIC_ACQUIRE);
+    uint16_t padding;
+    uint64_t value;
+} adaptive_radix_tree_header_t;
+#define ADAPTIVE_RADIX_TREE_VALUE_HAS(value) ((int)((value) & 1u))
+#define ADAPTIVE_RADIX_TREE_VALUE_OFFSET(value) ((uint64_t)((value) >> 1))
+#define ADAPTIVE_RADIX_TREE_VALUE_MAKE(has,offset) ((((uint64_t)(offset)) << 1) | ((has) ? 1ull : 0ull))
+static inline uint64_t adaptive_radix_tree_value_load(const adaptive_radix_tree_header_t *node_header) {
+    return __atomic_load_n(&node_header->value, __ATOMIC_ACQUIRE);
 }
-static inline void art_val_store(art_hdr_t *h, uint64_t v) {
-    __atomic_store_n(&h->val, v, __ATOMIC_RELEASE);
+static inline void adaptive_radix_tree_value_store(adaptive_radix_tree_header_t *node_header, uint64_t value) {
+    __atomic_store_n(&node_header->value, value, __ATOMIC_RELEASE);
 }
-static inline bool art_val_cas(art_hdr_t *h, uint64_t *exp, uint64_t nv) {
-    return __atomic_compare_exchange_n(&h->val, exp, nv, false,
+static inline bool adaptive_radix_tree_value_compare_and_swap(adaptive_radix_tree_header_t *node_header, uint64_t *expected, uint64_t new_value) {
+    return __atomic_compare_exchange_n(&node_header->value, expected, new_value, false,
                                        __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE);
 }
 typedef struct {
-    art_hdr_t h;
+    adaptive_radix_tree_header_t header;
     uint8_t keys[4];
     int32_t children[4];
-} art_n4_t;
+} adaptive_radix_tree_node4_t;
 typedef struct {
-    art_hdr_t h;
+    adaptive_radix_tree_header_t header;
     uint8_t keys[16];
     int32_t children[16];
-} art_n16_t;
+} adaptive_radix_tree_node16_t;
 typedef struct {
-    art_hdr_t h;
+    adaptive_radix_tree_header_t header;
     uint8_t index[256];
     int32_t children[48];
-} art_n48_t;
+} adaptive_radix_tree_node48_t;
 typedef struct {
-    art_hdr_t h;
+    adaptive_radix_tree_header_t header;
     int32_t children[256];
-} art_n256_t;
-_Static_assert(sizeof(art_n4_t) <= ART_BLOCK_SZ && sizeof(art_n16_t) <= ART_BLOCK_SZ,
+} adaptive_radix_tree_node256_t;
+_Static_assert(sizeof(adaptive_radix_tree_node4_t) <= ADAPTIVE_RADIX_TREE_BLOCK_SIZE && sizeof(adaptive_radix_tree_node16_t) <= ADAPTIVE_RADIX_TREE_BLOCK_SIZE,
                "N4/N16 must fit one ART block");
-static int art_node_sz(int t) {
-    return t == ART_N4 ? sizeof(art_n4_t)
-           : t == ART_N16 ? sizeof(art_n16_t)
-           : t == ART_N48 ? sizeof(art_n48_t)
-                          : sizeof(art_n256_t);
+static int adaptive_radix_tree_node_size(int node_type) {
+    return node_type == ADAPTIVE_RADIX_TREE_N4 ? sizeof(adaptive_radix_tree_node4_t)
+           : node_type == ADAPTIVE_RADIX_TREE_N16 ? sizeof(adaptive_radix_tree_node16_t)
+           : node_type == ADAPTIVE_RADIX_TREE_N48 ? sizeof(adaptive_radix_tree_node48_t)
+                          : sizeof(adaptive_radix_tree_node256_t);
 }
-#define P2_SLOT_N 64
-enum { P2_SLOT_FREE = 0, P2_SLOT_MINE = 1, P2_SLOT_CLAIMING = 3 };
+#define RECOVERY_SLOT_COUNT 64
+enum { RECOVERY_SLOT_FREE = 0, RECOVERY_SLOT_MINE = 1, RECOVERY_SLOT_CLAIMING = 3 };
 typedef struct {
-    uint32_t pid;
+    uint32_t process_id;
     uint32_t state;
-    uint64_t starttime;
+    uint64_t start_time;
     uint64_t recovery_ack;
     uint32_t quiesced;
     uint32_t claim_id;
-} p2_slot_t;
-#define GARB_CAP (1u << 21)
-#define GARB_THRESHOLD (64ull << 20)
-#define P2_BARRIER_MS_DEFAULT 200
-#define GARB_MAX_CLAIM ((1u << 30) - 1u)
+} recovery_slot_t;
+#define GARBAGE_CAPACITY (1u << 21)
+#define GARBAGE_THRESHOLD (64ull << 20)
+#define RECOVERY_BARRIER_MILLISECONDS_DEFAULT 200
+#define GARBAGE_MAX_CLAIM ((1u << 30) - 1u)
 typedef struct {
-    uint64_t off;
+    uint64_t offset;
     uint32_t epoch;
     uint32_t meta;
-} garb_ent_t;
-enum { GE_EMPTY = 0, GE_RESERVED = 1, GE_COMMITTED = 2 };
-#define GE_STATE(m) ((uint32_t)((m) & 3u))
-#define GE_CLAIM(m) ((uint32_t)((m) >> 2))
-#define GE_MAKE(st,id) ((((uint32_t)(id)) << 2) | (uint32_t)(st))
+} garbage_entry_t;
+enum { GARBAGE_ENTRY_EMPTY = 0, GARBAGE_ENTRY_RESERVED = 1, GARBAGE_ENTRY_COMMITTED = 2 };
+#define GARBAGE_ENTRY_STATE(metadata) ((uint32_t)((metadata) & 3u))
+#define GARBAGE_ENTRY_CLAIM(metadata) ((uint32_t)((metadata) >> 2))
+#define GARBAGE_ENTRY_MAKE(state,claim_id) ((((uint32_t)(claim_id)) << 2) | (uint32_t)(state))
 typedef struct {
-    char magic[sizeof(KVS_MAGIC)];
-    uint64_t art_slab_size, sbo_head_size, sbo_data_size;
-    int32_t art_root;
-    uint64_t gen_epoch;
+    char magic[sizeof(KVSPACE_MAGIC)];
+    uint64_t adaptive_radix_tree_slab_size, slots_box_head_size, slots_box_data_size;
+    int32_t adaptive_radix_tree_root;
+    uint64_t generation_epoch;
     uint32_t recovery_epoch;
-    uint32_t ack_seq;
+    uint32_t ack_sequence;
     uint32_t barrier_state;
-    uint64_t garb_head, garb_tail;
+    uint64_t garbage_head, garbage_tail;
     uint64_t committed_bytes;
     uint64_t freed_bytes;
-    uint64_t garb_freeing;
-    uint64_t list_gen;
-    uint32_t claim_seq;
-    p2_slot_t slots[P2_SLOT_N];
-} kvspace_hdr_t;
-#define ART_OFF (sizeof(kvspace_hdr_t) + sizeof(blocks_meta_t))
+    uint64_t garbage_freeing;
+    uint64_t list_generation;
+    uint32_t claim_sequence;
+    recovery_slot_t slots[RECOVERY_SLOT_COUNT];
+} kvspace_header_t;
+#define ADAPTIVE_RADIX_TREE_OFFSET (sizeof(kvspace_header_t) + sizeof(blocks_meta_t))
 static size_t kvspace_data_size = 8ULL * 64 * 64 * 64 * 64;
-static int delete_tree(kvspace_t *kv, const char *prefix);
-static int copy_key(kvspace_t *kv, const char *src, const char *dst);
-static int copy_tree(kvspace_t *kv, const char *src, const char *dst);
-static uint8_t *storage_data_base(kvspace_t *kv);
-static int resolve_root(kvspace_t *kv, const char *key,
+static int delete_tree(kvspace_t *store, const char *prefix);
+static int copy_key(kvspace_t *store, const char *source, const char *destination);
+static int copy_tree(kvspace_t *store, const char *source, const char *destination);
+static uint8_t *storage_data_base(kvspace_t *store);
+static int resolve_root(kvspace_t *store, const char *key,
                              uint64_t *out_offset);
-static int resolve_anchor(kvspace_t *kv, const char *key,
+static int resolve_anchor(kvspace_t *store, const char *key,
                           const kvspace_anchor_t *anchor,
                           uint64_t *out_offset);
-static int art_resume(kvspace_t *kv, int32_t node_id, const char *suffix,
-                      int suffix_len, uint64_t *out_offset, int follow_moved);
-static int realloc_key(kvspace_t *kv, const char *key, uint64_t body_len,
-                             uint64_t attr_len, uint64_t *out_offset);
-static int free_key(kvspace_t *kv, const char *key);
-static int makeindex_key(kvspace_t *kv, const char *key);
-static int listlen_key(kvspace_t *kv, const char *key, int64_t *out_count,
+static int adaptive_radix_tree_resume(kvspace_t *store, int32_t node_id, const char *suffix,
+                      int suffix_length, uint64_t *out_offset, int follow_moved);
+static int realloc_key(kvspace_t *store, const char *key, uint64_t body_length,
+                             uint64_t attribute_length, uint64_t *out_offset);
+static int free_key(kvspace_t *store, const char *key);
+static int makeindex_key(kvspace_t *store, const char *key);
+static int listlen_key(kvspace_t *store, const char *key, int64_t *out_count,
                              uint32_t *out_max_name_length);
-static int list_names_raw(kvspace_t *kv, const char *key, char *out_names,
+static int list_names_raw(kvspace_t *store, const char *key, char *out_names,
                           uint32_t out_capacity, uint32_t *out_length,
                           uint32_t *out_count, uint64_t *out_generation);
-_Static_assert(ART_SLAB_INIT / (ART_BLOCK_SZ + 2) > 32767ULL / 4,
+_Static_assert(ADAPTIVE_RADIX_TREE_SLAB_INITIAL / (ADAPTIVE_RADIX_TREE_BLOCK_SIZE + 2) > 32767ULL / 4,
                "ART_SLAB_INIT too small: blockmalloc would pick 14-bit ids");
-_Static_assert(ART_RESERVE / (ART_BLOCK_SZ + 8) <= (1ULL << 30),
+_Static_assert(ADAPTIVE_RADIX_TREE_RESERVE / (ADAPTIVE_RADIX_TREE_BLOCK_SIZE + 8) <= (1ULL << 30),
                "ART_RESERVE too large for 30-bit block ids");
-_Static_assert((ART_BLOCK_SZ + 8) % 8 == 0, "ART stride must keep 8B alignment");
+_Static_assert((ADAPTIVE_RADIX_TREE_BLOCK_SIZE + 8) % 8 == 0, "ART stride must keep 8B alignment");
 _Static_assert(
-    SBO_HEAD_POOL_INIT / (sizeof(sbo_box_t) + 2) > 32767ULL / 4,
+    SLOTS_BOX_HEAD_POOL_INITIAL / (sizeof(sbo_box_t) + 2) > 32767ULL / 4,
     "SBO_HEAD_POOL_INIT too small: blockmalloc would pick 14-bit ids");
-#define SBO_HEAD_FIXED \
+#define SLOTS_BOX_HEAD_FIXED \
     (sizeof(sbo_meta_t) + sizeof(blocks_meta_t) + sizeof(sbo_lock_t))
-static blocks_meta_t *sbo_pool(sbo_meta_t *m) {
-    return sbo_pool_meta(m, 0);
+static blocks_meta_t *slots_box_pool(sbo_meta_t *meta) {
+    return sbo_pool_meta(meta, 0);
 }
-static sbo_lock_t *sbo_plock(sbo_meta_t *m) {
-    return sbo_pool_lock(m, 0);
+static sbo_lock_t *slots_box_pool_lock(sbo_meta_t *meta) {
+    return sbo_pool_lock(meta, 0);
 }
-static uint8_t *sbo_pmem(sbo_meta_t *m) {
-    return sbo_pool_mem(m, 0);
+static uint8_t *slots_box_pool_memory(sbo_meta_t *meta) {
+    return sbo_pool_mem(meta, 0);
 }
-static sbo_box_t *sbo_box(sbo_meta_t *m, int32_t id) {
-    return (sbo_box_t *)(sbo_pmem(m) + (size_t)id * m->block_stride +
-                         m->box_off);
+static sbo_box_t *slots_box_box(sbo_meta_t *meta, int32_t id) {
+    return (sbo_box_t *)(slots_box_pool_memory(meta) + (size_t)id * meta->block_stride +
+                         meta->box_off);
 }
 typedef struct {
-    int fd;
+    int file_descriptor;
     uint8_t *base;
     size_t mapped;
     size_t reserve;
-} shm_region_t;
+} shared_memory_region_t;
 struct kvspace {
-    shm_region_t r_art, r_head, r_data, r_gen, r_garb;
-    garb_ent_t *garb;
-    uint64_t gen_n;
-    uint64_t art_total_seen;
-    kvspace_hdr_t *hdr;
-    int p2_slot;
-    uint32_t pid;
-    uint32_t fork_gen;
+    shared_memory_region_t region_adaptive_radix_tree, region_header, region_data, region_generations, region_garbage;
+    garbage_entry_t *garbage;
+    uint64_t generation_count;
+    uint64_t adaptive_radix_tree_total_seen;
+    kvspace_header_t *header;
+    int recovery_slot;
+    uint32_t process_id;
+    uint32_t fork_generation;
     uint32_t quiesced;
-    pthread_t maint_thread;
-    uint32_t maint_seq;
-    uint32_t maint_started, maint_stop;
+    pthread_t maintenance_thread;
+    uint32_t maintenance_sequence;
+    uint32_t maintenance_started, maintenance_stop;
     uint32_t reclaim_unavailable;
-    blocks_meta_t *art_meta;
-    uint8_t *art_data;
-    sbo_meta_t *sbo_meta;
-    uint8_t *sbo_data;
+    blocks_meta_t *adaptive_radix_tree_meta;
+    uint8_t *adaptive_radix_tree_data;
+    sbo_meta_t *slots_box_meta;
+    uint8_t *slots_box_data;
 };
-static inline void list_gen_bump(kvspace_t *kv) {
-    __atomic_add_fetch(&kv->hdr->list_gen, 1ull, __ATOMIC_RELEASE);
+static inline void list_generation_bump(kvspace_t *store) {
+    __atomic_add_fetch(&store->header->list_generation, 1ull, __ATOMIC_RELEASE);
 }
-static int region_map(shm_region_t *r, size_t size) {
-    if (size > r->reserve)
+static int region_map(shared_memory_region_t *region, size_t size) {
+    if (size > region->reserve)
         return -1;
-    if (size <= r->mapped)
+    if (size <= region->mapped)
         return 0;
-    if (mmap(r->base, size, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED,
-             r->fd, 0) == MAP_FAILED)
+    if (mmap(region->base, size, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED,
+             region->file_descriptor, 0) == MAP_FAILED)
         return -1;
-    r->mapped = size;
+    region->mapped = size;
     return 0;
 }
-static int region_attach(shm_region_t *r, bool create, size_t size,
+static int region_attach(shared_memory_region_t *region, bool create, size_t size,
                          size_t reserve) {
-    struct stat st;
-    if (create ? ftruncate(r->fd, (off_t)size) != 0
-               : fstat(r->fd, &st) != 0 || st.st_size < (off_t)size)
+    struct stat stat_result;
+    if (create ? ftruncate(region->file_descriptor, (off_t)size) != 0
+               : fstat(region->file_descriptor, &stat_result) != 0 || stat_result.st_size < (off_t)size)
         return -1;
-    r->reserve = size > reserve ? size : reserve;
-    void *p = mmap(NULL, r->reserve, PROT_NONE,
+    region->reserve = size > reserve ? size : reserve;
+    void *mapping = mmap(NULL, region->reserve, PROT_NONE,
                    MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
-    if (p == MAP_FAILED)
+    if (mapping == MAP_FAILED)
         return -1;
-    r->base = p;
-    return region_map(r, size);
+    region->base = mapping;
+    return region_map(region, size);
 }
-static void region_close(shm_region_t *r) {
-    if (r->base)
-        munmap(r->base, r->reserve);
-    if (r->fd >= 0)
-        close(r->fd);
+static void region_close(shared_memory_region_t *region) {
+    if (region->base)
+        munmap(region->base, region->reserve);
+    if (region->file_descriptor >= 0)
+        close(region->file_descriptor);
 }
-static void kv_sbo_free(kvspace_t *kv, uint64_t off);
-static art_hdr_t *art_hdr(kvspace_t *kv, int32_t id);
-static int32_t art_child(kvspace_t *kv, void *n, uint8_t b);
-static int pfx_shared(const uint8_t *a, int al, const uint8_t *b, int bl);
-static int32_t art_walk(kvspace_t *kv, int32_t nid, const uint8_t *key, int klen,
-                        int d, int32_t *par, int *pard);
-static int32_t art_follow(kvspace_t *kv, int32_t id);
+static void store_slots_box_free(kvspace_t *store, uint64_t offset);
+static adaptive_radix_tree_header_t *adaptive_radix_tree_header(kvspace_t *store, int32_t id);
+static int32_t adaptive_radix_tree_child(kvspace_t *store, void *node, uint8_t byte);
+static int shared_prefix_length(const uint8_t *left, int left_length, const uint8_t *right, int right_length);
+static int32_t adaptive_radix_tree_walk(kvspace_t *store, int32_t node_id, const uint8_t *key, int key_length,
+                        int depth, int32_t *out_parent, int *out_parent_depth);
+static int32_t adaptive_radix_tree_follow(kvspace_t *store, int32_t id);
 typedef struct {
-    uint32_t struct_gen;
-    uint32_t value_gen;
-} kv_gens_t;
-static uint64_t gen_cap(const kvspace_t *kv) {
-    blocks_meta_t *m = kv->art_meta;
-    uint64_t head = (uint64_t)m->sizeof_block_head;
-    return m->total_size / (head + m->block_size);
+    uint32_t struct_generation;
+    uint32_t value_generation;
+} generations_t;
+static uint64_t generation_capacity(const kvspace_t *store) {
+    blocks_meta_t *meta = store->adaptive_radix_tree_meta;
+    uint64_t head = (uint64_t)meta->sizeof_block_head;
+    return meta->total_size / (head + meta->block_size);
 }
-static int32_t art_id_of(kvspace_t *kv, const void *p) {
-    if (!p || !kv->art_data)
+static int32_t adaptive_radix_tree_id_of(kvspace_t *store, const void *pointer) {
+    if (!pointer || !store->adaptive_radix_tree_data)
         return -1;
-    return (int32_t)blockid_bydataoffset(kv->art_meta,
-                                         (uint64_t)((const uint8_t *)p - kv->art_data));
+    return (int32_t)blockid_bydataoffset(store->adaptive_radix_tree_meta,
+                                         (uint64_t)((const uint8_t *)pointer - store->adaptive_radix_tree_data));
 }
-static kv_gens_t *gens_at(kvspace_t *kv, int32_t id) {
-    if (id < 0 || !kv->r_gen.base)
+static generations_t *generations_at(kvspace_t *store, int32_t id) {
+    if (id < 0 || !store->region_generations.base)
         return NULL;
-    if ((uint64_t)id >= kv->gen_n)
+    if ((uint64_t)id >= store->generation_count)
         return NULL;
-    return (kv_gens_t *)kv->r_gen.base + id;
+    return (generations_t *)store->region_generations.base + id;
 }
-static void gen_bump_struct(kvspace_t *kv, int32_t id) {
-    kv_gens_t *g = gens_at(kv, id);
-    if (g)
-        __atomic_add_fetch(&g->struct_gen, 1u, __ATOMIC_ACQ_REL);
+static void generation_bump_struct(kvspace_t *store, int32_t id) {
+    generations_t *generations = generations_at(store, id);
+    if (generations)
+        __atomic_add_fetch(&generations->struct_generation, 1u, __ATOMIC_ACQ_REL);
 }
-static void gen_bump_value(kvspace_t *kv, int32_t id) {
-    kv_gens_t *g = gens_at(kv, id);
-    if (g)
-        __atomic_add_fetch(&g->value_gen, 2u, __ATOMIC_ACQ_REL);
+static void generation_bump_value(kvspace_t *store, int32_t id) {
+    generations_t *generations = generations_at(store, id);
+    if (generations)
+        __atomic_add_fetch(&generations->value_generation, 2u, __ATOMIC_ACQ_REL);
 }
-static int64_t gen_alloc_epoch(kvspace_t *kv) {
-    return (int64_t)__atomic_add_fetch(&kv->hdr->gen_epoch, 1ull, __ATOMIC_ACQ_REL);
+static int64_t generation_alloc_epoch(kvspace_t *store) {
+    return (int64_t)__atomic_add_fetch(&store->header->generation_epoch, 1ull, __ATOMIC_ACQ_REL);
 }
-static int p2_maint_start(kvspace_t *kv);
-static bool p2_claim_alive(kvspace_t *kv, uint32_t claim);
-static int kv_sync(kvspace_t *kv);
-static uint64_t p2_garb_threshold(void) {
-    return GARB_THRESHOLD;
+static int recovery_maintenance_start(kvspace_t *store);
+static bool recovery_claim_alive(kvspace_t *store, uint32_t claim);
+static int store_sync(kvspace_t *store);
+static uint64_t recovery_garbage_threshold(void) {
+    return GARBAGE_THRESHOLD;
 }
-static void garb_full_report(kvspace_t *kv) {
+static void garbage_full_report(kvspace_t *store) {
     static bool once;
     if (once)
         return;
     once = true;
-    uint64_t h = __atomic_load_n(&kv->hdr->garb_head, __ATOMIC_ACQUIRE);
-    uint64_t t = __atomic_load_n(&kv->hdr->garb_tail, __ATOMIC_ACQUIRE);
-    uint32_t m = __atomic_load_n(&kv->garb[h & (GARB_CAP - 1)].meta,
+    uint64_t garbage_head_index = __atomic_load_n(&store->header->garbage_head, __ATOMIC_ACQUIRE);
+    uint64_t garbage_tail_index = __atomic_load_n(&store->header->garbage_tail, __ATOMIC_ACQUIRE);
+    uint32_t meta_state = __atomic_load_n(&store->garbage[garbage_head_index & (GARBAGE_CAPACITY - 1)].meta,
                                  __ATOMIC_ACQUIRE);
     fprintf(stderr,
             "kvspace: garbage ring full (cap=%llu, head=%llu, tail=%llu, "
             "bytes=%llu): head entry #%llu state=%u claim=%u is holding "
             "the drain (no reclaim round yet)\n",
-            (unsigned long long)GARB_CAP, (unsigned long long)h,
-            (unsigned long long)t,
-            (unsigned long long)(kv->hdr->committed_bytes -
-                                 kv->hdr->freed_bytes),
-            (unsigned long long)h, GE_STATE(m), GE_CLAIM(m));
+            (unsigned long long)GARBAGE_CAPACITY, (unsigned long long)garbage_head_index,
+            (unsigned long long)garbage_tail_index,
+            (unsigned long long)(store->header->committed_bytes -
+                                 store->header->freed_bytes),
+            (unsigned long long)garbage_head_index, GARBAGE_ENTRY_STATE(meta_state), GARBAGE_ENTRY_CLAIM(meta_state));
 }
-static int garb_reserve(kvspace_t *kv, uint64_t *idx) {
-    uint32_t claim = kv->p2_slot >= 0 ? kv->hdr->slots[kv->p2_slot].claim_id : 0;
+static int garbage_reserve(kvspace_t *store, uint64_t *index) {
+    uint32_t claim = store->recovery_slot >= 0 ? store->header->slots[store->recovery_slot].claim_id : 0;
     if (!claim)
         return -1;
-    uint64_t h = __atomic_load_n(&kv->hdr->garb_head, __ATOMIC_ACQUIRE);
-    uint64_t t = __atomic_load_n(&kv->hdr->garb_tail, __ATOMIC_ACQUIRE);
-    if (t - h >= GARB_CAP) {
-        garb_full_report(kv);
+    uint64_t garbage_head_index = __atomic_load_n(&store->header->garbage_head, __ATOMIC_ACQUIRE);
+    uint64_t garbage_tail_index = __atomic_load_n(&store->header->garbage_tail, __ATOMIC_ACQUIRE);
+    if (garbage_tail_index - garbage_head_index >= GARBAGE_CAPACITY) {
+        garbage_full_report(store);
         return -1;
     }
-    if (kv->reclaim_unavailable &&
-        GARB_CAP - (t - h) < GARB_CAP / 4) {
-        garb_full_report(kv);
+    if (store->reclaim_unavailable &&
+        GARBAGE_CAPACITY - (garbage_tail_index - garbage_head_index) < GARBAGE_CAPACITY / 4) {
+        garbage_full_report(store);
         return -1;
     }
-    garb_ent_t *e = &kv->garb[t & (GARB_CAP - 1)];
-    uint32_t m = __atomic_load_n(&e->meta, __ATOMIC_ACQUIRE);
-    if (m != GE_EMPTY) {
-        if (GE_STATE(m) != GE_RESERVED || p2_claim_alive(kv, GE_CLAIM(m)))
+    garbage_entry_t *entry = &store->garbage[garbage_tail_index & (GARBAGE_CAPACITY - 1)];
+    uint32_t meta_state = __atomic_load_n(&entry->meta, __ATOMIC_ACQUIRE);
+    if (meta_state != GARBAGE_ENTRY_EMPTY) {
+        if (GARBAGE_ENTRY_STATE(meta_state) != GARBAGE_ENTRY_RESERVED || recovery_claim_alive(store, GARBAGE_ENTRY_CLAIM(meta_state)))
             return -1;
-        __atomic_store_n(&e->meta, GE_EMPTY, __ATOMIC_RELEASE);
+        __atomic_store_n(&entry->meta, GARBAGE_ENTRY_EMPTY, __ATOMIC_RELEASE);
     }
-    __atomic_store_n(&e->meta, GE_MAKE(GE_RESERVED, claim), __ATOMIC_RELEASE);
-    __atomic_store_n(&kv->hdr->garb_tail, t + 1, __ATOMIC_RELEASE);
-    *idx = t;
+    __atomic_store_n(&entry->meta, GARBAGE_ENTRY_MAKE(GARBAGE_ENTRY_RESERVED, claim), __ATOMIC_RELEASE);
+    __atomic_store_n(&store->header->garbage_tail, garbage_tail_index + 1, __ATOMIC_RELEASE);
+    *index = garbage_tail_index;
     return 0;
 }
-static void garb_commit(kvspace_t *kv, uint64_t idx, uint64_t off,
+static void garbage_commit(kvspace_t *store, uint64_t index, uint64_t offset,
                         uint64_t bytes_retired) {
-    garb_ent_t *e = &kv->garb[idx & (GARB_CAP - 1)];
-    uint32_t claim = GE_CLAIM(__atomic_load_n(&e->meta, __ATOMIC_ACQUIRE));
-    e->off = off;
-    e->epoch = __atomic_load_n(&kv->hdr->recovery_epoch, __ATOMIC_ACQUIRE);
-    __atomic_store_n(&e->meta, GE_MAKE(GE_COMMITTED, claim), __ATOMIC_RELEASE);
-    uint64_t bytes = kv->hdr->committed_bytes + bytes_retired;
-    __atomic_store_n(&kv->hdr->committed_bytes, bytes, __ATOMIC_RELEASE);
-    if (bytes - __atomic_load_n(&kv->hdr->freed_bytes, __ATOMIC_ACQUIRE) >=
-        p2_garb_threshold())
-        (void)p2_maint_start(kv);
+    garbage_entry_t *entry = &store->garbage[index & (GARBAGE_CAPACITY - 1)];
+    uint32_t claim = GARBAGE_ENTRY_CLAIM(__atomic_load_n(&entry->meta, __ATOMIC_ACQUIRE));
+    entry->offset = offset;
+    entry->epoch = __atomic_load_n(&store->header->recovery_epoch, __ATOMIC_ACQUIRE);
+    __atomic_store_n(&entry->meta, GARBAGE_ENTRY_MAKE(GARBAGE_ENTRY_COMMITTED, claim), __ATOMIC_RELEASE);
+    uint64_t bytes = store->header->committed_bytes + bytes_retired;
+    __atomic_store_n(&store->header->committed_bytes, bytes, __ATOMIC_RELEASE);
+    if (bytes - __atomic_load_n(&store->header->freed_bytes, __ATOMIC_ACQUIRE) >=
+        recovery_garbage_threshold())
+        (void)recovery_maintenance_start(store);
 }
-static void garb_cancel(kvspace_t *kv, uint64_t idx) {
-    __atomic_store_n(&kv->garb[idx & (GARB_CAP - 1)].meta, GE_EMPTY,
+static void garbage_cancel(kvspace_t *store, uint64_t index) {
+    __atomic_store_n(&store->garbage[index & (GARBAGE_CAPACITY - 1)].meta, GARBAGE_ENTRY_EMPTY,
                      __ATOMIC_RELEASE);
 }
-static int32_t p2_node_at(kvspace_t *kv, const char *key) {
-    int klen = (int)strlen(key);
-    int d = 0;
-    int32_t nid = kv->hdr->art_root;
-    while (nid >= 0) {
-        art_hdr_t *h = art_hdr(kv, nid);
-        if (!h || h->type == ART_MOVED)
+static int32_t recovery_node_at(kvspace_t *store, const char *key) {
+    int key_length = (int)strlen(key);
+    int depth = 0;
+    int32_t node_id = store->header->adaptive_radix_tree_root;
+    while (node_id >= 0) {
+        adaptive_radix_tree_header_t *node_header = adaptive_radix_tree_header(store, node_id);
+        if (!node_header || node_header->type == ADAPTIVE_RADIX_TREE_MOVED)
             return -1;
-        if (h->prefix_len) {
-            int s = pfx_shared(h->prefix, h->prefix_len,
-                               (const uint8_t *)key + d, klen - d);
-            if (s != h->prefix_len && d + s != klen)
+        if (node_header->prefix_len) {
+            int shared = shared_prefix_length(node_header->prefix, node_header->prefix_len,
+                               (const uint8_t *)key + depth, key_length - depth);
+            if (shared != node_header->prefix_len && depth + shared != key_length)
                 return -1;
-            d += s;
+            depth += shared;
         }
-        if (d == klen)
-            return nid;
-        nid = art_child(kv, h, (uint8_t)key[d]);
-        d++;
+        if (depth == key_length)
+            return node_id;
+        node_id = adaptive_radix_tree_child(store, node_header, (uint8_t)key[depth]);
+        depth++;
     }
     return -1;
 }
-static int p2_proc_starttime(uint32_t pid, uint64_t *out) {
+static int recovery_process_start_time(uint32_t process_id, uint64_t *out) {
 #if defined(__linux__)
-    char p[64];
-    if (snprintf(p, sizeof p, "/proc/%u/stat", pid) >= (int)sizeof p)
+    char path[64];
+    if (snprintf(path, sizeof path, "/proc/%u/stat", process_id) >= (int)sizeof path)
         return 2;
-    FILE *f = fopen(p, "r");
-    if (!f)
+    FILE *file = fopen(path, "r");
+    if (!file)
         return errno == ENOENT ? 1 : 2;
-    char buf[1024];
-    size_t n = fread(buf, 1, sizeof buf - 1, f);
-    fclose(f);
-    if (!n)
+    char buffer[1024];
+    size_t bytes_read = fread(buffer, 1, sizeof buffer - 1, file);
+    fclose(file);
+    if (!bytes_read)
         return 2;
-    buf[n] = 0;
-    char *rp = strrchr(buf, ')');
-    if (!rp)
+    buffer[bytes_read] = 0;
+    char *closing_parenthesis = strrchr(buffer, ')');
+    if (!closing_parenthesis)
         return 2;
-    char *s = rp + 1;
+    char *scan_pointer = closing_parenthesis + 1;
     int field = 3;
-    while (*s) {
-        while (*s == ' ')
-            s++;
-        if (!*s)
+    while (*scan_pointer) {
+        while (*scan_pointer == ' ')
+            scan_pointer++;
+        if (!*scan_pointer)
             break;
-        if (field == 3 && (*s == 'Z' || *s == 'X'))
+        if (field == 3 && (*scan_pointer == 'Z' || *scan_pointer == 'X'))
             return 1;
         if (field == 22) {
-            *out = strtoull(s, NULL, 10);
+            *out = strtoull(scan_pointer, NULL, 10);
             return 0;
         }
-        while (*s && *s != ' ')
-            s++;
+        while (*scan_pointer && *scan_pointer != ' ')
+            scan_pointer++;
         field++;
     }
     return 2;
 #else
-    (void)pid;
+    (void)process_id;
     (void)out;
     return 2;
 #endif
 }
-static bool p2_slot_alive(const p2_slot_t *s) {
-    uint64_t st = 0;
-    uint32_t state = __atomic_load_n(&s->state, __ATOMIC_ACQUIRE);
-    if (state == P2_SLOT_FREE)
+static bool recovery_slot_alive(const recovery_slot_t *slot) {
+    uint64_t process_start_time = 0;
+    uint32_t state = __atomic_load_n(&slot->state, __ATOMIC_ACQUIRE);
+    if (state == RECOVERY_SLOT_FREE)
         return false;
-    if (state == P2_SLOT_CLAIMING)
+    if (state == RECOVERY_SLOT_CLAIMING)
         return true;
-    int rc = p2_proc_starttime(s->pid, &st);
-    if (rc == 1)
+    int return_code = recovery_process_start_time(slot->process_id, &process_start_time);
+    if (return_code == 1)
         return false;
-    if (rc != 0)
+    if (return_code != 0)
         return true;
-    return st == s->starttime;
+    return process_start_time == slot->start_time;
 }
-static int p2_reg_claim(kvspace_t *kv) {
-    uint64_t st = 0;
-    if (p2_proc_starttime((uint32_t)getpid(), &st) != 0)
-        st = 0;
-    uint32_t me = (uint32_t)getpid();
-    for (int i = 0; i < P2_SLOT_N; i++) {
-        p2_slot_t *s = &kv->hdr->slots[i];
-        uint32_t v = __atomic_load_n(&s->state, __ATOMIC_ACQUIRE);
-        if (v == P2_SLOT_CLAIMING && s->pid == 0) {
-            __atomic_compare_exchange_n(&s->state, &v, P2_SLOT_FREE, false,
+static int recovery_register_claim(kvspace_t *store) {
+    uint64_t process_start_time = 0;
+    if (recovery_process_start_time((uint32_t)getpid(), &process_start_time) != 0)
+        process_start_time = 0;
+    uint32_t current_process_id = (uint32_t)getpid();
+    for (int i = 0; i < RECOVERY_SLOT_COUNT; i++) {
+        recovery_slot_t *slot = &store->header->slots[i];
+        uint32_t state = __atomic_load_n(&slot->state, __ATOMIC_ACQUIRE);
+        if (state == RECOVERY_SLOT_CLAIMING && slot->process_id == 0) {
+            __atomic_compare_exchange_n(&slot->state, &state, RECOVERY_SLOT_FREE, false,
                                         __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE);
             continue;
         }
-        if (v != P2_SLOT_FREE && !p2_slot_alive(s))
-            __atomic_compare_exchange_n(&s->state, &v, P2_SLOT_FREE, false,
+        if (state != RECOVERY_SLOT_FREE && !recovery_slot_alive(slot))
+            __atomic_compare_exchange_n(&slot->state, &state, RECOVERY_SLOT_FREE, false,
                                         __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE);
     }
-    for (int i = 0; i < P2_SLOT_N; i++) {
-        p2_slot_t *s = &kv->hdr->slots[i];
-        uint32_t expect = P2_SLOT_FREE;
-        if (!__atomic_compare_exchange_n(&s->state, &expect, P2_SLOT_CLAIMING, false,
+    for (int i = 0; i < RECOVERY_SLOT_COUNT; i++) {
+        recovery_slot_t *slot = &store->header->slots[i];
+        uint32_t expect = RECOVERY_SLOT_FREE;
+        if (!__atomic_compare_exchange_n(&slot->state, &expect, RECOVERY_SLOT_CLAIMING, false,
                                          __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE))
             continue;
-        uint32_t cid = __atomic_add_fetch(&kv->hdr->claim_seq, 1u,
+        uint32_t claim_id = __atomic_add_fetch(&store->header->claim_sequence, 1u,
                                           __ATOMIC_ACQ_REL);
-        if (cid > GARB_MAX_CLAIM) {
-            __atomic_store_n(&s->state, P2_SLOT_FREE, __ATOMIC_RELEASE);
+        if (claim_id > GARBAGE_MAX_CLAIM) {
+            __atomic_store_n(&slot->state, RECOVERY_SLOT_FREE, __ATOMIC_RELEASE);
             return -3;
         }
-        s->pid = me;
-        s->starttime = st;
-        s->quiesced = 1;
-        s->claim_id = cid;
-        __atomic_store_n(&s->recovery_ack,
-                         __atomic_load_n(&kv->hdr->recovery_epoch, __ATOMIC_ACQUIRE),
+        slot->process_id = current_process_id;
+        slot->start_time = process_start_time;
+        slot->quiesced = 1;
+        slot->claim_id = claim_id;
+        __atomic_store_n(&slot->recovery_ack,
+                         __atomic_load_n(&store->header->recovery_epoch, __ATOMIC_ACQUIRE),
                          __ATOMIC_RELEASE);
-        __atomic_store_n(&s->state, P2_SLOT_MINE, __ATOMIC_RELEASE);
+        __atomic_store_n(&slot->state, RECOVERY_SLOT_MINE, __ATOMIC_RELEASE);
         return i;
     }
     return -2;
 }
-static void p2_reg_release(kvspace_t *kv) {
-    if (kv->p2_slot < 0)
+static void recovery_register_release(kvspace_t *store) {
+    if (store->recovery_slot < 0)
         return;
-    if (kv->pid != (uint32_t)getpid()) {
-        kv->p2_slot = -1;
+    if (store->process_id != (uint32_t)getpid()) {
+        store->recovery_slot = -1;
         return;
     }
-    p2_slot_t *s = &kv->hdr->slots[kv->p2_slot];
-    uint32_t expect = P2_SLOT_MINE;
-    __atomic_compare_exchange_n(&s->state, &expect, P2_SLOT_FREE, false,
+    recovery_slot_t *slot = &store->header->slots[store->recovery_slot];
+    uint32_t expect = RECOVERY_SLOT_MINE;
+    __atomic_compare_exchange_n(&slot->state, &expect, RECOVERY_SLOT_FREE, false,
                                 __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE);
-    kv->p2_slot = -1;
+    store->recovery_slot = -1;
 }
-#define GEN_RESERVE (8ULL << 30)
-static int gens_grow(kvspace_t *kv) {
-    uint64_t want = gen_cap(kv) * sizeof(kv_gens_t);
-    if (want > GEN_RESERVE)
+#define GENERATIONS_RESERVE (8ULL << 30)
+static int generations_grow(kvspace_t *store) {
+    uint64_t want = generation_capacity(store) * sizeof(generations_t);
+    if (want > GENERATIONS_RESERVE)
         return -1;
-    kv->gen_n = want / sizeof(kv_gens_t);
-    kv->art_total_seen = kv->art_meta->total_size;
-    if (want <= kv->r_gen.mapped)
+    store->generation_count = want / sizeof(generations_t);
+    store->adaptive_radix_tree_total_seen = store->adaptive_radix_tree_meta->total_size;
+    if (want <= store->region_generations.mapped)
         return 0;
-    if (!kv->r_gen.base) {
-        void *p = mmap(NULL, GEN_RESERVE, PROT_NONE,
+    if (!store->region_generations.base) {
+        void *mapping = mmap(NULL, GENERATIONS_RESERVE, PROT_NONE,
                        MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
-        if (p == MAP_FAILED)
+        if (mapping == MAP_FAILED)
             return -1;
-        kv->r_gen.base = p;
-        kv->r_gen.reserve = GEN_RESERVE;
+        store->region_generations.base = mapping;
+        store->region_generations.reserve = GENERATIONS_RESERVE;
     }
-    if (ftruncate(kv->r_gen.fd, (off_t)want) != 0)
+    if (ftruncate(store->region_generations.file_descriptor, (off_t)want) != 0)
         return -1;
-    if (region_map(&kv->r_gen, (size_t)want) != 0)
+    if (region_map(&store->region_generations, (size_t)want) != 0)
         return -1;
     return 0;
 }
-static uint32_t g_fork_gen;
+static uint32_t g_fork_generation;
 static pthread_once_t g_atfork_once = PTHREAD_ONCE_INIT;
-static void p2_atfork_child(void) {
-    __atomic_add_fetch(&g_fork_gen, 1u, __ATOMIC_ACQ_REL);
+static void recovery_atfork_child(void) {
+    __atomic_add_fetch(&g_fork_generation, 1u, __ATOMIC_ACQ_REL);
 }
-static void p2_atfork_install(void) {
-    (void)pthread_atfork(NULL, NULL, p2_atfork_child);
+static void recovery_atfork_install(void) {
+    (void)pthread_atfork(NULL, NULL, recovery_atfork_child);
 }
-static long long p2_now_ms(void) {
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (long long)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+static long long recovery_now_milliseconds(void) {
+    struct timespec time_specification;
+    clock_gettime(CLOCK_MONOTONIC, &time_specification);
+    return (long long)time_specification.tv_sec * 1000 + time_specification.tv_nsec / 1000000;
 }
-static int p2_barrier_ms(void) {
-    return P2_BARRIER_MS_DEFAULT;
+static int recovery_barrier_milliseconds(void) {
+    return RECOVERY_BARRIER_MILLISECONDS_DEFAULT;
 }
 #if defined(__linux__)
-static void p2_futex_wait(uint32_t *addr, uint32_t val, int ms) {
-    struct timespec ts = {(time_t)(ms / 1000), (long)(ms % 1000) * 1000000L};
-    syscall(SYS_futex, addr, FUTEX_WAIT, val, &ts, NULL, 0);
+static void recovery_futex_wait(uint32_t *address, uint32_t value, int milliseconds) {
+    struct timespec time_specification = {(time_t)(milliseconds / 1000), (long)(milliseconds % 1000) * 1000000L};
+    syscall(SYS_futex, address, FUTEX_WAIT, value, &time_specification, NULL, 0);
 }
-static void p2_futex_wake(uint32_t *addr) {
-    syscall(SYS_futex, addr, FUTEX_WAKE, INT_MAX, NULL, NULL, 0);
+static void recovery_futex_wake(uint32_t *address) {
+    syscall(SYS_futex, address, FUTEX_WAKE, INT_MAX, NULL, NULL, 0);
 }
-static void p2_futex_wait_priv(uint32_t *addr, uint32_t val, int ms) {
-    struct timespec ts = {(time_t)(ms / 1000), (long)(ms % 1000) * 1000000L};
-    syscall(SYS_futex, addr, FUTEX_WAIT_PRIVATE, val, &ts, NULL, 0);
+static void recovery_futex_wait_private(uint32_t *address, uint32_t value, int milliseconds) {
+    struct timespec time_specification = {(time_t)(milliseconds / 1000), (long)(milliseconds % 1000) * 1000000L};
+    syscall(SYS_futex, address, FUTEX_WAIT_PRIVATE, value, &time_specification, NULL, 0);
 }
-static void p2_futex_wake_priv(uint32_t *addr) {
-    syscall(SYS_futex, addr, FUTEX_WAKE_PRIVATE, INT_MAX, NULL, NULL, 0);
+static void recovery_futex_wake_private(uint32_t *address) {
+    syscall(SYS_futex, address, FUTEX_WAKE_PRIVATE, INT_MAX, NULL, NULL, 0);
 }
 #else
-static void p2_futex_wait(uint32_t *a, uint32_t v, int ms) { (void)a; (void)v; usleep((useconds_t)ms * 1000); }
-static void p2_futex_wake(uint32_t *a) { (void)a; }
-static void p2_futex_wait_priv(uint32_t *a, uint32_t v, int ms) { (void)a; (void)v; usleep((useconds_t)ms * 1000); }
-static void p2_futex_wake_priv(uint32_t *a) { (void)a; }
+static void recovery_futex_wait(uint32_t *address, uint32_t value, int milliseconds) { (void)address; (void)value; usleep((useconds_t)milliseconds * 1000); }
+static void recovery_futex_wake(uint32_t *address) { (void)address; }
+static void recovery_futex_wait_private(uint32_t *address, uint32_t value, int milliseconds) { (void)address; (void)value; usleep((useconds_t)milliseconds * 1000); }
+static void recovery_futex_wake_private(uint32_t *address) { (void)address; }
 #endif
-enum { P2_BARRIER_FREE = 0, P2_BARRIER_OWNED = 1 };
-static uint32_t p2_my_claim(kvspace_t *kv) {
-    return kv->p2_slot >= 0 ? kv->hdr->slots[kv->p2_slot].claim_id : 0;
+enum { RECOVERY_BARRIER_FREE = 0, RECOVERY_BARRIER_OWNED = 1 };
+static uint32_t recovery_my_claim(kvspace_t *store) {
+    return store->recovery_slot >= 0 ? store->header->slots[store->recovery_slot].claim_id : 0;
 }
-static bool p2_claim_alive(kvspace_t *kv, uint32_t claim) {
+static bool recovery_claim_alive(kvspace_t *store, uint32_t claim) {
     if (!claim)
         return false;
-    for (int i = 0; i < P2_SLOT_N; i++) {
-        p2_slot_t *s = &kv->hdr->slots[i];
-        if (__atomic_load_n(&s->state, __ATOMIC_ACQUIRE) != P2_SLOT_MINE)
+    for (int i = 0; i < RECOVERY_SLOT_COUNT; i++) {
+        recovery_slot_t *slot = &store->header->slots[i];
+        if (__atomic_load_n(&slot->state, __ATOMIC_ACQUIRE) != RECOVERY_SLOT_MINE)
             continue;
-        if (__atomic_load_n(&s->claim_id, __ATOMIC_ACQUIRE) != claim)
+        if (__atomic_load_n(&slot->claim_id, __ATOMIC_ACQUIRE) != claim)
             continue;
-        return p2_slot_alive(s);
+        return recovery_slot_alive(slot);
     }
     return false;
 }
-static bool p2_elect(kvspace_t *kv) {
-    uint32_t mine = p2_my_claim(kv);
+static bool recovery_elect(kvspace_t *store) {
+    uint32_t mine = recovery_my_claim(store);
     if (!mine)
         return false;
-    uint32_t own = GE_MAKE(P2_BARRIER_OWNED, mine);
+    uint32_t own = GARBAGE_ENTRY_MAKE(RECOVERY_BARRIER_OWNED, mine);
     for (;;) {
-        uint32_t cur = __atomic_load_n(&kv->hdr->barrier_state, __ATOMIC_ACQUIRE);
-        if (cur == GE_MAKE(P2_BARRIER_FREE, 0)) {
-            if (__atomic_compare_exchange_n(&kv->hdr->barrier_state, &cur, own,
+        uint32_t current = __atomic_load_n(&store->header->barrier_state, __ATOMIC_ACQUIRE);
+        if (current == GARBAGE_ENTRY_MAKE(RECOVERY_BARRIER_FREE, 0)) {
+            if (__atomic_compare_exchange_n(&store->header->barrier_state, &current, own,
                                             false, __ATOMIC_ACQ_REL,
                                             __ATOMIC_ACQUIRE))
                 return true;
             continue;
         }
-        if (GE_STATE(cur) != P2_BARRIER_OWNED)
+        if (GARBAGE_ENTRY_STATE(current) != RECOVERY_BARRIER_OWNED)
             return false;
-        if (GE_CLAIM(cur) == mine)
+        if (GARBAGE_ENTRY_CLAIM(current) == mine)
             return false;
-        if (p2_claim_alive(kv, GE_CLAIM(cur)))
+        if (recovery_claim_alive(store, GARBAGE_ENTRY_CLAIM(current)))
             return false;
-        if (__atomic_compare_exchange_n(&kv->hdr->barrier_state, &cur, own, false,
+        if (__atomic_compare_exchange_n(&store->header->barrier_state, &current, own, false,
                                         __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE))
             return true;
     }
 }
-static void p2_release_busy(kvspace_t *kv) {
-    uint32_t mine = GE_MAKE(P2_BARRIER_OWNED, p2_my_claim(kv));
-    __atomic_compare_exchange_n(&kv->hdr->barrier_state, &mine,
-                                GE_MAKE(P2_BARRIER_FREE, 0), false,
+static void recovery_release_busy(kvspace_t *store) {
+    uint32_t mine = GARBAGE_ENTRY_MAKE(RECOVERY_BARRIER_OWNED, recovery_my_claim(store));
+    __atomic_compare_exchange_n(&store->header->barrier_state, &mine,
+                                GARBAGE_ENTRY_MAKE(RECOVERY_BARRIER_FREE, 0), false,
                                 __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE);
 }
-static bool p2_wait_acks(kvspace_t *kv, uint32_t r, int deadline_ms) {
-    uint8_t dead[P2_SLOT_N] = {0};
-    long long t0 = p2_now_ms();
+static bool recovery_wait_acknowledgements(kvspace_t *store, uint32_t epoch, int deadline_milliseconds) {
+    uint8_t dead[RECOVERY_SLOT_COUNT] = {0};
+    long long start_milliseconds = recovery_now_milliseconds();
     for (;;) {
-        uint32_t seq = __atomic_load_n(&kv->hdr->ack_seq, __ATOMIC_ACQUIRE);
+        uint32_t sequence = __atomic_load_n(&store->header->ack_sequence, __ATOMIC_ACQUIRE);
         bool missing = false;
         int first = -1;
-        for (int i = 0; i < P2_SLOT_N; i++) {
-            p2_slot_t *s = &kv->hdr->slots[i];
-            if (__atomic_load_n(&s->state, __ATOMIC_ACQUIRE) != P2_SLOT_MINE)
+        for (int i = 0; i < RECOVERY_SLOT_COUNT; i++) {
+            recovery_slot_t *slot = &store->header->slots[i];
+            if (__atomic_load_n(&slot->state, __ATOMIC_ACQUIRE) != RECOVERY_SLOT_MINE)
                 continue;
-            if (__atomic_load_n(&s->recovery_ack, __ATOMIC_ACQUIRE) == r)
+            if (__atomic_load_n(&slot->recovery_ack, __ATOMIC_ACQUIRE) == epoch)
                 continue;
-            if (__atomic_load_n(&s->quiesced, __ATOMIC_ACQUIRE))
+            if (__atomic_load_n(&slot->quiesced, __ATOMIC_ACQUIRE))
                 continue;
             if (!dead[i]) {
-                uint64_t ts = 0;
-                int rc = p2_proc_starttime(s->pid, &ts);
-                if (rc == 1 || (rc == 0 && ts != s->starttime))
+                uint64_t process_start_time = 0;
+                int return_code = recovery_process_start_time(slot->process_id, &process_start_time);
+                if (return_code == 1 || (return_code == 0 && process_start_time != slot->start_time))
                     dead[i] = 1;
             }
             if (dead[i])
@@ -681,143 +681,143 @@ static bool p2_wait_acks(kvspace_t *kv, uint32_t r, int deadline_ms) {
         }
         if (!missing)
             return true;
-        long long left = (long long)deadline_ms - (p2_now_ms() - t0);
-        if (left <= 0 || __atomic_load_n(&kv->maint_stop, __ATOMIC_ACQUIRE)) {
+        long long left = (long long)deadline_milliseconds - (recovery_now_milliseconds() - start_milliseconds);
+        if (left <= 0 || __atomic_load_n(&store->maintenance_stop, __ATOMIC_ACQUIRE)) {
             if (first >= 0) {
-                p2_slot_t *s = &kv->hdr->slots[first];
+                recovery_slot_t *slot = &store->header->slots[first];
                 fprintf(stderr,
                         "kvspace: barrier round %u abandoned (waited %dms): "
                         "slot %d pid=%u start=%llu ack=%llu quiesced=%u\n",
-                        r, deadline_ms, first, s->pid,
-                        (unsigned long long)s->starttime,
-                        (unsigned long long)__atomic_load_n(&s->recovery_ack,
+                        epoch, deadline_milliseconds, first, slot->process_id,
+                        (unsigned long long)slot->start_time,
+                        (unsigned long long)__atomic_load_n(&slot->recovery_ack,
                                                             __ATOMIC_ACQUIRE),
-                        __atomic_load_n(&s->quiesced, __ATOMIC_ACQUIRE));
+                        __atomic_load_n(&slot->quiesced, __ATOMIC_ACQUIRE));
             }
             return false;
         }
-        p2_futex_wait(&kv->hdr->ack_seq, seq, (int)(left < 5 ? left : 5));
+        recovery_futex_wait(&store->header->ack_sequence, sequence, (int)(left < 5 ? left : 5));
     }
 }
-static int p2_drain(kvspace_t *kv, uint32_t r) {
+static int recovery_drain(kvspace_t *store, uint32_t epoch) {
     int freed = 0;
-    uint64_t i = __atomic_load_n(&kv->hdr->garb_head, __ATOMIC_ACQUIRE);
+    uint64_t i = __atomic_load_n(&store->header->garbage_head, __ATOMIC_ACQUIRE);
     for (;;) {
-        if (i >= __atomic_load_n(&kv->hdr->garb_tail, __ATOMIC_ACQUIRE))
+        if (i >= __atomic_load_n(&store->header->garbage_tail, __ATOMIC_ACQUIRE))
             goto out;
-        garb_ent_t *e = &kv->garb[i & (GARB_CAP - 1)];
-        uint32_t m = __atomic_load_n(&e->meta, __ATOMIC_ACQUIRE);
-        uint32_t st = GE_STATE(m);
-        if (st == GE_EMPTY) {
-            __atomic_store_n(&kv->hdr->garb_head, i + 1, __ATOMIC_RELEASE);
+        garbage_entry_t *entry = &store->garbage[i & (GARBAGE_CAPACITY - 1)];
+        uint32_t meta_state = __atomic_load_n(&entry->meta, __ATOMIC_ACQUIRE);
+        uint32_t garbage_state = GARBAGE_ENTRY_STATE(meta_state);
+        if (garbage_state == GARBAGE_ENTRY_EMPTY) {
+            __atomic_store_n(&store->header->garbage_head, i + 1, __ATOMIC_RELEASE);
             i++;
             continue;
         }
-        if (st == GE_RESERVED) {
-            if (p2_claim_alive(kv, GE_CLAIM(m)))
+        if (garbage_state == GARBAGE_ENTRY_RESERVED) {
+            if (recovery_claim_alive(store, GARBAGE_ENTRY_CLAIM(meta_state)))
                 goto out;
-            __atomic_store_n(&e->meta, GE_EMPTY, __ATOMIC_RELEASE);
+            __atomic_store_n(&entry->meta, GARBAGE_ENTRY_EMPTY, __ATOMIC_RELEASE);
             fprintf(stderr,
                     "kvspace: garbage entry %llu reserved by dead claim %u: "
-                    "leaked\n", (unsigned long long)i, GE_CLAIM(m));
-            __atomic_store_n(&kv->hdr->garb_head, i + 1, __ATOMIC_RELEASE);
+                    "leaked\n", (unsigned long long)i, GARBAGE_ENTRY_CLAIM(meta_state));
+            __atomic_store_n(&store->header->garbage_head, i + 1, __ATOMIC_RELEASE);
             i++;
             continue;
         }
-        if (st != GE_COMMITTED)
+        if (garbage_state != GARBAGE_ENTRY_COMMITTED)
             goto out;
-        if (!((int32_t)(r - __atomic_load_n(&e->epoch, __ATOMIC_ACQUIRE)) > 0))
+        if (!((int32_t)(epoch - __atomic_load_n(&entry->epoch, __ATOMIC_ACQUIRE)) > 0))
             goto out;
-        uint64_t off = __atomic_load_n(&e->off, __ATOMIC_ACQUIRE);
-        uint64_t cap = sbo_allocated_size(kv->sbo_meta, off);
-        __atomic_store_n(&kv->hdr->garb_freeing, off, __ATOMIC_RELEASE);
-        __atomic_store_n(&e->meta, GE_EMPTY, __ATOMIC_RELEASE);
-        __atomic_store_n(&kv->hdr->garb_head, i + 1, __ATOMIC_RELEASE);
-        kv_sbo_free(kv, off);
-        __atomic_store_n(&kv->hdr->freed_bytes,
-                         kv->hdr->freed_bytes + cap, __ATOMIC_RELEASE);
+        uint64_t offset = __atomic_load_n(&entry->offset, __ATOMIC_ACQUIRE);
+        uint64_t capacity = sbo_allocated_size(store->slots_box_meta, offset);
+        __atomic_store_n(&store->header->garbage_freeing, offset, __ATOMIC_RELEASE);
+        __atomic_store_n(&entry->meta, GARBAGE_ENTRY_EMPTY, __ATOMIC_RELEASE);
+        __atomic_store_n(&store->header->garbage_head, i + 1, __ATOMIC_RELEASE);
+        store_slots_box_free(store, offset);
+        __atomic_store_n(&store->header->freed_bytes,
+                         store->header->freed_bytes + capacity, __ATOMIC_RELEASE);
         i++;
         freed++;
     }
 out:
-    __atomic_store_n(&kv->hdr->garb_freeing, 0, __ATOMIC_RELEASE);
+    __atomic_store_n(&store->header->garbage_freeing, 0, __ATOMIC_RELEASE);
     return freed;
 }
-static int p2_round(kvspace_t *kv) {
+static int recovery_round(kvspace_t *store) {
 #if !defined(__linux__)
-    (void)kv;
+    (void)store;
     return 0;
 #else
-    if (!kv || kv->hdr->art_root < 0)
+    if (!store || store->header->adaptive_radix_tree_root < 0)
         return 0;
-    if (kv->pid != (uint32_t)getpid())
+    if (store->process_id != (uint32_t)getpid())
         return -1;
-    if (!p2_elect(kv))
+    if (!recovery_elect(store))
         return -1;
-    if (kv_sync(kv) != 0) {
-        p2_release_busy(kv);
+    if (store_sync(store) != 0) {
+        recovery_release_busy(store);
         return -1;
     }
-    uint64_t pending = __atomic_exchange_n(&kv->hdr->garb_freeing, 0,
+    uint64_t pending = __atomic_exchange_n(&store->header->garbage_freeing, 0,
                                            __ATOMIC_ACQ_REL);
     if (pending) {
         fprintf(stderr, "kvspace: previous leader died freeing box %llu: "
                         "leaked\n", (unsigned long long)pending);
     }
-    uint32_t r = __atomic_add_fetch(&kv->hdr->recovery_epoch, 1u,
+    uint32_t epoch = __atomic_add_fetch(&store->header->recovery_epoch, 1u,
                                     __ATOMIC_ACQ_REL);
-    if (!p2_wait_acks(kv, r, p2_barrier_ms())) {
-        p2_release_busy(kv);
+    if (!recovery_wait_acknowledgements(store, epoch, recovery_barrier_milliseconds())) {
+        recovery_release_busy(store);
         return -2;
     }
-    int freed = p2_drain(kv, r);
-    for (int i = 0; i < P2_SLOT_N; i++) {
-        p2_slot_t *s = &kv->hdr->slots[i];
-        uint32_t v = P2_SLOT_MINE;
-        if (__atomic_load_n(&s->state, __ATOMIC_ACQUIRE) != P2_SLOT_MINE)
+    int freed = recovery_drain(store, epoch);
+    for (int i = 0; i < RECOVERY_SLOT_COUNT; i++) {
+        recovery_slot_t *slot = &store->header->slots[i];
+        uint32_t state = RECOVERY_SLOT_MINE;
+        if (__atomic_load_n(&slot->state, __ATOMIC_ACQUIRE) != RECOVERY_SLOT_MINE)
             continue;
-        if (p2_slot_alive(s))
+        if (recovery_slot_alive(slot))
             continue;
-        __atomic_compare_exchange_n(&s->state, &v, P2_SLOT_FREE, false,
+        __atomic_compare_exchange_n(&slot->state, &state, RECOVERY_SLOT_FREE, false,
                                     __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE);
     }
-    p2_release_busy(kv);
+    recovery_release_busy(store);
     return freed;
 #endif
 }
-static void *p2_maint(void *arg) {
-    kvspace_t *kv = arg;
-    while (!__atomic_load_n(&kv->maint_stop, __ATOMIC_ACQUIRE)) {
-        uint32_t seq = __atomic_load_n(&kv->maint_seq, __ATOMIC_ACQUIRE);
-        if (__atomic_load_n(&kv->maint_stop, __ATOMIC_ACQUIRE))
+static void *recovery_maintenance(void *arg) {
+    kvspace_t *store = arg;
+    while (!__atomic_load_n(&store->maintenance_stop, __ATOMIC_ACQUIRE)) {
+        uint32_t sequence = __atomic_load_n(&store->maintenance_sequence, __ATOMIC_ACQUIRE);
+        if (__atomic_load_n(&store->maintenance_stop, __ATOMIC_ACQUIRE))
             break;
-        p2_futex_wait_priv(&kv->maint_seq, seq, 50);
-        if (__atomic_load_n(&kv->maint_stop, __ATOMIC_ACQUIRE))
+        recovery_futex_wait_private(&store->maintenance_sequence, sequence, 50);
+        if (__atomic_load_n(&store->maintenance_stop, __ATOMIC_ACQUIRE))
             break;
-        if (kv->hdr->committed_bytes -
-                __atomic_load_n(&kv->hdr->freed_bytes, __ATOMIC_ACQUIRE) <
-            p2_garb_threshold())
+        if (store->header->committed_bytes -
+                __atomic_load_n(&store->header->freed_bytes, __ATOMIC_ACQUIRE) <
+            recovery_garbage_threshold())
             continue;
-        p2_round(kv);
+        recovery_round(store);
     }
     return NULL;
 }
-static int p2_maint_start(kvspace_t *kv) {
+static int recovery_maintenance_start(kvspace_t *store) {
 #if !defined(__linux__)
-    (void)kv;
+    (void)store;
     return 0;
 #else
-    uint32_t st = 0;
-    if (!__atomic_compare_exchange_n(&kv->maint_started, &st, 1u, false,
+    uint32_t started_state = 0;
+    if (!__atomic_compare_exchange_n(&store->maintenance_started, &started_state, 1u, false,
                                      __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE))
-        return st == 2u ? -1 : 0;
-    if (kv->pid != (uint32_t)getpid()) {
-        __atomic_store_n(&kv->maint_started, 0u, __ATOMIC_RELEASE);
+        return started_state == 2u ? -1 : 0;
+    if (store->process_id != (uint32_t)getpid()) {
+        __atomic_store_n(&store->maintenance_started, 0u, __ATOMIC_RELEASE);
         return 0;
     }
-    if (pthread_create(&kv->maint_thread, NULL, p2_maint, kv) != 0) {
-        __atomic_store_n(&kv->maint_started, 2u, __ATOMIC_RELEASE);
-        kv->reclaim_unavailable = 1;
+    if (pthread_create(&store->maintenance_thread, NULL, recovery_maintenance, store) != 0) {
+        __atomic_store_n(&store->maintenance_started, 2u, __ATOMIC_RELEASE);
+        store->reclaim_unavailable = 1;
         fprintf(stderr, "kvspace: maintenance thread create failed; reclaim "
                         "unavailable (writes hard-fail when the ring is 3/4 "
                         "full)\n");
@@ -826,933 +826,933 @@ static int p2_maint_start(kvspace_t *kv) {
     return 0;
 #endif
 }
-static void p2_maint_stop(kvspace_t *kv) {
-    if (kv->pid != (uint32_t)getpid()) {
-        __atomic_store_n(&kv->maint_started, 0u, __ATOMIC_RELEASE);
+static void recovery_maintenance_stop(kvspace_t *store) {
+    if (store->process_id != (uint32_t)getpid()) {
+        __atomic_store_n(&store->maintenance_started, 0u, __ATOMIC_RELEASE);
         return;
     }
-    if (__atomic_load_n(&kv->maint_started, __ATOMIC_ACQUIRE) != 1u)
+    if (__atomic_load_n(&store->maintenance_started, __ATOMIC_ACQUIRE) != 1u)
         return;
-    __atomic_store_n(&kv->maint_stop, 1, __ATOMIC_RELEASE);
-    __atomic_add_fetch(&kv->maint_seq, 1u, __ATOMIC_RELEASE);
-    p2_futex_wake_priv(&kv->maint_seq);
-    pthread_join(kv->maint_thread, NULL);
-    __atomic_store_n(&kv->maint_started, 0u, __ATOMIC_RELEASE);
+    __atomic_store_n(&store->maintenance_stop, 1, __ATOMIC_RELEASE);
+    __atomic_add_fetch(&store->maintenance_sequence, 1u, __ATOMIC_RELEASE);
+    recovery_futex_wake_private(&store->maintenance_sequence);
+    pthread_join(store->maintenance_thread, NULL);
+    __atomic_store_n(&store->maintenance_started, 0u, __ATOMIC_RELEASE);
 }
-#ifdef P2_TEST_HOOKS
+#ifdef RECOVERY_TEST_HOOKS
 void kvspaceTestSetDataSize(size_t data_size) {
     kvspace_data_size = data_size;
 }
 #endif
-#ifdef P2_TEST_HOOKS
-int64_t kvspaceTestArtAlignCheck(kvspace_t *kv) {
-    if (!kv || !kv->art_meta)
+#ifdef RECOVERY_TEST_HOOKS
+int64_t kvspaceTestArtAlignCheck(kvspace_t *store) {
+    if (!store || !store->adaptive_radix_tree_meta)
         return -2;
-    blocks_meta_t *m = kv->art_meta;
-    if (m->sizeof_block_head != 8)
+    blocks_meta_t *meta = store->adaptive_radix_tree_meta;
+    if (meta->sizeof_block_head != 8)
         return -2;
-    uint64_t stride = (uint64_t)m->sizeof_block_head + m->block_size;
+    uint64_t stride = (uint64_t)meta->sizeof_block_head + meta->block_size;
     if (stride % 8)
         return -2;
-    uint64_t n = m->total_size / stride;
-    for (uint64_t id = 0; id < n; id++) {
-        uint64_t off = blockdata_offset(m, id);
-        uint64_t val = off + offsetof(art_hdr_t, val);
-        if (off % 8 || val % 8 || (val & 63) > 56)
+    uint64_t block_count = meta->total_size / stride;
+    for (uint64_t id = 0; id < block_count; id++) {
+        uint64_t offset = blockdata_offset(meta, id);
+        uint64_t value = offset + offsetof(adaptive_radix_tree_header_t, value);
+        if (offset % 8 || value % 8 || (value & 63) > 56)
             return (int64_t)id;
     }
     return -1;
 }
 #endif
-static int kv_sync(kvspace_t *kv) {
-    if (region_map(&kv->r_art, ART_OFF + (size_t)kv->hdr->art_slab_size) != 0)
+static int store_sync(kvspace_t *store) {
+    if (region_map(&store->region_adaptive_radix_tree, ADAPTIVE_RADIX_TREE_OFFSET + (size_t)store->header->adaptive_radix_tree_slab_size) != 0)
         return -1;
-    if (kv->art_meta->total_size != kv->art_total_seen &&
-        gens_grow(kv) != 0)
+    if (store->adaptive_radix_tree_meta->total_size != store->adaptive_radix_tree_total_seen &&
+        generations_grow(store) != 0)
         return -1;
-    if (region_map(&kv->r_head, (size_t)kv->hdr->sbo_head_size) != 0)
+    if (region_map(&store->region_header, (size_t)store->header->slots_box_head_size) != 0)
         return -1;
-    return region_map(&kv->r_data, (size_t)kv->hdr->sbo_data_size);
+    return region_map(&store->region_data, (size_t)store->header->slots_box_data_size);
 }
-static int art_slab_grow(kvspace_t *kv) {
-    size_t want = (size_t)kv->hdr->art_slab_size * 2;
-    if (ART_OFF + want > kv->r_art.reserve ||
-        ftruncate(kv->r_art.fd, (off_t)(ART_OFF + want)) != 0 ||
-        region_map(&kv->r_art, ART_OFF + want) != 0)
+static int adaptive_radix_tree_slab_grow(kvspace_t *store) {
+    size_t want = (size_t)store->header->adaptive_radix_tree_slab_size * 2;
+    if (ADAPTIVE_RADIX_TREE_OFFSET + want > store->region_adaptive_radix_tree.reserve ||
+        ftruncate(store->region_adaptive_radix_tree.file_descriptor, (off_t)(ADAPTIVE_RADIX_TREE_OFFSET + want)) != 0 ||
+        region_map(&store->region_adaptive_radix_tree, ADAPTIVE_RADIX_TREE_OFFSET + want) != 0)
         return -1;
-    kv->hdr->art_slab_size = want;
-    kv->art_meta->total_size = want;
+    store->header->adaptive_radix_tree_slab_size = want;
+    store->adaptive_radix_tree_meta->total_size = want;
     return 0;
 }
 #ifdef BLOCKMALLOC_COUNT_MASK
-#define BM_MALLOC_BLOCKS(m) blocks_malloc_count(m)
-#define BM_HEAD_SIZE(m) blocks_head_size(m)
+#define BLOCKMALLOC_MALLOC_BLOCKS(metadata) blocks_malloc_count(metadata)
+#define BLOCKMALLOC_HEAD_SIZE(metadata) blocks_head_size(metadata)
 #else
-#define BM_MALLOC_BLOCKS(m) ((uint64_t)(m)->malloc_blocks)
-#define BM_HEAD_SIZE(m) ((uint64_t)(m)->sizeof_block_head)
+#define BLOCKMALLOC_MALLOC_BLOCKS(metadata) ((uint64_t)(metadata)->malloc_blocks)
+#define BLOCKMALLOC_HEAD_SIZE(metadata) ((uint64_t)(metadata)->sizeof_block_head)
 #endif
-static bool sbo_pool_full(sbo_meta_t *m) {
-    blocks_meta_t *p = sbo_pool(m);
-    if (p->free_next_id != -1)
+static bool slots_box_pool_full(sbo_meta_t *meta) {
+    blocks_meta_t *pool = slots_box_pool(meta);
+    if (pool->free_next_id != -1)
         return false;
-    uint64_t next_end = (uint64_t)block_offset(p, BM_MALLOC_BLOCKS(p)) +
-                        BM_HEAD_SIZE(p) + p->block_size;
-    return next_end > p->total_size;
+    uint64_t next_end = (uint64_t)block_offset(pool, BLOCKMALLOC_MALLOC_BLOCKS(pool)) +
+                        BLOCKMALLOC_HEAD_SIZE(pool) + pool->block_size;
+    return next_end > pool->total_size;
 }
-static int sbo_head_grow(kvspace_t *kv) {
-    sbo_meta_t *m = kv->sbo_meta;
-    blocks_meta_t *p = sbo_pool(m);
-    uint64_t stride = p->sizeof_block_head + p->block_size;
-    uint64_t cap = (1ULL << (p->sizeof_block_head == 2 ? 14 : 30)) * stride;
-    uint64_t cur = p->total_size, want = cur * 2;
-    if (want > cap)
-        want = cap;
-    if (SBO_HEAD_FIXED + want > kv->r_head.reserve)
-        want = (kv->r_head.reserve - SBO_HEAD_FIXED) & ~(uint64_t)7;
-    if (want <= cur ||
-        ftruncate(kv->r_head.fd, (off_t)(SBO_HEAD_FIXED + want)) != 0 ||
-        region_map(&kv->r_head, SBO_HEAD_FIXED + (size_t)want) != 0)
+static int slots_box_head_grow(kvspace_t *store) {
+    sbo_meta_t *meta = store->slots_box_meta;
+    blocks_meta_t *pool = slots_box_pool(meta);
+    uint64_t stride = pool->sizeof_block_head + pool->block_size;
+    uint64_t capacity = (1ULL << (pool->sizeof_block_head == 2 ? 14 : 30)) * stride;
+    uint64_t current = pool->total_size, want = current * 2;
+    if (want > capacity)
+        want = capacity;
+    if (SLOTS_BOX_HEAD_FIXED + want > store->region_header.reserve)
+        want = (store->region_header.reserve - SLOTS_BOX_HEAD_FIXED) & ~(uint64_t)7;
+    if (want <= current ||
+        ftruncate(store->region_header.file_descriptor, (off_t)(SLOTS_BOX_HEAD_FIXED + want)) != 0 ||
+        region_map(&store->region_header, SLOTS_BOX_HEAD_FIXED + (size_t)want) != 0)
         return -1;
-    p->total_size = want;
-    m->per_slot_meta = want;
-    m->max_blocks = (uint32_t)(want / m->block_stride);
-    kv->hdr->sbo_head_size = SBO_HEAD_FIXED + want;
+    pool->total_size = want;
+    meta->per_slot_meta = want;
+    meta->max_blocks = (uint32_t)(want / meta->block_stride);
+    store->header->slots_box_head_size = SLOTS_BOX_HEAD_FIXED + want;
     return 0;
 }
-static int sbo_data_grow(kvspace_t *kv) {
-    sbo_meta_t *m = kv->sbo_meta;
-    uint64_t cur = m->data_size, want = cur * 64;
-    if (want > kv->r_data.reserve)
+static int slots_box_data_grow(kvspace_t *store) {
+    sbo_meta_t *meta = store->slots_box_meta;
+    uint64_t current = meta->data_size, want = current * 64;
+    if (want > store->region_data.reserve)
         return -1;
-    if (sbo_pool_full(m) && sbo_head_grow(kv) != 0)
+    if (slots_box_pool_full(meta) && slots_box_head_grow(store) != 0)
         return -1;
-    if (ftruncate(kv->r_data.fd, (off_t)want) != 0 ||
-        region_map(&kv->r_data, (size_t)want) != 0)
+    if (ftruncate(store->region_data.file_descriptor, (off_t)want) != 0 ||
+        region_map(&store->region_data, (size_t)want) != 0)
         return -1;
-    int64_t nid = blocks_alloc(sbo_pool(m), sbo_pmem(m));
-    if (nid < 0)
+    int64_t node_id = blocks_alloc(slots_box_pool(meta), slots_box_pool_memory(meta));
+    if (node_id < 0)
         return -1;
-    sbo_box_t *root = sbo_box(m, 0), *b = sbo_box(m, (int32_t)nid);
-    memcpy(b, root, sizeof *b);
-    b->parent = 0;
-    b->parent_slot = 0;
-    b->self_id = (int32_t)nid;
-    uint64_t mm = root->child_mask;
-    while (mm) {
-        int i = __builtin_ctzll(mm);
-        mm &= mm - 1;
-        sbo_box(m, root->children[i])->parent = (int32_t)nid;
+    sbo_box_t *root = slots_box_box(meta, 0), *box = slots_box_box(meta, (int32_t)node_id);
+    memcpy(box, root, sizeof *box);
+    box->parent = 0;
+    box->parent_slot = 0;
+    box->self_id = (int32_t)node_id;
+    uint64_t child_mask = root->child_mask;
+    while (child_mask) {
+        int i = __builtin_ctzll(child_mask);
+        child_mask &= child_mask - 1;
+        slots_box_box(meta, root->children[i])->parent = (int32_t)node_id;
     }
-    sbo_lock_t *lk = sbo_plock(m);
-    uint8_t old_lvl = b->objlevel;
-    if (old_lvl >= 1 && old_lvl <= 3 && lk->hot_id1[old_lvl - 1] == 1)
-        lk->hot_id1[old_lvl - 1] = (uint32_t)nid + 1;
-    uint8_t lvl = (uint8_t)(old_lvl + 1);
-    sbo_box_format(root, lvl, -1, 255, 0);
+    sbo_lock_t *lock = slots_box_pool_lock(meta);
+    uint8_t old_level = box->objlevel;
+    if (old_level >= 1 && old_level <= 3 && lock->hot_id1[old_level - 1] == 1)
+        lock->hot_id1[old_level - 1] = (uint32_t)node_id + 1;
+    uint8_t level = (uint8_t)(old_level + 1);
+    sbo_box_format(root, level, -1, 255, 0);
     root->free_mask = ~1ULL;
     root->child_mask = 1ULL;
     root->states[0] = SBO_BOX;
-    root->children[0] = (int32_t)nid;
-    uint16_t b_comb = sbo_combined(b);
-    root->child_cap[0] = b_comb;
-    root->child_max_enc = b_comb;
+    root->children[0] = (int32_t)node_id;
+    uint16_t box_combined = sbo_combined(box);
+    root->child_cap[0] = box_combined;
+    root->child_max_enc = box_combined;
     root->child_max_count = 1;
     root->max_obj_cap = SBO_MULT_MAX;
     root->hint_child = 0;
-    m->data_size = want;
-    m->slot_shift = (uint8_t)__builtin_ctzll(want);
-    kv->hdr->sbo_data_size = want;
+    meta->data_size = want;
+    meta->slot_shift = (uint8_t)__builtin_ctzll(want);
+    store->header->slots_box_data_size = want;
     return 0;
 }
-static int kv_sbo_grow(kvspace_t *kv, bool failed, uint64_t *seen_data) {
-    sbo_meta_t *m = kv->sbo_meta;
-    sbo_lock(sbo_plock(m));
-    int rc = 0;
-    if (sbo_pool_full(m))
-        rc = sbo_head_grow(kv);
-    else if (failed && m->data_size == *seen_data)
-        rc = sbo_data_grow(kv);
+static int store_slots_box_grow(kvspace_t *store, bool failed, uint64_t *seen_data) {
+    sbo_meta_t *meta = store->slots_box_meta;
+    sbo_lock(slots_box_pool_lock(meta));
+    int return_code = 0;
+    if (slots_box_pool_full(meta))
+        return_code = slots_box_head_grow(store);
+    else if (failed && meta->data_size == *seen_data)
+        return_code = slots_box_data_grow(store);
     else if (failed)
-        *seen_data = m->data_size;
-    sbo_unlock(sbo_plock(m));
-    return rc;
+        *seen_data = meta->data_size;
+    sbo_unlock(slots_box_pool_lock(meta));
+    return return_code;
 }
-static uint64_t kv_sbo_alloc(kvspace_t *kv, size_t n) {
-    sbo_meta_t *m = kv->sbo_meta;
+static uint64_t store_slots_box_alloc(kvspace_t *store, size_t size) {
+    sbo_meta_t *meta = store->slots_box_meta;
     uint64_t seen_data = 0;
     for (int attempt = 0; attempt < 8; attempt++) {
-        if (attempt && kv_sync(kv) != 0)
+        if (attempt && store_sync(store) != 0)
             return (uint64_t)-1;
-        if (sbo_pool_full(m) && kv_sbo_grow(kv, false, &seen_data) != 0)
+        if (slots_box_pool_full(meta) && store_slots_box_grow(store, false, &seen_data) != 0)
             return (uint64_t)-1;
-        uint64_t off = sbo_alloc(m, n);
-        if (off != (uint64_t)-1)
-            return off;
-        if (kv_sbo_grow(kv, true, &seen_data) != 0)
+        uint64_t offset = sbo_alloc(meta, size);
+        if (offset != (uint64_t)-1)
+            return offset;
+        if (store_slots_box_grow(store, true, &seen_data) != 0)
             return (uint64_t)-1;
     }
     return (uint64_t)-1;
 }
-static void kv_sbo_free(kvspace_t *kv, uint64_t off) {
+static void store_slots_box_free(kvspace_t *store, uint64_t offset) {
 #if defined(__linux__)
-    uint64_t sz = sbo_allocated_size(kv->sbo_meta, off);
-    if (sz >= SBO_PUNCH_MIN) {
-        uint64_t pg = (uint64_t)sysconf(_SC_PAGESIZE);
-        uint64_t a = (off + pg - 1) & ~(pg - 1), b = (off + sz) & ~(pg - 1);
-        if (b > a)
-            (void)fallocate(kv->r_data.fd,
+    uint64_t size = sbo_allocated_size(store->slots_box_meta, offset);
+    if (size >= SLOTS_BOX_PUNCH_MIN) {
+        uint64_t page_size = (uint64_t)sysconf(_SC_PAGESIZE);
+        uint64_t page_start = (offset + page_size - 1) & ~(page_size - 1), page_end = (offset + size) & ~(page_size - 1);
+        if (page_end > page_start)
+            (void)fallocate(store->region_data.file_descriptor,
                             FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE,
-                            (off_t)a, (off_t)(b - a));
+                            (off_t)page_start, (off_t)(page_end - page_start));
     }
 #endif
-    sbo_free(kv->sbo_meta, off);
+    sbo_free(store->slots_box_meta, offset);
 }
-static void *art_blk(kvspace_t *kv, int32_t id) {
+static void *adaptive_radix_tree_block(kvspace_t *store, int32_t id) {
     if (id < 0)
         return NULL;
-    return kv->art_data + blockdata_offset(kv->art_meta, (uint64_t)id);
+    return store->adaptive_radix_tree_data + blockdata_offset(store->adaptive_radix_tree_meta, (uint64_t)id);
 }
 _Static_assert(offsetof(blocks_meta_t, used_blocks) ==
                    offsetof(blocks_meta_t, block_size) + 2 * sizeof(uint64_t),
                "blockmalloc: sizeof_block_head/malloc_blocks must share one u64 word");
 #ifdef BLOCKMALLOC_COUNT_MASK
-static inline void bm_set_malloc_blocks(blocks_meta_t *m, uint64_t n) {
-    blocks_set_malloc_count(m, n);
+static inline void blockmalloc_set_malloc_blocks(blocks_meta_t *meta, uint64_t count) {
+    blocks_set_malloc_count(meta, count);
 }
 #else
-#define BM_WORD_OFF (offsetof(blocks_meta_t, block_size) + sizeof(uint64_t))
-static unsigned bm_count_shift(void) {
-    blocks_meta_t t;
-    memset(&t, 0, sizeof t);
-    t.malloc_blocks = 1;
-    uint64_t w;
-    memcpy(&w, (const char *)&t + BM_WORD_OFF, sizeof w);
-    return w ? (unsigned)__builtin_ctzll(w) : 64u;
+#define BLOCKMALLOC_WORD_OFFSET (offsetof(blocks_meta_t, block_size) + sizeof(uint64_t))
+static unsigned blockmalloc_count_shift(void) {
+    blocks_meta_t metadata;
+    memset(&metadata, 0, sizeof metadata);
+    metadata.malloc_blocks = 1;
+    uint64_t word;
+    memcpy(&word, (const char *)&metadata + BLOCKMALLOC_WORD_OFFSET, sizeof word);
+    return word ? (unsigned)__builtin_ctzll(word) : 64u;
 }
-static void bm_set_malloc_blocks(blocks_meta_t *m, uint64_t n) {
-    uint64_t *w = (uint64_t *)((char *)m + BM_WORD_OFF);
-    const unsigned sh = bm_count_shift();
-    const uint64_t mask = ((1ULL << 60) - 1) << sh;
-    uint64_t old = __atomic_load_n(w, __ATOMIC_RELAXED);
-    __atomic_store_n(w, (old & ~mask) | ((n << sh) & mask), __ATOMIC_RELEASE);
+static void blockmalloc_set_malloc_blocks(blocks_meta_t *meta, uint64_t count) {
+    uint64_t *word = (uint64_t *)((char *)meta + BLOCKMALLOC_WORD_OFFSET);
+    const unsigned shift = blockmalloc_count_shift();
+    const uint64_t mask = ((1ULL << 60) - 1) << shift;
+    uint64_t old = __atomic_load_n(word, __ATOMIC_RELAXED);
+    __atomic_store_n(word, (old & ~mask) | ((count << shift) & mask), __ATOMIC_RELEASE);
 }
 #endif
-static bool bm_layout_ok(void) {
-    blocks_meta_t t;
-    memset(&t, 0, sizeof t);
-    t.sizeof_block_head = 8;
-    t.malloc_blocks = 5;
-    t.used_blocks = 7;
-    bm_set_malloc_blocks(&t, 0x0123456789ABCDEull);
-    return t.sizeof_block_head == 8 && t.malloc_blocks == 0x0123456789ABCDEull &&
-           t.block_size == 0 && t.used_blocks == 7;
+static bool blockmalloc_layout_ok(void) {
+    blocks_meta_t metadata;
+    memset(&metadata, 0, sizeof metadata);
+    metadata.sizeof_block_head = 8;
+    metadata.malloc_blocks = 5;
+    metadata.used_blocks = 7;
+    blockmalloc_set_malloc_blocks(&metadata, 0x0123456789ABCDEull);
+    return metadata.sizeof_block_head == 8 && metadata.malloc_blocks == 0x0123456789ABCDEull &&
+           metadata.block_size == 0 && metadata.used_blocks == 7;
 }
-static int64_t art_bump(kvspace_t *kv, uint32_t k) {
-    blocks_meta_t *m = kv->art_meta;
-    spin_lock(&m->lock);
-    uint64_t id = BM_MALLOC_BLOCKS(m);
-    if ((uint64_t)block_offset(m, id + k) > m->total_size) {
-        spin_unlock(&m->lock);
+static int64_t adaptive_radix_tree_bump(kvspace_t *store, uint32_t block_count) {
+    blocks_meta_t *meta = store->adaptive_radix_tree_meta;
+    spin_lock(&meta->lock);
+    uint64_t id = BLOCKMALLOC_MALLOC_BLOCKS(meta);
+    if ((uint64_t)block_offset(meta, id + block_count) > meta->total_size) {
+        spin_unlock(&meta->lock);
         return -1;
     }
-    setblock_t(m, kv->art_data + block_offset(m, id), 1, -1);
-    bm_set_malloc_blocks(m, id + k);
-    m->used_blocks += k;
-    spin_unlock(&m->lock);
+    setblock_t(meta, store->adaptive_radix_tree_data + block_offset(meta, id), 1, -1);
+    blockmalloc_set_malloc_blocks(meta, id + block_count);
+    meta->used_blocks += block_count;
+    spin_unlock(&meta->lock);
     return (int64_t)id;
 }
-static int32_t art_balloc(kvspace_t *kv, int t) {
-    const uint64_t head = BM_HEAD_SIZE(kv->art_meta);
-    const uint64_t stride = head + kv->art_meta->block_size;
-    const uint32_t k = (uint32_t)(((uint64_t)art_node_sz(t) +
+static int32_t adaptive_radix_tree_block_alloc(kvspace_t *store, int node_type) {
+    const uint64_t head = BLOCKMALLOC_HEAD_SIZE(store->adaptive_radix_tree_meta);
+    const uint64_t stride = head + store->adaptive_radix_tree_meta->block_size;
+    const uint32_t block_count = (uint32_t)(((uint64_t)adaptive_radix_tree_node_size(node_type) +
                                    head + stride - 1) /
                                   stride);
-    int64_t id = art_bump(kv, k);
+    int64_t id = adaptive_radix_tree_bump(store, block_count);
     while (id < 0) {
-        if (art_slab_grow(kv) != 0 || gens_grow(kv) != 0)
+        if (adaptive_radix_tree_slab_grow(store) != 0 || generations_grow(store) != 0)
             return -1;
-        id = art_bump(kv, k);
+        id = adaptive_radix_tree_bump(store, block_count);
     }
     if (id >= 0) {
-        kv_gens_t *g = gens_at(kv, (int32_t)id);
-        if (g) {
-            __atomic_store_n(&g->struct_gen,
-                             (uint32_t)gen_alloc_epoch(kv), __ATOMIC_RELEASE);
-            __atomic_store_n(&g->value_gen, 0u, __ATOMIC_RELEASE);
+        generations_t *generations = generations_at(store, (int32_t)id);
+        if (generations) {
+            __atomic_store_n(&generations->struct_generation,
+                             (uint32_t)generation_alloc_epoch(store), __ATOMIC_RELEASE);
+            __atomic_store_n(&generations->value_generation, 0u, __ATOMIC_RELEASE);
         }
     }
     return (int32_t)id;
 }
-static art_hdr_t *art_hdr(kvspace_t *kv, int32_t id) {
-    return (art_hdr_t *)art_blk(kv, id);
+static adaptive_radix_tree_header_t *adaptive_radix_tree_header(kvspace_t *store, int32_t id) {
+    return (adaptive_radix_tree_header_t *)adaptive_radix_tree_block(store, id);
 }
-static int pfx_shared(const uint8_t *a, int al, const uint8_t *b, int bl) {
-    int n = al < bl ? al : bl;
-    for (int i = 0; i < n; i++)
-        if (a[i] != b[i])
+static int shared_prefix_length(const uint8_t *left, int left_length, const uint8_t *right, int right_length) {
+    int common_length = left_length < right_length ? left_length : right_length;
+    for (int i = 0; i < common_length; i++)
+        if (left[i] != right[i])
             return i;
-    return n;
+    return common_length;
 }
-static int32_t art_child(kvspace_t *kv, void *n, uint8_t b) {
-    art_hdr_t *h = (art_hdr_t *)n;
-    switch (h->type) {
-    case ART_N4: {
-        art_n4_t *x = n;
-        for (int i = 0; i < (int)h->count; i++)
-            if (x->keys[i] == b)
-                return x->children[i];
+static int32_t adaptive_radix_tree_child(kvspace_t *store, void *node, uint8_t byte) {
+    adaptive_radix_tree_header_t *node_header = (adaptive_radix_tree_header_t *)node;
+    switch (node_header->type) {
+    case ADAPTIVE_RADIX_TREE_N4: {
+        adaptive_radix_tree_node4_t *node_data = node;
+        for (int i = 0; i < (int)node_header->count; i++)
+            if (node_data->keys[i] == byte)
+                return node_data->children[i];
         return -1;
     }
-    case ART_N16: {
-        art_n16_t *x = n;
-        int lo = 0, hi = (int)h->count - 1;
-        while (lo <= hi) {
-            int m = (lo + hi) / 2;
-            if (x->keys[m] == b)
-                return x->children[m];
-            if (x->keys[m] < b)
-                lo = m + 1;
+    case ADAPTIVE_RADIX_TREE_N16: {
+        adaptive_radix_tree_node16_t *node_data = node;
+        int low = 0, high = (int)node_header->count - 1;
+        while (low <= high) {
+            int middle = (low + high) / 2;
+            if (node_data->keys[middle] == byte)
+                return node_data->children[middle];
+            if (node_data->keys[middle] < byte)
+                low = middle + 1;
             else
-                hi = m - 1;
+                high = middle - 1;
         }
         return -1;
     }
-    case ART_N48: {
-        art_n48_t *x = n;
-        uint8_t idx = x->index[b];
-        return idx == 255 ? -1 : x->children[idx];
+    case ADAPTIVE_RADIX_TREE_N48: {
+        adaptive_radix_tree_node48_t *node_data = node;
+        uint8_t index = node_data->index[byte];
+        return index == 255 ? -1 : node_data->children[index];
     }
-    case ART_N256: {
-        return ((art_n256_t *)n)->children[b];
+    case ADAPTIVE_RADIX_TREE_N256: {
+        return ((adaptive_radix_tree_node256_t *)node)->children[byte];
     }
     }
     return -1;
 }
-static int32_t art_follow(kvspace_t *kv, int32_t id);
-static int32_t art_walk(kvspace_t *kv, int32_t nid, const uint8_t *key, int klen,
-                        int d, int32_t *par, int *pard) {
-    while (nid >= 0) {
-        art_hdr_t *h = art_hdr(kv, nid);
-        if (!h || h->type == ART_MOVED)
+static int32_t adaptive_radix_tree_follow(kvspace_t *store, int32_t id);
+static int32_t adaptive_radix_tree_walk(kvspace_t *store, int32_t node_id, const uint8_t *key, int key_length,
+                        int depth, int32_t *out_parent, int *out_parent_depth) {
+    while (node_id >= 0) {
+        adaptive_radix_tree_header_t *node_header = adaptive_radix_tree_header(store, node_id);
+        if (!node_header || node_header->type == ADAPTIVE_RADIX_TREE_MOVED)
             return -1;
-        if (h->prefix_len) {
-            if (pfx_shared(h->prefix, h->prefix_len, key + d, klen - d) !=
-                h->prefix_len)
+        if (node_header->prefix_len) {
+            if (shared_prefix_length(node_header->prefix, node_header->prefix_len, key + depth, key_length - depth) !=
+                node_header->prefix_len)
                 return -1;
-            d += h->prefix_len;
+            depth += node_header->prefix_len;
         }
-        if (d == klen)
-            return AV_HAS(art_val_load(h)) ? nid : -1;
-        if (par)
-            *par = nid;
-        if (pard)
-            *pard = d;
-        nid = art_child(kv, h, key[d]);
-        d++;
+        if (depth == key_length)
+            return ADAPTIVE_RADIX_TREE_VALUE_HAS(adaptive_radix_tree_value_load(node_header)) ? node_id : -1;
+        if (out_parent)
+            *out_parent = node_id;
+        if (out_parent_depth)
+            *out_parent_depth = depth;
+        node_id = adaptive_radix_tree_child(store, node_header, key[depth]);
+        depth++;
     }
     return -1;
 }
-static int32_t art_find2(kvspace_t *kv, int32_t nid, const uint8_t *key, int klen,
-                         int32_t *par, int *pard) {
-    if (nid < 0 || !key)
+static int32_t adaptive_radix_tree_find_with_parent(kvspace_t *store, int32_t node_id, const uint8_t *key, int key_length,
+                         int32_t *out_parent, int *out_parent_depth) {
+    if (node_id < 0 || !key)
         return -1;
     int32_t parent = -1;
-    int parent_d = 0;
-    int32_t id = art_walk(kv, nid, key, klen, 0, &parent, &parent_d);
-    if (par)
-        *par = parent;
-    if (pard)
-        *pard = parent_d;
+    int parent_depth = 0;
+    int32_t id = adaptive_radix_tree_walk(store, node_id, key, key_length, 0, &parent, &parent_depth);
+    if (out_parent)
+        *out_parent = parent;
+    if (out_parent_depth)
+        *out_parent_depth = parent_depth;
     return id;
 }
-static int32_t art_find(kvspace_t *kv, int32_t nid, const uint8_t *key,
-                        int klen) {
-    return art_find2(kv, nid, key, klen, NULL, NULL);
+static int32_t adaptive_radix_tree_find(kvspace_t *store, int32_t node_id, const uint8_t *key,
+                        int key_length) {
+    return adaptive_radix_tree_find_with_parent(store, node_id, key, key_length, NULL, NULL);
 }
-static art_hdr_t *art_search(kvspace_t *kv, int32_t nid, const uint8_t *key,
-                             int klen) {
-    int32_t id = art_find(kv, nid, key, klen);
-    return id < 0 ? NULL : art_hdr(kv, id);
+static adaptive_radix_tree_header_t *adaptive_radix_tree_search(kvspace_t *store, int32_t node_id, const uint8_t *key,
+                             int key_length) {
+    int32_t id = adaptive_radix_tree_find(store, node_id, key, key_length);
+    return id < 0 ? NULL : adaptive_radix_tree_header(store, id);
 }
-static int32_t art_follow(kvspace_t *kv, int32_t id) {
+static int32_t adaptive_radix_tree_follow(kvspace_t *store, int32_t id) {
     for (int i = 0; i < 8 && id >= 0; i++) {
-        art_hdr_t *h = art_hdr(kv, id);
-        if (!h)
+        adaptive_radix_tree_header_t *node_header = adaptive_radix_tree_header(store, id);
+        if (!node_header)
             return -1;
-        if (h->type != ART_MOVED)
+        if (node_header->type != ADAPTIVE_RADIX_TREE_MOVED)
             return id;
-        id = (int32_t)AV_OFF(art_val_load(h));
+        id = (int32_t)ADAPTIVE_RADIX_TREE_VALUE_OFFSET(adaptive_radix_tree_value_load(node_header));
     }
     return -1;
 }
-static int32_t art_new_leaf(kvspace_t *kv, uint64_t off) {
-    int32_t id = art_balloc(kv, ART_N4);
+static int32_t adaptive_radix_tree_new_leaf(kvspace_t *store, uint64_t offset) {
+    int32_t id = adaptive_radix_tree_block_alloc(store, ADAPTIVE_RADIX_TREE_N4);
     if (id < 0)
         return -1;
-    art_n4_t *x = art_blk(kv, id);
-    memset(x, 0, sizeof(*x));
-    x->h.type = ART_N4;
-    art_val_store(&x->h, AV_MAKE(1, off));
+    adaptive_radix_tree_node4_t *node_data = adaptive_radix_tree_block(store, id);
+    memset(node_data, 0, sizeof(*node_data));
+    node_data->header.type = ADAPTIVE_RADIX_TREE_N4;
+    adaptive_radix_tree_value_store(&node_data->header, ADAPTIVE_RADIX_TREE_VALUE_MAKE(1, offset));
     return id;
 }
-static int32_t art_new_node(kvspace_t *kv, int t) {
-    int32_t id = art_balloc(kv, t);
+static int32_t adaptive_radix_tree_new_node(kvspace_t *store, int node_type) {
+    int32_t id = adaptive_radix_tree_block_alloc(store, node_type);
     if (id < 0)
         return -1;
-    void *x = art_blk(kv, id);
-    int sz = art_node_sz(t);
-    memset(x, 0, sz);
-    ((art_hdr_t *)x)->type = (uint8_t)t;
-    if (t == ART_N48)
-        memset(((art_n48_t *)x)->index, 255, 256);
-    if (t == ART_N256) {
-        art_n256_t *n = x;
+    void *node_data = adaptive_radix_tree_block(store, id);
+    int size = adaptive_radix_tree_node_size(node_type);
+    memset(node_data, 0, size);
+    ((adaptive_radix_tree_header_t *)node_data)->type = (uint8_t)node_type;
+    if (node_type == ADAPTIVE_RADIX_TREE_N48)
+        memset(((adaptive_radix_tree_node48_t *)node_data)->index, 255, 256);
+    if (node_type == ADAPTIVE_RADIX_TREE_N256) {
+        adaptive_radix_tree_node256_t *node256 = node_data;
         for (int i = 0; i < 256; i++)
-            n->children[i] = -1;
+            node256->children[i] = -1;
     }
     return id;
 }
-static int32_t art_grow(kvspace_t *kv, void *on) {
-    art_hdr_t *oh = on;
-    int nt;
-    if (oh->type == ART_N4)
-        nt = ART_N16;
-    else if (oh->type == ART_N16)
-        nt = ART_N48;
-    else if (oh->type == ART_N48)
-        nt = ART_N256;
+static int32_t adaptive_radix_tree_grow(kvspace_t *store, void *old_node) {
+    adaptive_radix_tree_header_t *old_header = old_node;
+    int new_type;
+    if (old_header->type == ADAPTIVE_RADIX_TREE_N4)
+        new_type = ADAPTIVE_RADIX_TREE_N16;
+    else if (old_header->type == ADAPTIVE_RADIX_TREE_N16)
+        new_type = ADAPTIVE_RADIX_TREE_N48;
+    else if (old_header->type == ADAPTIVE_RADIX_TREE_N48)
+        new_type = ADAPTIVE_RADIX_TREE_N256;
     else
         return -1;
-    int32_t nid = art_new_node(kv, nt);
-    if (nid < 0)
+    int32_t node_id = adaptive_radix_tree_new_node(store, new_type);
+    if (node_id < 0)
         return -1;
-    art_hdr_t *nh = art_hdr(kv, nid);
-    nh->prefix_len = oh->prefix_len;
-    memcpy(nh->prefix, oh->prefix, oh->prefix_len);
-    art_val_store(nh, art_val_load(oh));
-    for (int i = 0; i < (int)oh->count; i++) {
-        uint8_t b = 0;
-        int32_t c = -1;
-        switch (oh->type) {
-        case ART_N4: {
-            art_n4_t *x = on;
-            b = x->keys[i];
-            c = x->children[i];
+    adaptive_radix_tree_header_t *new_header = adaptive_radix_tree_header(store, node_id);
+    new_header->prefix_len = old_header->prefix_len;
+    memcpy(new_header->prefix, old_header->prefix, old_header->prefix_len);
+    adaptive_radix_tree_value_store(new_header, adaptive_radix_tree_value_load(old_header));
+    for (int i = 0; i < (int)old_header->count; i++) {
+        uint8_t byte = 0;
+        int32_t child_id = -1;
+        switch (old_header->type) {
+        case ADAPTIVE_RADIX_TREE_N4: {
+            adaptive_radix_tree_node4_t *node_data = old_node;
+            byte = node_data->keys[i];
+            child_id = node_data->children[i];
             break;
         }
-        case ART_N16: {
-            art_n16_t *x = on;
-            b = x->keys[i];
-            c = x->children[i];
+        case ADAPTIVE_RADIX_TREE_N16: {
+            adaptive_radix_tree_node16_t *node_data = old_node;
+            byte = node_data->keys[i];
+            child_id = node_data->children[i];
             break;
         }
-        case ART_N48: {
-            art_n48_t *x = on;
-            c = x->children[i];
+        case ADAPTIVE_RADIX_TREE_N48: {
+            adaptive_radix_tree_node48_t *node_data = old_node;
+            child_id = node_data->children[i];
             for (int j = 0; j < 256; j++)
-                if (x->index[j] == i) {
-                    b = (uint8_t)j;
+                if (node_data->index[j] == i) {
+                    byte = (uint8_t)j;
                     break;
                 }
             break;
         }
         }
-        switch (nt) {
-        case ART_N16: {
-            art_n16_t *x = (art_n16_t *)nh;
-            x->keys[i] = b;
-            x->children[i] = c;
+        switch (new_type) {
+        case ADAPTIVE_RADIX_TREE_N16: {
+            adaptive_radix_tree_node16_t *node_data = (adaptive_radix_tree_node16_t *)new_header;
+            node_data->keys[i] = byte;
+            node_data->children[i] = child_id;
             break;
         }
-        case ART_N48: {
-            art_n48_t *x = (art_n48_t *)nh;
-            x->index[b] = (uint8_t)i;
-            x->children[i] = c;
+        case ADAPTIVE_RADIX_TREE_N48: {
+            adaptive_radix_tree_node48_t *node_data = (adaptive_radix_tree_node48_t *)new_header;
+            node_data->index[byte] = (uint8_t)i;
+            node_data->children[i] = child_id;
             break;
         }
-        case ART_N256: {
-            ((art_n256_t *)nh)->children[b] = c;
+        case ADAPTIVE_RADIX_TREE_N256: {
+            ((adaptive_radix_tree_node256_t *)new_header)->children[byte] = child_id;
             break;
         }
         }
     }
-    nh->count = oh->count;
-    if (nt == ART_N16) {
-        art_n16_t *x = (art_n16_t *)nh;
-        for (int i = 0; i < (int)nh->count - 1; i++)
-            for (int j = i + 1; j < (int)nh->count; j++)
-                if (x->keys[i] > x->keys[j]) {
-                    uint8_t tk = x->keys[i];
-                    x->keys[i] = x->keys[j];
-                    x->keys[j] = tk;
-                    int32_t tc = x->children[i];
-                    x->children[i] = x->children[j];
-                    x->children[j] = tc;
+    new_header->count = old_header->count;
+    if (new_type == ADAPTIVE_RADIX_TREE_N16) {
+        adaptive_radix_tree_node16_t *node_data = (adaptive_radix_tree_node16_t *)new_header;
+        for (int i = 0; i < (int)new_header->count - 1; i++)
+            for (int j = i + 1; j < (int)new_header->count; j++)
+                if (node_data->keys[i] > node_data->keys[j]) {
+                    uint8_t temporary_key = node_data->keys[i];
+                    node_data->keys[i] = node_data->keys[j];
+                    node_data->keys[j] = temporary_key;
+                    int32_t temporary_child = node_data->children[i];
+                    node_data->children[i] = node_data->children[j];
+                    node_data->children[j] = temporary_child;
                 }
     }
     {
-        int32_t oid = art_id_of(kv, oh);
-        gen_bump_struct(kv, nid);
-        gen_bump_struct(kv, oid);
+        int32_t old_id = adaptive_radix_tree_id_of(store, old_header);
+        generation_bump_struct(store, node_id);
+        generation_bump_struct(store, old_id);
     }
-    oh->type = ART_MOVED;
-    art_val_store(oh, AV_MAKE(0, (uint32_t)nid));
-    return nid;
+    old_header->type = ADAPTIVE_RADIX_TREE_MOVED;
+    adaptive_radix_tree_value_store(old_header, ADAPTIVE_RADIX_TREE_VALUE_MAKE(0, (uint32_t)node_id));
+    return node_id;
 }
-static int art_add(kvspace_t *kv, void *n, uint8_t b, int32_t cid) {
-    gen_bump_struct(kv, art_id_of(kv, n));
-    art_hdr_t *h = n;
-    switch (h->type) {
-    case ART_N4: {
-        if (h->count >= 4)
+static int adaptive_radix_tree_add(kvspace_t *store, void *node, uint8_t byte, int32_t child_id) {
+    generation_bump_struct(store, adaptive_radix_tree_id_of(store, node));
+    adaptive_radix_tree_header_t *node_header = node;
+    switch (node_header->type) {
+    case ADAPTIVE_RADIX_TREE_N4: {
+        if (node_header->count >= 4)
             return -1;
-        art_n4_t *x = n;
-        x->keys[h->count] = b;
-        x->children[h->count] = cid;
-        h->count++;
+        adaptive_radix_tree_node4_t *node_data = node;
+        node_data->keys[node_header->count] = byte;
+        node_data->children[node_header->count] = child_id;
+        node_header->count++;
         return 0;
     }
-    case ART_N16: {
-        if (h->count >= 16)
+    case ADAPTIVE_RADIX_TREE_N16: {
+        if (node_header->count >= 16)
             return -1;
-        art_n16_t *x = n;
-        int p = (int)h->count;
-        while (p > 0 && x->keys[p - 1] > b) {
-            x->keys[p] = x->keys[p - 1];
-            x->children[p] = x->children[p - 1];
-            p--;
+        adaptive_radix_tree_node16_t *node_data = node;
+        int position = (int)node_header->count;
+        while (position > 0 && node_data->keys[position - 1] > byte) {
+            node_data->keys[position] = node_data->keys[position - 1];
+            node_data->children[position] = node_data->children[position - 1];
+            position--;
         }
-        x->keys[p] = b;
-        x->children[p] = cid;
-        h->count++;
+        node_data->keys[position] = byte;
+        node_data->children[position] = child_id;
+        node_header->count++;
         return 0;
     }
-    case ART_N48: {
-        if (h->count >= 48)
+    case ADAPTIVE_RADIX_TREE_N48: {
+        if (node_header->count >= 48)
             return -1;
-        art_n48_t *x = n;
-        int s = (int)h->count;
-        x->index[b] = (uint8_t)s;
-        x->children[s] = cid;
-        h->count++;
+        adaptive_radix_tree_node48_t *node_data = node;
+        int slot = (int)node_header->count;
+        node_data->index[byte] = (uint8_t)slot;
+        node_data->children[slot] = child_id;
+        node_header->count++;
         return 0;
     }
-    case ART_N256: {
-        art_n256_t *x = n;
-        if (x->children[b] >= 0)
+    case ADAPTIVE_RADIX_TREE_N256: {
+        adaptive_radix_tree_node256_t *node_data = node;
+        if (node_data->children[byte] >= 0)
             return -1;
-        x->children[b] = cid;
-        h->count++;
+        node_data->children[byte] = child_id;
+        node_header->count++;
         return 0;
     }
     }
     return -1;
 }
-static void art_rm(kvspace_t *kv, void *n, uint8_t b) {
-    art_hdr_t *h = n;
-    switch (h->type) {
-    case ART_N4: {
-        art_n4_t *x = n;
-        for (int i = 0; i < (int)h->count; i++)
-            if (x->keys[i] == b) {
-                for (int j = i; j < (int)h->count - 1; j++) {
-                    x->keys[j] = x->keys[j + 1];
-                    x->children[j] = x->children[j + 1];
+static void adaptive_radix_tree_remove(kvspace_t *store, void *node, uint8_t byte) {
+    adaptive_radix_tree_header_t *node_header = node;
+    switch (node_header->type) {
+    case ADAPTIVE_RADIX_TREE_N4: {
+        adaptive_radix_tree_node4_t *node_data = node;
+        for (int i = 0; i < (int)node_header->count; i++)
+            if (node_data->keys[i] == byte) {
+                for (int j = i; j < (int)node_header->count - 1; j++) {
+                    node_data->keys[j] = node_data->keys[j + 1];
+                    node_data->children[j] = node_data->children[j + 1];
                 }
-                h->count--;
+                node_header->count--;
                 return;
             }
         break;
     }
-    case ART_N16: {
-        art_n16_t *x = n;
-        int lo = 0, hi = (int)h->count - 1, pos = -1;
-        while (lo <= hi) {
-            int m = (lo + hi) / 2;
-            if (x->keys[m] == b) {
-                pos = m;
+    case ADAPTIVE_RADIX_TREE_N16: {
+        adaptive_radix_tree_node16_t *node_data = node;
+        int low = 0, high = (int)node_header->count - 1, position = -1;
+        while (low <= high) {
+            int middle = (low + high) / 2;
+            if (node_data->keys[middle] == byte) {
+                position = middle;
                 break;
             }
-            if (x->keys[m] < b)
-                lo = m + 1;
+            if (node_data->keys[middle] < byte)
+                low = middle + 1;
             else
-                hi = m - 1;
+                high = middle - 1;
         }
-        if (pos < 0)
+        if (position < 0)
             return;
-        for (int j = pos; j < (int)h->count - 1; j++) {
-            x->keys[j] = x->keys[j + 1];
-            x->children[j] = x->children[j + 1];
+        for (int j = position; j < (int)node_header->count - 1; j++) {
+            node_data->keys[j] = node_data->keys[j + 1];
+            node_data->children[j] = node_data->children[j + 1];
         }
-        h->count--;
+        node_header->count--;
         break;
     }
-    case ART_N48: {
-        art_n48_t *x = n;
-        uint8_t idx = x->index[b];
-        if (idx == 255)
+    case ADAPTIVE_RADIX_TREE_N48: {
+        adaptive_radix_tree_node48_t *node_data = node;
+        uint8_t index = node_data->index[byte];
+        if (index == 255)
             return;
-        x->index[b] = 255;
-        int last = (int)h->count - 1;
-        if (idx != last) {
-            x->children[idx] = x->children[last];
+        node_data->index[byte] = 255;
+        int last = (int)node_header->count - 1;
+        if (index != last) {
+            node_data->children[index] = node_data->children[last];
             for (int j = 0; j < 256; j++)
-                if (x->index[j] == last) {
-                    x->index[j] = idx;
+                if (node_data->index[j] == last) {
+                    node_data->index[j] = index;
                     break;
                 }
         }
-        h->count--;
+        node_header->count--;
         break;
     }
-    case ART_N256: {
-        art_n256_t *x = n;
-        x->children[b] = -1;
-        h->count--;
+    case ADAPTIVE_RADIX_TREE_N256: {
+        adaptive_radix_tree_node256_t *node_data = node;
+        node_data->children[byte] = -1;
+        node_header->count--;
         break;
     }
     }
 }
-static int32_t art_leaf_chain(kvspace_t *kv, const uint8_t *key, int klen,
-                              int d, uint64_t off) {
-    int rem = klen - d;
-    if (rem <= ART_PREFIX_MAX) {
-        int32_t id = art_new_leaf(kv, off);
+static int32_t adaptive_radix_tree_leaf_chain(kvspace_t *store, const uint8_t *key, int key_length,
+                              int depth, uint64_t offset) {
+    int remaining = key_length - depth;
+    if (remaining <= ADAPTIVE_RADIX_TREE_PREFIX_MAX) {
+        int32_t id = adaptive_radix_tree_new_leaf(store, offset);
         if (id < 0)
             return -1;
-        art_n4_t *x = art_blk(kv, id);
-        if (rem > 0)
-            memcpy(x->h.prefix, key + d, (size_t)rem);
-        x->h.prefix_len = (uint8_t)rem;
+        adaptive_radix_tree_node4_t *node_data = adaptive_radix_tree_block(store, id);
+        if (remaining > 0)
+            memcpy(node_data->header.prefix, key + depth, (size_t)remaining);
+        node_data->header.prefix_len = (uint8_t)remaining;
         return id;
     }
-    int32_t id = art_new_node(kv, ART_N4);
+    int32_t id = adaptive_radix_tree_new_node(store, ADAPTIVE_RADIX_TREE_N4);
     if (id < 0)
         return -1;
-    art_hdr_t *x = art_hdr(kv, id);
-    memcpy(x->prefix, key + d, ART_PREFIX_MAX);
-    x->prefix_len = ART_PREFIX_MAX;
-    int32_t sub = art_leaf_chain(kv, key, klen, d + ART_PREFIX_MAX + 1, off);
-    if (sub < 0)
+    adaptive_radix_tree_header_t *node_data = adaptive_radix_tree_header(store, id);
+    memcpy(node_data->prefix, key + depth, ADAPTIVE_RADIX_TREE_PREFIX_MAX);
+    node_data->prefix_len = ADAPTIVE_RADIX_TREE_PREFIX_MAX;
+    int32_t subtree_node = adaptive_radix_tree_leaf_chain(store, key, key_length, depth + ADAPTIVE_RADIX_TREE_PREFIX_MAX + 1, offset);
+    if (subtree_node < 0)
         return -1;
-    art_add(kv, x, key[d + ART_PREFIX_MAX], sub);
+    adaptive_radix_tree_add(store, node_data, key[depth + ADAPTIVE_RADIX_TREE_PREFIX_MAX], subtree_node);
     return id;
 }
-static int32_t art_ins(kvspace_t *kv, int32_t nid, const uint8_t *key, int klen,
-                       int d, uint64_t off) {
-    if (nid < 0)
-        return art_leaf_chain(kv, key, klen, d, off);
-    art_hdr_t *h = art_hdr(kv, nid);
-    if (!h)
+static int32_t adaptive_radix_tree_insert(kvspace_t *store, int32_t node_id, const uint8_t *key, int key_length,
+                       int depth, uint64_t offset) {
+    if (node_id < 0)
+        return adaptive_radix_tree_leaf_chain(store, key, key_length, depth, offset);
+    adaptive_radix_tree_header_t *node_header = adaptive_radix_tree_header(store, node_id);
+    if (!node_header)
         return -1;
-    int shared = pfx_shared(h->prefix, h->prefix_len, key + d, klen - d);
-    int mpl = h->prefix_len < (klen - d) ? h->prefix_len : (klen - d);
-    if (shared == mpl && (klen - d) < h->prefix_len) {
-        int32_t nn = art_new_node(kv, ART_N4);
-        if (nn < 0)
+    int shared = shared_prefix_length(node_header->prefix, node_header->prefix_len, key + depth, key_length - depth);
+    int minimum_prefix_length = node_header->prefix_len < (key_length - depth) ? node_header->prefix_len : (key_length - depth);
+    if (shared == minimum_prefix_length && (key_length - depth) < node_header->prefix_len) {
+        int32_t new_node = adaptive_radix_tree_new_node(store, ADAPTIVE_RADIX_TREE_N4);
+        if (new_node < 0)
             return -1;
-        art_hdr_t *nh = art_hdr(kv, nn);
-        nh->prefix_len = (uint8_t)shared;
+        adaptive_radix_tree_header_t *new_header = adaptive_radix_tree_header(store, new_node);
+        new_header->prefix_len = (uint8_t)shared;
         if (shared > 0)
-            memcpy(nh->prefix, key + d, (size_t)shared);
-        uint8_t ob = h->prefix[shared];
-        h->prefix_len -= (uint8_t)(shared + 1);
-        if (h->prefix_len > 0)
-            memmove(h->prefix, h->prefix + shared + 1, h->prefix_len);
-        art_add(kv, nh, ob, nid);
-        art_val_store(nh, AV_MAKE(1, off));
-        return nn;
+            memcpy(new_header->prefix, key + depth, (size_t)shared);
+        uint8_t old_byte = node_header->prefix[shared];
+        node_header->prefix_len -= (uint8_t)(shared + 1);
+        if (node_header->prefix_len > 0)
+            memmove(node_header->prefix, node_header->prefix + shared + 1, node_header->prefix_len);
+        adaptive_radix_tree_add(store, new_header, old_byte, node_id);
+        adaptive_radix_tree_value_store(new_header, ADAPTIVE_RADIX_TREE_VALUE_MAKE(1, offset));
+        return new_node;
     }
-    if (shared < mpl) {
-        int32_t nn = art_new_node(kv, ART_N4);
-        if (nn < 0)
+    if (shared < minimum_prefix_length) {
+        int32_t new_node = adaptive_radix_tree_new_node(store, ADAPTIVE_RADIX_TREE_N4);
+        if (new_node < 0)
             return -1;
-        art_hdr_t *nh = art_hdr(kv, nn);
-        nh->prefix_len = (uint8_t)shared;
-        memcpy(nh->prefix, key + d, shared);
-        uint8_t ob = h->prefix[shared];
-        h->prefix_len -= (uint8_t)(shared + 1);
-        if (h->prefix_len > 0)
-            memmove(h->prefix, h->prefix + shared + 1, h->prefix_len);
-        art_add(kv, nh, ob, nid);
-        int32_t leaf = art_leaf_chain(kv, key, klen, d + shared + 1, off);
+        adaptive_radix_tree_header_t *new_header = adaptive_radix_tree_header(store, new_node);
+        new_header->prefix_len = (uint8_t)shared;
+        memcpy(new_header->prefix, key + depth, shared);
+        uint8_t old_byte = node_header->prefix[shared];
+        node_header->prefix_len -= (uint8_t)(shared + 1);
+        if (node_header->prefix_len > 0)
+            memmove(node_header->prefix, node_header->prefix + shared + 1, node_header->prefix_len);
+        adaptive_radix_tree_add(store, new_header, old_byte, node_id);
+        int32_t leaf = adaptive_radix_tree_leaf_chain(store, key, key_length, depth + shared + 1, offset);
         if (leaf < 0)
             return -1;
-        art_add(kv, nh, key[d + shared], leaf);
-        return nn;
+        adaptive_radix_tree_add(store, new_header, key[depth + shared], leaf);
+        return new_node;
     }
-    d += h->prefix_len;
-    if (d == klen) {
-        art_val_store(h, AV_MAKE(1, off));
-        return nid;
+    depth += node_header->prefix_len;
+    if (depth == key_length) {
+        adaptive_radix_tree_value_store(node_header, ADAPTIVE_RADIX_TREE_VALUE_MAKE(1, offset));
+        return node_id;
     }
-    int32_t cid = art_child(kv, h, key[d]);
-    if (cid >= 0) {
-        int32_t nc = art_ins(kv, cid, key, klen, d + 1, off);
-        if (nc < 0)
+    int32_t child_id = adaptive_radix_tree_child(store, node_header, key[depth]);
+    if (child_id >= 0) {
+        int32_t new_child = adaptive_radix_tree_insert(store, child_id, key, key_length, depth + 1, offset);
+        if (new_child < 0)
             return -1;
-        if (nc != cid) {
-            art_rm(kv, h, key[d]);
-            art_add(kv, h, key[d], nc);
+        if (new_child != child_id) {
+            adaptive_radix_tree_remove(store, node_header, key[depth]);
+            adaptive_radix_tree_add(store, node_header, key[depth], new_child);
         }
-        return nid;
+        return node_id;
     }
-    int32_t leaf = art_leaf_chain(kv, key, klen, d + 1, off);
+    int32_t leaf = adaptive_radix_tree_leaf_chain(store, key, key_length, depth + 1, offset);
     if (leaf < 0)
         return -1;
-    if ((h->type == ART_N4 && h->count >= 4) ||
-        (h->type == ART_N16 && h->count >= 16) ||
-        (h->type == ART_N48 && h->count >= 48)) {
-        int32_t g = art_grow(kv, h);
-        if (g < 0)
+    if ((node_header->type == ADAPTIVE_RADIX_TREE_N4 && node_header->count >= 4) ||
+        (node_header->type == ADAPTIVE_RADIX_TREE_N16 && node_header->count >= 16) ||
+        (node_header->type == ADAPTIVE_RADIX_TREE_N48 && node_header->count >= 48)) {
+        int32_t grown = adaptive_radix_tree_grow(store, node_header);
+        if (grown < 0)
             return -1;
-        art_add(kv, art_hdr(kv, g), key[d], leaf);
-        return g;
+        adaptive_radix_tree_add(store, adaptive_radix_tree_header(store, grown), key[depth], leaf);
+        return grown;
     }
-    art_add(kv, h, key[d], leaf);
-    return nid;
+    adaptive_radix_tree_add(store, node_header, key[depth], leaf);
+    return node_id;
 }
-static int32_t art_del(kvspace_t *kv, int32_t nid, const uint8_t *key, int klen,
-                       int d, bool *del) {
-    if (nid < 0)
+static int32_t adaptive_radix_tree_delete(kvspace_t *store, int32_t node_id, const uint8_t *key, int key_length,
+                       int depth, bool *deleted) {
+    if (node_id < 0)
         return -1;
-    art_hdr_t *h = art_hdr(kv, nid);
-    if (!h)
+    adaptive_radix_tree_header_t *node_header = adaptive_radix_tree_header(store, node_id);
+    if (!node_header)
         return -1;
-    if (h->prefix_len) {
-        if (pfx_shared(h->prefix, h->prefix_len, key + d, klen - d) !=
-            h->prefix_len)
-            return nid;
-        d += h->prefix_len;
+    if (node_header->prefix_len) {
+        if (shared_prefix_length(node_header->prefix, node_header->prefix_len, key + depth, key_length - depth) !=
+            node_header->prefix_len)
+            return node_id;
+        depth += node_header->prefix_len;
     }
-    if (d == klen) {
-        uint64_t hv = art_val_load(h);
-        if (!AV_HAS(hv))
-            return nid;
-        uint64_t gidx;
-        if (garb_reserve(kv, &gidx) != 0)
+    if (depth == key_length) {
+        uint64_t header_value = adaptive_radix_tree_value_load(node_header);
+        if (!ADAPTIVE_RADIX_TREE_VALUE_HAS(header_value))
+            return node_id;
+        uint64_t garbage_index;
+        if (garbage_reserve(store, &garbage_index) != 0)
             return -1;
-        if (!art_val_cas(h, &hv, 0)) {
-            garb_cancel(kv, gidx);
-            return nid;
+        if (!adaptive_radix_tree_value_compare_and_swap(node_header, &header_value, 0)) {
+            garbage_cancel(store, garbage_index);
+            return node_id;
         }
-        gen_bump_value(kv, art_id_of(kv, h));
-        gen_bump_struct(kv, art_id_of(kv, h));
-        garb_commit(kv, gidx, AV_OFF(hv),
-                    sbo_allocated_size(kv->sbo_meta, AV_OFF(hv)));
-        *del = true;
+        generation_bump_value(store, adaptive_radix_tree_id_of(store, node_header));
+        generation_bump_struct(store, adaptive_radix_tree_id_of(store, node_header));
+        garbage_commit(store, garbage_index, ADAPTIVE_RADIX_TREE_VALUE_OFFSET(header_value),
+                    sbo_allocated_size(store->slots_box_meta, ADAPTIVE_RADIX_TREE_VALUE_OFFSET(header_value)));
+        *deleted = true;
     } else {
-        int32_t cid = art_child(kv, h, key[d]);
-        if (cid >= 0) {
-            int32_t rc = art_del(kv, cid, key, klen, d + 1, del);
-            if (rc < 0)
-                return rc;
+        int32_t child_id = adaptive_radix_tree_child(store, node_header, key[depth]);
+        if (child_id >= 0) {
+            int32_t return_code = adaptive_radix_tree_delete(store, child_id, key, key_length, depth + 1, deleted);
+            if (return_code < 0)
+                return return_code;
         }
     }
-    return nid;
+    return node_id;
 }
-static char *pjoin(const char *a, const char *b) {
-    size_t al = strlen(a), bl = strlen(b);
-    int sep = (al > 0 && ending_separator(a, al) != SEPARATOR_SLASH)
+static char *path_join(const char *left, const char *right) {
+    size_t left_length = strlen(left), right_length = strlen(right);
+    int separator = (left_length > 0 && ending_separator(left, left_length) != SEPARATOR_SLASH)
                   ? separator_length(SEPARATOR_SLASH) : 0;
-    char *r = malloc(al + (size_t)sep + bl + 1);
-    memcpy(r, a, al);
-    if (sep)
-        memcpy(r + al, separator_table[SEPARATOR_SLASH].bytes, (size_t)sep);
-    memcpy(r + al + (size_t)sep, b, bl + 1);
-    return r;
+    char *result = malloc(left_length + (size_t)separator + right_length + 1);
+    memcpy(result, left, left_length);
+    if (separator)
+        memcpy(result + left_length, separator_table[SEPARATOR_SLASH].bytes, (size_t)separator);
+    memcpy(result + left_length + (size_t)separator, right, right_length + 1);
+    return result;
 }
-static char *edir(const char *p) {
-    size_t l = strlen(p);
-    if (ending_separator(p, l) == SEPARATOR_SLASH)
-        return strdup(p);
-    return append_separator(p, SEPARATOR_SLASH);
+static char *ending_directory(const char *path) {
+    size_t length = strlen(path);
+    if (ending_separator(path, length) == SEPARATOR_SLASH)
+        return strdup(path);
+    return append_separator(path, SEPARATOR_SLASH);
 }
-static int32_t art_cover(kvspace_t *kv, int32_t nid, const uint8_t *pfx,
-                         int plen, char *buf, int bcap, int *bpos) {
-    int d = 0;
-    if (nid < 0 || !pfx || plen < 0 || !buf || !bpos)
+static int32_t adaptive_radix_tree_cover(kvspace_t *store, int32_t node_id, const uint8_t *prefix,
+                         int prefix_length, char *buffer, int buffer_capacity, int *buffer_position) {
+    int depth = 0;
+    if (node_id < 0 || !prefix || prefix_length < 0 || !buffer || !buffer_position)
         return -1;
-    while (nid >= 0) {
-        art_hdr_t *h = art_hdr(kv, nid);
-        if (!h)
+    while (node_id >= 0) {
+        adaptive_radix_tree_header_t *node_header = adaptive_radix_tree_header(store, node_id);
+        if (!node_header)
             return -1;
-        int pd = d, cover = 0;
-        if (h->prefix_len) {
-            int s = pfx_shared(h->prefix, h->prefix_len, pfx + d, plen - d);
-            if (s < h->prefix_len) {
-                if (d + s < plen)
+        int prefix_depth = depth, cover = 0;
+        if (node_header->prefix_len) {
+            int shared = shared_prefix_length(node_header->prefix, node_header->prefix_len, prefix + depth, prefix_length - depth);
+            if (shared < node_header->prefix_len) {
+                if (depth + shared < prefix_length)
                     return -1;
                 cover = 1;
             } else
-                d += h->prefix_len;
+                depth += node_header->prefix_len;
         }
-        if (cover || d == plen) {
-            if (pd >= bcap)
+        if (cover || depth == prefix_length) {
+            if (prefix_depth >= buffer_capacity)
                 return -1;
-            if (pd)
-                memcpy(buf, pfx, (size_t)pd);
-            *bpos = pd;
-            return nid;
+            if (prefix_depth)
+                memcpy(buffer, prefix, (size_t)prefix_depth);
+            *buffer_position = prefix_depth;
+            return node_id;
         }
-        nid = art_child(kv, h, pfx[d]);
-        if (nid < 0)
+        node_id = adaptive_radix_tree_child(store, node_header, prefix[depth]);
+        if (node_id < 0)
             return -1;
-        d++;
+        depth++;
     }
     return -1;
 }
 typedef struct {
     char **keys;
     int32_t count;
-    int32_t cap;
+    int32_t capacity;
 } keyscan_t;
 static void keyscan_free(keyscan_t *scan) {
     for (int32_t i = 0; i < scan->count; i++)
         free(scan->keys[i]);
     free(scan->keys);
     scan->keys = NULL;
-    scan->count = scan->cap = 0;
+    scan->count = scan->capacity = 0;
 }
-static int keyscan_add_n(keyscan_t *scan, const char *key, size_t len) {
+static int keyscan_add_name(keyscan_t *scan, const char *key, size_t length) {
     if (scan->count == INT32_MAX)
         return -1;
-    if (scan->count == scan->cap) {
-        int32_t cap = scan->cap > INT32_MAX / 2 ? INT32_MAX :
-                      scan->cap ? scan->cap * 2 : 64;
-        char **keys = realloc(scan->keys, (size_t)cap * sizeof *keys);
+    if (scan->count == scan->capacity) {
+        int32_t capacity = scan->capacity > INT32_MAX / 2 ? INT32_MAX :
+                      scan->capacity ? scan->capacity * 2 : 64;
+        char **keys = realloc(scan->keys, (size_t)capacity * sizeof *keys);
         if (!keys)
             return -1;
         scan->keys = keys;
-        scan->cap = cap;
+        scan->capacity = capacity;
     }
-    char *copy = strndup(key, len);
+    char *copy = strndup(key, length);
     if (!copy)
         return -1;
     scan->keys[scan->count++] = copy;
     return 0;
 }
-static int child_name_len(const char *rest, int restlen) {
-    for (int i = 0; i < restlen; i++) {
-        enum separator_kind kind = separator_at(rest, (size_t)i, (size_t)restlen);
+static int child_name_len(const char *rest, int rest_length) {
+    for (int i = 0; i < rest_length; i++) {
+        enum separator_kind kind = separator_at(rest, (size_t)i, (size_t)rest_length);
         if (kind != SEPARATOR_NONE)
             return i + separator_length(kind);
     }
-    return restlen;
+    return rest_length;
 }
-static int art_has_live_value(kvspace_t *kv, int32_t nid) {
-    if (nid < 0)
+static int adaptive_radix_tree_has_live_value(kvspace_t *store, int32_t node_id) {
+    if (node_id < 0)
         return 0;
-    art_hdr_t *h = art_hdr(kv, nid);
-    if (!h)
+    adaptive_radix_tree_header_t *node_header = adaptive_radix_tree_header(store, node_id);
+    if (!node_header)
         return -1;
-    if (AV_HAS(art_val_load(h)))
+    if (ADAPTIVE_RADIX_TREE_VALUE_HAS(adaptive_radix_tree_value_load(node_header)))
         return 1;
     const int32_t *children;
-    int count = h->count;
-    switch (h->type) {
-    case ART_N4:
-        children = ((art_n4_t *)h)->children;
+    int count = node_header->count;
+    switch (node_header->type) {
+    case ADAPTIVE_RADIX_TREE_N4:
+        children = ((adaptive_radix_tree_node4_t *)node_header)->children;
         break;
-    case ART_N16:
-        children = ((art_n16_t *)h)->children;
+    case ADAPTIVE_RADIX_TREE_N16:
+        children = ((adaptive_radix_tree_node16_t *)node_header)->children;
         break;
-    case ART_N48:
-        children = ((art_n48_t *)h)->children;
+    case ADAPTIVE_RADIX_TREE_N48:
+        children = ((adaptive_radix_tree_node48_t *)node_header)->children;
         break;
-    case ART_N256:
-        children = ((art_n256_t *)h)->children;
+    case ADAPTIVE_RADIX_TREE_N256:
+        children = ((adaptive_radix_tree_node256_t *)node_header)->children;
         count = 256;
         break;
     default:
         return 0;
     }
     for (int i = 0; i < count; i++) {
-        int live = art_has_live_value(kv, children[i]);
+        int live = adaptive_radix_tree_has_live_value(store, children[i]);
         if (live != 0)
             return live;
     }
     return 0;
 }
-static int art_scan_children(kvspace_t *kv, int32_t nid, char *buf, int bpos, int bcap,
-                             int plen, keyscan_t *scan) {
-    if (nid < 0)
+static int adaptive_radix_tree_scan_children(kvspace_t *store, int32_t node_id, char *buffer, int buffer_position, int buffer_capacity,
+                             int prefix_length, keyscan_t *scan) {
+    if (node_id < 0)
         return 0;
-    art_hdr_t *h = art_hdr(kv, nid);
-    if (!h || h->prefix_len > bcap - bpos - 1)
+    adaptive_radix_tree_header_t *node_header = adaptive_radix_tree_header(store, node_id);
+    if (!node_header || node_header->prefix_len > buffer_capacity - buffer_position - 1)
         return -1;
-    for (int i = 0; i < h->prefix_len; i++)
-        buf[bpos++] = h->prefix[i];
-    buf[bpos] = 0;
-    if (bpos > plen) {
-        const char *rest = buf + plen;
-        int restlen = bpos - plen;
-        int len = child_name_len(rest, restlen);
-        if (len < restlen) {
-            int live = art_has_live_value(kv, nid);
+    for (int i = 0; i < node_header->prefix_len; i++)
+        buffer[buffer_position++] = node_header->prefix[i];
+    buffer[buffer_position] = 0;
+    if (buffer_position > prefix_length) {
+        const char *rest = buffer + prefix_length;
+        int rest_length = buffer_position - prefix_length;
+        int length = child_name_len(rest, rest_length);
+        if (length < rest_length) {
+            int live = adaptive_radix_tree_has_live_value(store, node_id);
             if (live <= 0)
                 return live;
-            return keyscan_add_n(scan, rest, (size_t)len);
+            return keyscan_add_name(scan, rest, (size_t)length);
         }
-        if (ending_separator(rest, (size_t)restlen) != SEPARATOR_NONE) {
-            int live = art_has_live_value(kv, nid);
+        if (ending_separator(rest, (size_t)rest_length) != SEPARATOR_NONE) {
+            int live = adaptive_radix_tree_has_live_value(store, node_id);
             if (live <= 0)
                 return live;
-            return keyscan_add_n(scan, rest, (size_t)len);
+            return keyscan_add_name(scan, rest, (size_t)length);
         }
-        if (AV_HAS(art_val_load(h)) &&
-            keyscan_add_n(scan, rest, (size_t)len) != 0)
+        if (ADAPTIVE_RADIX_TREE_VALUE_HAS(adaptive_radix_tree_value_load(node_header)) &&
+            keyscan_add_name(scan, rest, (size_t)length) != 0)
             return -1;
     }
-    switch (h->type) {
-    case ART_N4: {
-        art_n4_t *x = (art_n4_t *)h;
-        for (int i = 0; i < (int)h->count; i++) {
-            if (bpos + 1 >= bcap)
+    switch (node_header->type) {
+    case ADAPTIVE_RADIX_TREE_N4: {
+        adaptive_radix_tree_node4_t *node_data = (adaptive_radix_tree_node4_t *)node_header;
+        for (int i = 0; i < (int)node_header->count; i++) {
+            if (buffer_position + 1 >= buffer_capacity)
                 return -1;
-            buf[bpos] = x->keys[i];
-            if (art_scan_children(kv, x->children[i], buf, bpos + 1, bcap,
-                                  plen, scan) != 0)
-                return -1;
-        }
-        break;
-    }
-    case ART_N16: {
-        art_n16_t *x = (art_n16_t *)h;
-        for (int i = 0; i < (int)h->count; i++) {
-            if (bpos + 1 >= bcap)
-                return -1;
-            buf[bpos] = x->keys[i];
-            if (art_scan_children(kv, x->children[i], buf, bpos + 1, bcap,
-                                  plen, scan) != 0)
+            buffer[buffer_position] = node_data->keys[i];
+            if (adaptive_radix_tree_scan_children(store, node_data->children[i], buffer, buffer_position + 1, buffer_capacity,
+                                  prefix_length, scan) != 0)
                 return -1;
         }
         break;
     }
-    case ART_N48: {
-        art_n48_t *x = (art_n48_t *)h;
+    case ADAPTIVE_RADIX_TREE_N16: {
+        adaptive_radix_tree_node16_t *node_data = (adaptive_radix_tree_node16_t *)node_header;
+        for (int i = 0; i < (int)node_header->count; i++) {
+            if (buffer_position + 1 >= buffer_capacity)
+                return -1;
+            buffer[buffer_position] = node_data->keys[i];
+            if (adaptive_radix_tree_scan_children(store, node_data->children[i], buffer, buffer_position + 1, buffer_capacity,
+                                  prefix_length, scan) != 0)
+                return -1;
+        }
+        break;
+    }
+    case ADAPTIVE_RADIX_TREE_N48: {
+        adaptive_radix_tree_node48_t *node_data = (adaptive_radix_tree_node48_t *)node_header;
         for (int i = 0; i < 256; i++) {
-            if (x->index[i] == 255)
+            if (node_data->index[i] == 255)
                 continue;
-            if (bpos + 1 >= bcap)
+            if (buffer_position + 1 >= buffer_capacity)
                 return -1;
-            buf[bpos] = (uint8_t)i;
-            if (art_scan_children(kv, x->children[x->index[i]], buf, bpos + 1,
-                                  bcap, plen, scan) != 0)
+            buffer[buffer_position] = (uint8_t)i;
+            if (adaptive_radix_tree_scan_children(store, node_data->children[node_data->index[i]], buffer, buffer_position + 1,
+                                  buffer_capacity, prefix_length, scan) != 0)
                 return -1;
         }
         break;
     }
-    case ART_N256: {
-        art_n256_t *x = (art_n256_t *)h;
+    case ADAPTIVE_RADIX_TREE_N256: {
+        adaptive_radix_tree_node256_t *node_data = (adaptive_radix_tree_node256_t *)node_header;
         for (int i = 0; i < 256; i++) {
-            if (x->children[i] < 0)
+            if (node_data->children[i] < 0)
                 continue;
-            if (bpos + 1 >= bcap)
+            if (buffer_position + 1 >= buffer_capacity)
                 return -1;
-            buf[bpos] = (uint8_t)i;
-            if (art_scan_children(kv, x->children[i], buf, bpos + 1, bcap,
-                                  plen, scan) != 0)
+            buffer[buffer_position] = (uint8_t)i;
+            if (adaptive_radix_tree_scan_children(store, node_data->children[i], buffer, buffer_position + 1, buffer_capacity,
+                                  prefix_length, scan) != 0)
                 return -1;
         }
         break;
@@ -1760,65 +1760,65 @@ static int art_scan_children(kvspace_t *kv, int32_t nid, char *buf, int bpos, in
     }
     return 0;
 }
-static int art_scan_pfx(kvspace_t *kv, const char *pfx, int plen, char *buf,
-                        int bcap, keyscan_t *scan) {
-    if (plen >= bcap)
+static int adaptive_radix_tree_scan_prefix(kvspace_t *store, const char *prefix, int prefix_length, char *buffer,
+                        int buffer_capacity, keyscan_t *scan) {
+    if (prefix_length >= buffer_capacity)
         return -1;
-    int bpos = 0;
-    int32_t nid = art_cover(kv, kv->hdr->art_root, (const uint8_t *)pfx,
-                            plen, buf, bcap, &bpos);
-    if (nid < 0)
+    int buffer_position = 0;
+    int32_t node_id = adaptive_radix_tree_cover(store, store->header->adaptive_radix_tree_root, (const uint8_t *)prefix,
+                            prefix_length, buffer, buffer_capacity, &buffer_position);
+    if (node_id < 0)
         return 0;
-    return art_scan_children(kv, nid, buf, bpos, bcap, plen, scan);
+    return adaptive_radix_tree_scan_children(store, node_id, buffer, buffer_position, buffer_capacity, prefix_length, scan);
 }
-static int art_collect_keys(kvspace_t *kv, int32_t nid, char *buf, int bpos,
-                            int bcap, keyscan_t *scan) {
-    if (nid < 0)
+static int adaptive_radix_tree_collect_keys(kvspace_t *store, int32_t node_id, char *buffer, int buffer_position,
+                            int buffer_capacity, keyscan_t *scan) {
+    if (node_id < 0)
         return 0;
-    art_hdr_t *h = art_hdr(kv, nid);
-    if (!h || h->prefix_len > bcap - bpos - 1)
+    adaptive_radix_tree_header_t *node_header = adaptive_radix_tree_header(store, node_id);
+    if (!node_header || node_header->prefix_len > buffer_capacity - buffer_position - 1)
         return -1;
-    for (int i = 0; i < h->prefix_len; i++)
-        buf[bpos++] = h->prefix[i];
-    if (AV_HAS(art_val_load(h)) && keyscan_add_n(scan, buf, (size_t)bpos) != 0)
+    for (int i = 0; i < node_header->prefix_len; i++)
+        buffer[buffer_position++] = node_header->prefix[i];
+    if (ADAPTIVE_RADIX_TREE_VALUE_HAS(adaptive_radix_tree_value_load(node_header)) && keyscan_add_name(scan, buffer, (size_t)buffer_position) != 0)
         return -1;
     const uint8_t *keys = NULL;
     const int32_t *children = NULL;
-    int n = 0;
-    switch (h->type) {
-    case ART_N4:
-        keys = ((art_n4_t *)h)->keys;
-        children = ((art_n4_t *)h)->children;
-        n = h->count;
+    int count = 0;
+    switch (node_header->type) {
+    case ADAPTIVE_RADIX_TREE_N4:
+        keys = ((adaptive_radix_tree_node4_t *)node_header)->keys;
+        children = ((adaptive_radix_tree_node4_t *)node_header)->children;
+        count = node_header->count;
         break;
-    case ART_N16:
-        keys = ((art_n16_t *)h)->keys;
-        children = ((art_n16_t *)h)->children;
-        n = h->count;
+    case ADAPTIVE_RADIX_TREE_N16:
+        keys = ((adaptive_radix_tree_node16_t *)node_header)->keys;
+        children = ((adaptive_radix_tree_node16_t *)node_header)->children;
+        count = node_header->count;
         break;
-    case ART_N48: {
-        art_n48_t *x = (art_n48_t *)h;
+    case ADAPTIVE_RADIX_TREE_N48: {
+        adaptive_radix_tree_node48_t *node_data = (adaptive_radix_tree_node48_t *)node_header;
         for (int i = 0; i < 256; i++) {
-            if (x->index[i] == 255)
+            if (node_data->index[i] == 255)
                 continue;
-            if (bpos + 1 >= bcap)
+            if (buffer_position + 1 >= buffer_capacity)
                 return -1;
-            buf[bpos] = (char)i;
-            if (art_collect_keys(kv, x->children[x->index[i]], buf, bpos + 1,
-                                 bcap, scan) != 0)
+            buffer[buffer_position] = (char)i;
+            if (adaptive_radix_tree_collect_keys(store, node_data->children[node_data->index[i]], buffer, buffer_position + 1,
+                                 buffer_capacity, scan) != 0)
                 return -1;
         }
         return 0;
     }
-    case ART_N256: {
-        art_n256_t *x = (art_n256_t *)h;
+    case ADAPTIVE_RADIX_TREE_N256: {
+        adaptive_radix_tree_node256_t *node_data = (adaptive_radix_tree_node256_t *)node_header;
         for (int i = 0; i < 256; i++) {
-            if (x->children[i] < 0)
+            if (node_data->children[i] < 0)
                 continue;
-            if (bpos + 1 >= bcap)
+            if (buffer_position + 1 >= buffer_capacity)
                 return -1;
-            buf[bpos] = (char)i;
-            if (art_collect_keys(kv, x->children[i], buf, bpos + 1, bcap,
+            buffer[buffer_position] = (char)i;
+            if (adaptive_radix_tree_collect_keys(store, node_data->children[i], buffer, buffer_position + 1, buffer_capacity,
                                  scan) != 0)
                 return -1;
         }
@@ -1827,737 +1827,737 @@ static int art_collect_keys(kvspace_t *kv, int32_t nid, char *buf, int bpos,
     default:
         return 0;
     }
-    for (int i = 0; i < n; i++) {
-        if (bpos + 1 >= bcap)
+    for (int i = 0; i < count; i++) {
+        if (buffer_position + 1 >= buffer_capacity)
             return -1;
-        buf[bpos] = (char)keys[i];
-        if (art_collect_keys(kv, children[i], buf, bpos + 1, bcap, scan) != 0)
+        buffer[buffer_position] = (char)keys[i];
+        if (adaptive_radix_tree_collect_keys(store, children[i], buffer, buffer_position + 1, buffer_capacity, scan) != 0)
             return -1;
     }
     return 0;
 }
-static int art_scan_keys(kvspace_t *kv, const char *pfx, int plen,
+static int adaptive_radix_tree_scan_keys(kvspace_t *store, const char *prefix, int prefix_length,
                          keyscan_t *scan) {
-    char buf[4096];
-    if (plen >= (int)sizeof buf)
+    char buffer[4096];
+    if (prefix_length >= (int)sizeof buffer)
         return -1;
-    int bpos = 0;
-    int32_t nid = art_cover(kv, kv->hdr->art_root, (const uint8_t *)pfx, plen,
-                            buf, (int)sizeof buf, &bpos);
-    if (nid < 0)
+    int buffer_position = 0;
+    int32_t node_id = adaptive_radix_tree_cover(store, store->header->adaptive_radix_tree_root, (const uint8_t *)prefix, prefix_length,
+                            buffer, (int)sizeof buffer, &buffer_position);
+    if (node_id < 0)
         return 0;
-    return art_collect_keys(kv, nid, buf, bpos, (int)sizeof buf, scan);
+    return adaptive_radix_tree_collect_keys(store, node_id, buffer, buffer_position, (int)sizeof buffer, scan);
 }
-static bool sbo_data_size_ok(size_t n) {
-    for (uint64_t s = 8; s <= (1ULL << 45); s *= 64)
-        if (s == n)
+static bool slots_box_data_size_ok(size_t data_size) {
+    for (uint64_t step_size = 8; step_size <= (1ULL << 45); step_size *= 64)
+        if (step_size == data_size)
             return true;
     return false;
 }
-static kvspace_t *open_shm_store(const char *path, size_t data_size) {
+static kvspace_t *open_shared_memory_store(const char *path, size_t data_size) {
     if (!path)
         return NULL;
-    if (!bm_layout_ok()) {
+    if (!blockmalloc_layout_ok()) {
         fprintf(stderr, "kvspace: unexpected blockmalloc blocks_meta_t layout\n");
         return NULL;
     }
-    char head_path[PATH_MAX], data_path[PATH_MAX], gen_path[PATH_MAX],
-        garb_path[PATH_MAX];
+    char head_path[PATH_MAX], data_path[PATH_MAX], generation_path[PATH_MAX],
+        garbage_path[PATH_MAX];
     if (snprintf(head_path, sizeof head_path, "%s.sbo.head", path) >=
             (int)sizeof head_path ||
         snprintf(data_path, sizeof data_path, "%s.sbo.data", path) >=
             (int)sizeof data_path ||
-        snprintf(gen_path, sizeof gen_path, "%s.gen", path) >=
-            (int)sizeof gen_path ||
-        snprintf(garb_path, sizeof garb_path, "%s.garb", path) >=
-            (int)sizeof garb_path)
+        snprintf(generation_path, sizeof generation_path, "%s.gen", path) >=
+            (int)sizeof generation_path ||
+        snprintf(garbage_path, sizeof garbage_path, "%s.garb", path) >=
+            (int)sizeof garbage_path)
         return NULL;
-    kvspace_t *kv = calloc(1, sizeof(*kv));
-    if (!kv)
+    kvspace_t *store = calloc(1, sizeof(*store));
+    if (!store)
         return NULL;
-    kv->p2_slot = -1;
-    kv->r_art.fd = kv->r_head.fd = kv->r_data.fd = kv->r_gen.fd =
-        kv->r_garb.fd = -1;
+    store->recovery_slot = -1;
+    store->region_adaptive_radix_tree.file_descriptor = store->region_header.file_descriptor = store->region_data.file_descriptor = store->region_generations.file_descriptor =
+        store->region_garbage.file_descriptor = -1;
     bool created = false;
-    kv->r_art.fd = open(path, O_RDWR);
-    if (kv->r_art.fd < 0) {
-        if (!sbo_data_size_ok(data_size))
+    store->region_adaptive_radix_tree.file_descriptor = open(path, O_RDWR);
+    if (store->region_adaptive_radix_tree.file_descriptor < 0) {
+        if (!slots_box_data_size_ok(data_size))
             goto fail;
-        kv->r_art.fd = open(path, O_RDWR | O_CREAT | O_EXCL, 0644);
-        if (kv->r_art.fd < 0)
+        store->region_adaptive_radix_tree.file_descriptor = open(path, O_RDWR | O_CREAT | O_EXCL, 0644);
+        if (store->region_adaptive_radix_tree.file_descriptor < 0)
             goto fail;
         created = true;
     }
-    size_t art_slab, sbo_head;
+    size_t adaptive_radix_tree_slab, slots_box_head;
     if (created) {
-        art_slab = ART_SLAB_INIT;
-        sbo_head = sbo_meta_size(data_size, SBO_HEAD_POOL_INIT);
+        adaptive_radix_tree_slab = ADAPTIVE_RADIX_TREE_SLAB_INITIAL;
+        slots_box_head = sbo_meta_size(data_size, SLOTS_BOX_HEAD_POOL_INITIAL);
     } else {
-        kvspace_hdr_t tmp;
-        if (pread(kv->r_art.fd, &tmp, sizeof tmp, 0) != (ssize_t)sizeof tmp ||
-            memcmp(tmp.magic, KVS_MAGIC, sizeof(KVS_MAGIC) - 1) != 0)
+        kvspace_header_t temporary;
+        if (pread(store->region_adaptive_radix_tree.file_descriptor, &temporary, sizeof temporary, 0) != (ssize_t)sizeof temporary ||
+            memcmp(temporary.magic, KVSPACE_MAGIC, sizeof(KVSPACE_MAGIC) - 1) != 0)
             goto fail;
-        art_slab = (size_t)tmp.art_slab_size;
-        sbo_head = (size_t)tmp.sbo_head_size;
-        data_size = (size_t)tmp.sbo_data_size;
+        adaptive_radix_tree_slab = (size_t)temporary.adaptive_radix_tree_slab_size;
+        slots_box_head = (size_t)temporary.slots_box_head_size;
+        data_size = (size_t)temporary.slots_box_data_size;
     }
-    int fl = created ? O_RDWR | O_CREAT | O_TRUNC : O_RDWR;
-    if (region_attach(&kv->r_art, created, ART_OFF + art_slab,
-                      ART_RESERVE) != 0 ||
-        (kv->r_head.fd = open(head_path, fl, 0644)) < 0 ||
-        region_attach(&kv->r_head, created, sbo_head, REGION_RESERVE) != 0 ||
-        (kv->r_data.fd = open(data_path, fl, 0644)) < 0 ||
-        region_attach(&kv->r_data, created, data_size, DATA_RESERVE) != 0 ||
-        (kv->r_gen.fd = open(gen_path, fl, 0644)) < 0 ||
-        (kv->r_garb.fd = open(garb_path, fl, 0644)) < 0 ||
-        region_attach(&kv->r_garb, created,
-                      (size_t)GARB_CAP * sizeof(garb_ent_t),
-                      (size_t)GARB_CAP * sizeof(garb_ent_t)) != 0)
+    int open_flags = created ? O_RDWR | O_CREAT | O_TRUNC : O_RDWR;
+    if (region_attach(&store->region_adaptive_radix_tree, created, ADAPTIVE_RADIX_TREE_OFFSET + adaptive_radix_tree_slab,
+                      ADAPTIVE_RADIX_TREE_RESERVE) != 0 ||
+        (store->region_header.file_descriptor = open(head_path, open_flags, 0644)) < 0 ||
+        region_attach(&store->region_header, created, slots_box_head, SHARED_MEMORY_REGION_RESERVE) != 0 ||
+        (store->region_data.file_descriptor = open(data_path, open_flags, 0644)) < 0 ||
+        region_attach(&store->region_data, created, data_size, DATA_RESERVE) != 0 ||
+        (store->region_generations.file_descriptor = open(generation_path, open_flags, 0644)) < 0 ||
+        (store->region_garbage.file_descriptor = open(garbage_path, open_flags, 0644)) < 0 ||
+        region_attach(&store->region_garbage, created,
+                      (size_t)GARBAGE_CAPACITY * sizeof(garbage_entry_t),
+                      (size_t)GARBAGE_CAPACITY * sizeof(garbage_entry_t)) != 0)
         goto fail;
-    kv->hdr = (kvspace_hdr_t *)kv->r_art.base;
-    kv->art_meta = (blocks_meta_t *)(kv->r_art.base + sizeof(kvspace_hdr_t));
-    kv->art_data = kv->r_art.base + ART_OFF;
-    kv->sbo_meta = (sbo_meta_t *)kv->r_head.base;
-    kv->sbo_data = kv->r_data.base;
-    kv->garb = (garb_ent_t *)kv->r_garb.base;
+    store->header = (kvspace_header_t *)store->region_adaptive_radix_tree.base;
+    store->adaptive_radix_tree_meta = (blocks_meta_t *)(store->region_adaptive_radix_tree.base + sizeof(kvspace_header_t));
+    store->adaptive_radix_tree_data = store->region_adaptive_radix_tree.base + ADAPTIVE_RADIX_TREE_OFFSET;
+    store->slots_box_meta = (sbo_meta_t *)store->region_header.base;
+    store->slots_box_data = store->region_data.base;
+    store->garbage = (garbage_entry_t *)store->region_garbage.base;
     if (created) {
-        memset(kv->hdr, 0, sizeof(*kv->hdr));
-        kv->hdr->art_slab_size = art_slab;
-        kv->hdr->sbo_head_size = sbo_head;
-        kv->hdr->sbo_data_size = data_size;
-        kv->hdr->art_root = -1;
-        if (blocks_init(kv->art_meta, art_slab, ART_BLOCK_SZ) != 0 ||
-            sbo_init(kv->sbo_meta, sbo_head, data_size) != 0)
+        memset(store->header, 0, sizeof(*store->header));
+        store->header->adaptive_radix_tree_slab_size = adaptive_radix_tree_slab;
+        store->header->slots_box_head_size = slots_box_head;
+        store->header->slots_box_data_size = data_size;
+        store->header->adaptive_radix_tree_root = -1;
+        if (blocks_init(store->adaptive_radix_tree_meta, adaptive_radix_tree_slab, ADAPTIVE_RADIX_TREE_BLOCK_SIZE) != 0 ||
+            sbo_init(store->slots_box_meta, slots_box_head, data_size) != 0)
             goto fail;
-        kv->art_meta->sizeof_block_head = 8;
-        memcpy(kv->hdr->magic, KVS_MAGIC, sizeof(KVS_MAGIC) - 1);
+        store->adaptive_radix_tree_meta->sizeof_block_head = 8;
+        memcpy(store->header->magic, KVSPACE_MAGIC, sizeof(KVSPACE_MAGIC) - 1);
     }
-    if (gens_grow(kv) != 0)
+    if (generations_grow(store) != 0)
         goto fail;
-    kv->p2_slot = p2_reg_claim(kv);
-    if (kv->p2_slot == -2) {
-        fprintf(stderr, "kvspace: too many processes, N=%d\n", P2_SLOT_N);
+    store->recovery_slot = recovery_register_claim(store);
+    if (store->recovery_slot == -2) {
+        fprintf(stderr, "kvspace: too many processes, N=%d\n", RECOVERY_SLOT_COUNT);
         goto fail;
     }
-    if (kv->p2_slot == -3) {
+    if (store->recovery_slot == -3) {
         fprintf(stderr, "kvspace: claim_id exhausted (2^30 opens): "
                         "rebuild the store\n");
         goto fail;
     }
-    if (kv->p2_slot < 0)
+    if (store->recovery_slot < 0)
         goto fail;
-    kv->pid = (uint32_t)getpid();
-    (void)pthread_once(&g_atfork_once, p2_atfork_install);
-    kv->fork_gen = __atomic_load_n(&g_fork_gen, __ATOMIC_ACQUIRE);
-    kv->quiesced = 1;
-    if (kv->hdr->committed_bytes -
-            __atomic_load_n(&kv->hdr->freed_bytes, __ATOMIC_ACQUIRE) >=
-            p2_garb_threshold() &&
-        p2_maint_start(kv) != 0)
+    store->process_id = (uint32_t)getpid();
+    (void)pthread_once(&g_atfork_once, recovery_atfork_install);
+    store->fork_generation = __atomic_load_n(&g_fork_generation, __ATOMIC_ACQUIRE);
+    store->quiesced = 1;
+    if (store->header->committed_bytes -
+            __atomic_load_n(&store->header->freed_bytes, __ATOMIC_ACQUIRE) >=
+            recovery_garbage_threshold() &&
+        recovery_maintenance_start(store) != 0)
         goto fail;
-    return kv;
+    return store;
 fail:
-    p2_maint_stop(kv);
-    if (kv->p2_slot >= 0 && kv->hdr)
-        p2_reg_release(kv);
-    region_close(&kv->r_art);
-    region_close(&kv->r_head);
-    region_close(&kv->r_data);
-    region_close(&kv->r_gen);
-    region_close(&kv->r_garb);
-    free(kv);
+    recovery_maintenance_stop(store);
+    if (store->recovery_slot >= 0 && store->header)
+        recovery_register_release(store);
+    region_close(&store->region_adaptive_radix_tree);
+    region_close(&store->region_header);
+    region_close(&store->region_data);
+    region_close(&store->region_generations);
+    region_close(&store->region_garbage);
+    free(store);
     if (created) {
         unlink(path);
         unlink(head_path);
         unlink(data_path);
-        unlink(gen_path);
-        unlink(garb_path);
+        unlink(generation_path);
+        unlink(garbage_path);
     }
     return NULL;
 }
-static bool p2_other_alive(kvspace_t *kv) {
-    for (int i = 0; i < P2_SLOT_N; i++) {
-        if (i == kv->p2_slot)
+static bool recovery_other_alive(kvspace_t *store) {
+    for (int i = 0; i < RECOVERY_SLOT_COUNT; i++) {
+        if (i == store->recovery_slot)
             continue;
-        p2_slot_t *s = &kv->hdr->slots[i];
-        if (__atomic_load_n(&s->state, __ATOMIC_ACQUIRE) != P2_SLOT_MINE)
+        recovery_slot_t *slot = &store->header->slots[i];
+        if (__atomic_load_n(&slot->state, __ATOMIC_ACQUIRE) != RECOVERY_SLOT_MINE)
             continue;
-        if (p2_slot_alive(s))
+        if (recovery_slot_alive(slot))
             return true;
     }
     return false;
 }
-static void close_shm_store(kvspace_t *kv) {
-    if (!kv)
+static void close_shared_memory_store(kvspace_t *store) {
+    if (!store)
         return;
-    if (kv->pid == (uint32_t)getpid() && kv->p2_slot >= 0 &&
-        !p2_other_alive(kv)) {
+    if (store->process_id == (uint32_t)getpid() && store->recovery_slot >= 0 &&
+        !recovery_other_alive(store)) {
 #if defined(__linux__)
-        __atomic_store_n(&kv->hdr->slots[kv->p2_slot].quiesced, 1u,
+        __atomic_store_n(&store->header->slots[store->recovery_slot].quiesced, 1u,
                          __ATOMIC_RELEASE);
-        (void)p2_round(kv);
+        (void)recovery_round(store);
 #else
-        uint64_t h = __atomic_load_n(&kv->hdr->garb_head, __ATOMIC_ACQUIRE);
-        uint64_t t = __atomic_load_n(&kv->hdr->garb_tail, __ATOMIC_ACQUIRE);
-        for (; h < t; h++) {
-            garb_ent_t *e = &kv->garb[h & (GARB_CAP - 1)];
-            uint32_t m = __atomic_load_n(&e->meta, __ATOMIC_ACQUIRE);
-            if (GE_STATE(m) == GE_COMMITTED) {
-                uint64_t off = __atomic_load_n(&e->off, __ATOMIC_ACQUIRE);
-                uint64_t cap = sbo_allocated_size(kv->sbo_meta, off);
-                __atomic_store_n(&e->meta, GE_EMPTY, __ATOMIC_RELEASE);
-                kv_sbo_free(kv, off);
-                __atomic_store_n(&kv->hdr->freed_bytes,
-                                 kv->hdr->freed_bytes + cap, __ATOMIC_RELEASE);
+        uint64_t garbage_head_index = __atomic_load_n(&store->header->garbage_head, __ATOMIC_ACQUIRE);
+        uint64_t garbage_tail_index = __atomic_load_n(&store->header->garbage_tail, __ATOMIC_ACQUIRE);
+        for (; garbage_head_index < garbage_tail_index; garbage_head_index++) {
+            garbage_entry_t *entry = &store->garbage[garbage_head_index & (GARBAGE_CAPACITY - 1)];
+            uint32_t meta_state = __atomic_load_n(&entry->meta, __ATOMIC_ACQUIRE);
+            if (GARBAGE_ENTRY_STATE(meta_state) == GARBAGE_ENTRY_COMMITTED) {
+                uint64_t offset = __atomic_load_n(&entry->offset, __ATOMIC_ACQUIRE);
+                uint64_t capacity = sbo_allocated_size(store->slots_box_meta, offset);
+                __atomic_store_n(&entry->meta, GARBAGE_ENTRY_EMPTY, __ATOMIC_RELEASE);
+                store_slots_box_free(store, offset);
+                __atomic_store_n(&store->header->freed_bytes,
+                                 store->header->freed_bytes + capacity, __ATOMIC_RELEASE);
             } else {
-                __atomic_store_n(&e->meta, GE_EMPTY, __ATOMIC_RELEASE);
+                __atomic_store_n(&entry->meta, GARBAGE_ENTRY_EMPTY, __ATOMIC_RELEASE);
             }
         }
-        __atomic_store_n(&kv->hdr->garb_head, t, __ATOMIC_RELEASE);
+        __atomic_store_n(&store->header->garbage_head, garbage_tail_index, __ATOMIC_RELEASE);
 #endif
     }
-    p2_maint_stop(kv);
-    p2_reg_release(kv);
-    region_close(&kv->r_art);
-    region_close(&kv->r_head);
-    region_close(&kv->r_data);
-    region_close(&kv->r_gen);
-    region_close(&kv->r_garb);
-    free(kv);
+    recovery_maintenance_stop(store);
+    recovery_register_release(store);
+    region_close(&store->region_adaptive_radix_tree);
+    region_close(&store->region_header);
+    region_close(&store->region_data);
+    region_close(&store->region_generations);
+    region_close(&store->region_garbage);
+    free(store);
 }
-static int shm_del_key(kvspace_t *kv, const char *key) {
-    bool d = false;
-    int32_t root = art_del(kv, kv->hdr->art_root, (const uint8_t *)key,
-                           (int)strlen(key), 0, &d);
+static int shared_memory_delete_key(kvspace_t *store, const char *key) {
+    bool deleted = false;
+    int32_t root = adaptive_radix_tree_delete(store, store->header->adaptive_radix_tree_root, (const uint8_t *)key,
+                           (int)strlen(key), 0, &deleted);
     if (root < 0)
         return -1;
-    kv->hdr->art_root = root;
-    return d ? 1 : 0;
+    store->header->adaptive_radix_tree_root = root;
+    return deleted ? 1 : 0;
 }
-static char *memdir(const char *p) {
-    return append_separator(p, SEPARATOR_DOT);
+static char *member_directory(const char *path) {
+    return append_separator(path, SEPARATOR_DOT);
 }
-static int subtree_key(const char *base, size_t bl, const char *key) {
-    if (bl == 0)
+static int subtree_key(const char *base, size_t base_length, const char *key) {
+    if (base_length == 0)
         return separator_at(key, 0, strlen(key)) == SEPARATOR_SLASH;
-    if (strncmp(key, base, bl) != 0)
+    if (strncmp(key, base, base_length) != 0)
         return 0;
-    const char *rest = key + bl;
+    const char *rest = key + base_length;
     return rest[0] == 0 ||
            separator_at(rest, 0, strlen(rest)) != SEPARATOR_NONE;
 }
-static int delete_tree(kvspace_t *kv, const char *prefix) {
-    if (!kv || !prefix || reserved_meta_path(prefix))
+static int delete_tree(kvspace_t *store, const char *prefix) {
+    if (!store || !prefix || reserved_meta_path(prefix))
         return -1;
-    if (kv_sync(kv) != 0)
+    if (store_sync(store) != 0)
         return -1;
-    size_t pl = strlen(prefix);
-    if (pl >= 1024)
+    size_t prefix_length = strlen(prefix);
+    if (prefix_length >= 1024)
         return -1;
     char base[1024];
-    memcpy(base, prefix, pl + 1);
-    size_t bl = pl;
-    if (bl == (size_t)separator_length(SEPARATOR_SLASH) &&
-        separator_at(base, 0, bl) == SEPARATOR_SLASH) {
-        bl = 0;
+    memcpy(base, prefix, prefix_length + 1);
+    size_t base_length = prefix_length;
+    if (base_length == (size_t)separator_length(SEPARATOR_SLASH) &&
+        separator_at(base, 0, base_length) == SEPARATOR_SLASH) {
+        base_length = 0;
     } else {
-        enum separator_kind kind = ending_separator(base, bl);
+        enum separator_kind kind = ending_separator(base, base_length);
         if (kind != SEPARATOR_NONE)
-            bl -= (size_t)separator_length(kind);
+            base_length -= (size_t)separator_length(kind);
     }
-    base[bl] = 0;
-    if (bl && reserved_meta_path(base))
+    base[base_length] = 0;
+    if (base_length && reserved_meta_path(base))
         return -1;
     keyscan_t keys = {0};
-    if (art_scan_keys(kv, bl ? base : separator_table[SEPARATOR_SLASH].bytes,
-                      bl ? (int)bl : separator_length(SEPARATOR_SLASH),
+    if (adaptive_radix_tree_scan_keys(store, base_length ? base : separator_table[SEPARATOR_SLASH].bytes,
+                      base_length ? (int)base_length : separator_length(SEPARATOR_SLASH),
                       &keys) != 0) {
         keyscan_free(&keys);
         return -1;
     }
-    int rc = 0, any = 0;
+    int return_code = 0, any = 0;
     for (int32_t i = 0; i < keys.count; i++) {
-        const char *k = keys.keys[i];
-        if (!subtree_key(base, bl, k) || reserved_meta_path(k) ||
-            strlen(k) >= 1024)
+        const char *key = keys.keys[i];
+        if (!subtree_key(base, base_length, key) || reserved_meta_path(key) ||
+            strlen(key) >= 1024)
             continue;
-        int d = shm_del_key(kv, k);
-        if (d < 0)
-            rc = -1;
-        else if (d)
+        int deleted = shared_memory_delete_key(store, key);
+        if (deleted < 0)
+            return_code = -1;
+        else if (deleted)
             any = 1;
     }
     keyscan_free(&keys);
     if (any)
-        list_gen_bump(kv);
-    return rc;
+        list_generation_bump(store);
+    return return_code;
 }
-static int read_wire(kvspace_t *kv, const char *key, const uint8_t **out,
-                     uint64_t *out_len) {
-    uint64_t off = 0;
-    if (resolve_root(kv, key, &off) != KVSPACE_OK)
+static int read_wire(kvspace_t *store, const char *key, const uint8_t **out,
+                     uint64_t *out_length) {
+    uint64_t offset = 0;
+    if (resolve_root(store, key, &offset) != KVSPACE_OK)
         return -1;
-    uint8_t *base = storage_data_base(kv);
+    uint8_t *base = storage_data_base(store);
     if (!base)
         return -1;
-    const uint8_t *wire = base + off;
+    const uint8_t *wire = base + offset;
     const kvspaceXvalueHead *head = (const kvspaceXvalueHead *)(const void *)wire;
     uint64_t total = kvspaceXvalueHeadTotalLen(head);
     if (total < KVSPACE_XVALUE_HEAD_LEN)
         return -1;
     *out = wire;
-    *out_len = total;
+    *out_length = total;
     return 0;
 }
-static int write_wire(kvspace_t *kv, const char *key, const uint8_t *wire,
-                      uint64_t len) {
-    if (len < KVSPACE_XVALUE_HEAD_LEN)
+static int write_wire(kvspace_t *store, const char *key, const uint8_t *wire,
+                      uint64_t length) {
+    if (length < KVSPACE_XVALUE_HEAD_LEN)
         return -1;
     const kvspaceXvalueHead *head = (const kvspaceXvalueHead *)(const void *)wire;
     uint64_t body = kvspaceXvalueHeadLen(head);
-    uint64_t attrs = kvspaceXvalueHeadAttrsLen(head);
-    if (KVSPACE_XVALUE_HEAD_LEN + body + attrs != len)
+    uint64_t attributes = kvspaceXvalueHeadAttrsLen(head);
+    if (KVSPACE_XVALUE_HEAD_LEN + body + attributes != length)
         return -1;
-    uint64_t off = 0;
-    if (realloc_key(kv, key, body, attrs, &off) != KVSPACE_OK)
+    uint64_t offset = 0;
+    if (realloc_key(store, key, body, attributes, &offset) != KVSPACE_OK)
         return -1;
-    uint8_t *base = storage_data_base(kv);
+    uint8_t *base = storage_data_base(store);
     if (!base)
         return -1;
-    uint8_t *dst = base + off;
-    memcpy(dst + KVSPACE_XVALUE_HEAD_LEN, wire + KVSPACE_XVALUE_HEAD_LEN, body);
-    if (attrs)
-        memcpy(dst + KVSPACE_XVALUE_HEAD_LEN + body,
-               wire + KVSPACE_XVALUE_HEAD_LEN + body, attrs);
+    uint8_t *destination = base + offset;
+    memcpy(destination + KVSPACE_XVALUE_HEAD_LEN, wire + KVSPACE_XVALUE_HEAD_LEN, body);
+    if (attributes)
+        memcpy(destination + KVSPACE_XVALUE_HEAD_LEN + body,
+               wire + KVSPACE_XVALUE_HEAD_LEN + body, attributes);
     return 0;
 }
-static int copy_key(kvspace_t *kv, const char *src, const char *dst) {
-    if (!kv || !src || !dst)
+static int copy_key(kvspace_t *store, const char *source, const char *destination) {
+    if (!store || !source || !destination)
         return -1;
     const uint8_t *raw = NULL;
-    uint64_t rl = 0;
-    if (read_wire(kv, src, &raw, &rl) != 0)
+    uint64_t raw_length = 0;
+    if (read_wire(store, source, &raw, &raw_length) != 0)
         return -1;
-    uint8_t *tmp = malloc((size_t)rl);
-    if (!tmp)
+    uint8_t *temporary = malloc((size_t)raw_length);
+    if (!temporary)
         return -1;
-    memcpy(tmp, raw, (size_t)rl);
-    int rc = write_wire(kv, dst, tmp, rl);
-    free(tmp);
-    return rc;
+    memcpy(temporary, raw, (size_t)raw_length);
+    int return_code = write_wire(store, destination, temporary, raw_length);
+    free(temporary);
+    return return_code;
 }
-static int storage_children(kvspace_t *kv, const char *key, keyscan_t *out);
-static int cptree_rec(kvspace_t *kv, const char *src, const char *dst) {
+static int storage_children(kvspace_t *store, const char *key, keyscan_t *out);
+static int copy_tree_recursive(kvspace_t *store, const char *source, const char *destination) {
     {
         const uint8_t *raw = NULL;
-        uint64_t rl = 0;
-        if (read_wire(kv, src, &raw, &rl) == 0) {
-            if (copy_key(kv, src, dst) != 0)
+        uint64_t raw_length = 0;
+        if (read_wire(store, source, &raw, &raw_length) == 0) {
+            if (copy_key(store, source, destination) != 0)
                 return -1;
         }
     }
-    if (kv_sync(kv) != 0)
+    if (store_sync(store) != 0)
         return -1;
-    char *es = edir(src), *ed = edir(dst);
-    char *ms = memdir(src), *md = memdir(dst);
-    if (!es || !ed || !ms || !md) {
-        free(es);
-        free(ed);
-        free(ms);
-        free(md);
+    char *source_directory = ending_directory(source), *destination_directory = ending_directory(destination);
+    char *member_source_directory = member_directory(source), *member_destination_directory = member_directory(destination);
+    if (!source_directory || !destination_directory || !member_source_directory || !member_destination_directory) {
+        free(source_directory);
+        free(destination_directory);
+        free(member_source_directory);
+        free(member_destination_directory);
         return -1;
     }
     keyscan_t children = {0};
     keyscan_t members = {0};
-    int rc = 0;
-    if (storage_children(kv, es, &children) == KVSPACE_BACKEND ||
-        storage_children(kv, ms, &members) == KVSPACE_BACKEND)
-        rc = -1;
-    for (int32_t i = 0; rc == 0 && i < children.count; i++) {
-        char *cs = pjoin(es, children.keys[i]), *cd = pjoin(ed, children.keys[i]);
-        if (!cs || !cd || cptree_rec(kv, cs, cd) != 0)
-            rc = -1;
-        free(cs);
-        free(cd);
+    int return_code = 0;
+    if (storage_children(store, source_directory, &children) == KVSPACE_BACKEND ||
+        storage_children(store, member_source_directory, &members) == KVSPACE_BACKEND)
+        return_code = -1;
+    for (int32_t i = 0; return_code == 0 && i < children.count; i++) {
+        char *child_source = path_join(source_directory, children.keys[i]), *child_destination = path_join(destination_directory, children.keys[i]);
+        if (!child_source || !child_destination || copy_tree_recursive(store, child_source, child_destination) != 0)
+            return_code = -1;
+        free(child_source);
+        free(child_destination);
     }
-    for (int32_t i = 0; rc == 0 && i < members.count; i++) {
-        size_t msl = strlen(ms), mdl = strlen(md), nl = strlen(members.keys[i]);
-        char *cs = malloc(msl + nl + 1);
-        char *cd = malloc(mdl + nl + 1);
-        if (!cs || !cd) {
-            rc = -1;
+    for (int32_t i = 0; return_code == 0 && i < members.count; i++) {
+        size_t member_source_length = strlen(member_source_directory), member_destination_length = strlen(member_destination_directory), name_length = strlen(members.keys[i]);
+        char *child_source = malloc(member_source_length + name_length + 1);
+        char *child_destination = malloc(member_destination_length + name_length + 1);
+        if (!child_source || !child_destination) {
+            return_code = -1;
         } else {
-            memcpy(cs, ms, msl);
-            memcpy(cs + msl, members.keys[i], nl + 1);
-            memcpy(cd, md, mdl);
-            memcpy(cd + mdl, members.keys[i], nl + 1);
-            if (cptree_rec(kv, cs, cd) != 0)
-                rc = -1;
+            memcpy(child_source, member_source_directory, member_source_length);
+            memcpy(child_source + member_source_length, members.keys[i], name_length + 1);
+            memcpy(child_destination, member_destination_directory, member_destination_length);
+            memcpy(child_destination + member_destination_length, members.keys[i], name_length + 1);
+            if (copy_tree_recursive(store, child_source, child_destination) != 0)
+                return_code = -1;
         }
-        free(cs);
-        free(cd);
+        free(child_source);
+        free(child_destination);
     }
     keyscan_free(&children);
     keyscan_free(&members);
-    free(es);
-    free(ed);
-    free(ms);
-    free(md);
-    return rc;
+    free(source_directory);
+    free(destination_directory);
+    free(member_source_directory);
+    free(member_destination_directory);
+    return return_code;
 }
-static int copy_tree(kvspace_t *kv, const char *src, const char *dst) {
-    if (!kv || !src || !dst || reserved_meta_path(src) ||
-        reserved_meta_path(dst))
+static int copy_tree(kvspace_t *store, const char *source, const char *destination) {
+    if (!store || !source || !destination || reserved_meta_path(source) ||
+        reserved_meta_path(destination))
         return -1;
-    size_t sl = strlen(src);
+    size_t source_length = strlen(source);
     for (;;) {
-        enum separator_kind kind = ending_separator(src, sl);
-        if (kind == SEPARATOR_NONE || sl <= (size_t)separator_length(kind))
+        enum separator_kind kind = ending_separator(source, source_length);
+        if (kind == SEPARATOR_NONE || source_length <= (size_t)separator_length(kind))
             break;
-        sl -= (size_t)separator_length(kind);
+        source_length -= (size_t)separator_length(kind);
     }
-    if (sl == 1 && separator_at(src, 0, sl) == SEPARATOR_SLASH &&
-        separator_at(dst, 0, strlen(dst)) == SEPARATOR_SLASH)
-        return strlen(dst) == 1 ? 0 : -1;
-    if (strncmp(src, dst, sl) == 0) {
-        const char *rest = dst + sl;
-        size_t restlen = strlen(rest);
-        enum separator_kind kind = separator_at(rest, 0, restlen);
-        if (restlen == 0 ||
+    if (source_length == 1 && separator_at(source, 0, source_length) == SEPARATOR_SLASH &&
+        separator_at(destination, 0, strlen(destination)) == SEPARATOR_SLASH)
+        return strlen(destination) == 1 ? 0 : -1;
+    if (strncmp(source, destination, source_length) == 0) {
+        const char *rest = destination + source_length;
+        size_t rest_length = strlen(rest);
+        enum separator_kind kind = separator_at(rest, 0, rest_length);
+        if (rest_length == 0 ||
             (kind != SEPARATOR_NONE &&
-             restlen == (size_t)separator_length(kind)))
+             rest_length == (size_t)separator_length(kind)))
             return 0;
         if (kind != SEPARATOR_NONE)
             return -1;
     }
-    delete_tree(kv, dst);
-    return cptree_rec(kv, src, dst);
+    delete_tree(store, destination);
+    return copy_tree_recursive(store, source, destination);
 }
-static int storage_locate(kvspace_t *kv, const char *key, int32_t *out_id,
+static int storage_locate(kvspace_t *store, const char *key, int32_t *out_id,
                           uint64_t *out_offset) {
-    art_hdr_t *h = art_search(kv, kv->hdr->art_root, (const uint8_t *)key,
+    adaptive_radix_tree_header_t *node_header = adaptive_radix_tree_search(store, store->header->adaptive_radix_tree_root, (const uint8_t *)key,
                               (int)strlen(key));
-    if (!h)
+    if (!node_header)
         return KVSPACE_MISSING;
-    uint64_t hv = art_val_load(h);
-    if (!AV_HAS(hv))
+    uint64_t packed_value = adaptive_radix_tree_value_load(node_header);
+    if (!ADAPTIVE_RADIX_TREE_VALUE_HAS(packed_value))
         return KVSPACE_MISSING;
-    *out_id = art_id_of(kv, h);
-    *out_offset = AV_OFF(hv);
+    *out_id = adaptive_radix_tree_id_of(store, node_header);
+    *out_offset = ADAPTIVE_RADIX_TREE_VALUE_OFFSET(packed_value);
     return KVSPACE_OK;
 }
-static int anchor_offset_valid(kvspace_t *kv, uint64_t offset,
+static int anchor_offset_valid(kvspace_t *store, uint64_t offset,
                                int32_t *out_id) {
-    blocks_meta_t *m = kv->art_meta;
-    if (offset < (uint64_t)m->sizeof_block_head || offset >= m->total_size)
+    blocks_meta_t *meta = store->adaptive_radix_tree_meta;
+    if (offset < (uint64_t)meta->sizeof_block_head || offset >= meta->total_size)
         return 0;
-    int64_t id = blockid_bydataoffset(m, offset);
-    if (id < 0 || (uint64_t)id >= m->used_blocks)
+    int64_t id = blockid_bydataoffset(meta, offset);
+    if (id < 0 || (uint64_t)id >= meta->used_blocks)
         return 0;
     *out_id = (int32_t)id;
     return 1;
 }
-static int art_resume(kvspace_t *kv, int32_t node_id, const char *suffix,
-                      int suffix_len, uint64_t *out_offset, int follow_moved) {
-    int32_t id = follow_moved ? art_follow(kv, node_id) : node_id;
+static int adaptive_radix_tree_resume(kvspace_t *store, int32_t node_id, const char *suffix,
+                      int suffix_length, uint64_t *out_offset, int follow_moved) {
+    int32_t id = follow_moved ? adaptive_radix_tree_follow(store, node_id) : node_id;
     if (id < 0)
         return KVSPACE_ANCHOR_INVALID;
-    art_hdr_t *node = art_hdr(kv, id);
-    if (!node || node->type > ART_N256 || node->prefix_len > ART_PREFIX_MAX)
+    adaptive_radix_tree_header_t *node = adaptive_radix_tree_header(store, id);
+    if (!node || node->type > ADAPTIVE_RADIX_TREE_N256 || node->prefix_len > ADAPTIVE_RADIX_TREE_PREFIX_MAX)
         return KVSPACE_ANCHOR_INVALID;
-    uint64_t value = art_val_load(node);
-    if (suffix_len == 0)
-        return AV_HAS(value) ? (*out_offset = AV_OFF(value), KVSPACE_OK)
+    uint64_t value = adaptive_radix_tree_value_load(node);
+    if (suffix_length == 0)
+        return ADAPTIVE_RADIX_TREE_VALUE_HAS(value) ? (*out_offset = ADAPTIVE_RADIX_TREE_VALUE_OFFSET(value), KVSPACE_OK)
                              : KVSPACE_MISSING;
-    int32_t child = art_child(kv, node, (uint8_t)suffix[0]);
+    int32_t child = adaptive_radix_tree_child(store, node, (uint8_t)suffix[0]);
     if (child < 0)
         return KVSPACE_MISSING;
-    int32_t found = art_walk(kv, child, (const uint8_t *)suffix, suffix_len, 1,
+    int32_t found = adaptive_radix_tree_walk(store, child, (const uint8_t *)suffix, suffix_length, 1,
                              NULL, NULL);
     if (found < 0)
         return KVSPACE_MISSING;
-    value = art_val_load(art_hdr(kv, found));
-    if (!AV_HAS(value))
+    value = adaptive_radix_tree_value_load(adaptive_radix_tree_header(store, found));
+    if (!ADAPTIVE_RADIX_TREE_VALUE_HAS(value))
         return KVSPACE_MISSING;
-    *out_offset = AV_OFF(value);
+    *out_offset = ADAPTIVE_RADIX_TREE_VALUE_OFFSET(value);
     return KVSPACE_OK;
 }
-static int resolve_anchor(kvspace_t *kv, const char *key,
+static int resolve_anchor(kvspace_t *store, const char *key,
                           const kvspace_anchor_t *anchor,
                           uint64_t *out_offset) {
-    if (!kv || !key || !out_offset)
+    if (!store || !key || !out_offset)
         return KVSPACE_INVALID;
     *out_offset = 0;
     if (!anchor || anchor->node_offset == 0)
-        return resolve_root(kv, key, out_offset);
-    uint64_t suffix_len = (uint64_t)strlen(key);
+        return resolve_root(store, key, out_offset);
+    uint64_t suffix_length = (uint64_t)strlen(key);
     if (reserved_meta_path(key) ||
-        separator_at(key, 0, (size_t)suffix_len) != SEPARATOR_NONE ||
-        !separator_sequence_valid(key, (size_t)suffix_len) ||
-        (uint64_t)anchor->depth + suffix_len >= 1024)
+        separator_at(key, 0, (size_t)suffix_length) != SEPARATOR_NONE ||
+        !separator_sequence_valid(key, (size_t)suffix_length) ||
+        (uint64_t)anchor->depth + suffix_length >= 1024)
         return KVSPACE_INVALID;
     if (!(anchor->flags & KVSPACE_ANCHOR_FLAG_INDEX))
         return KVSPACE_ANCHOR_INVALID;
-    if (kv_sync(kv) != 0)
+    if (store_sync(store) != 0)
         return KVSPACE_BACKEND;
     int32_t node_id = -1;
-    if (!anchor_offset_valid(kv, anchor->node_offset, &node_id))
+    if (!anchor_offset_valid(store, anchor->node_offset, &node_id))
         return KVSPACE_ANCHOR_INVALID;
     for (int attempt = 0; attempt < 3; attempt++) {
         uint64_t before =
-            __atomic_load_n(&kv->hdr->gen_epoch, __ATOMIC_ACQUIRE);
-        int status = art_resume(kv, node_id, key, (int)suffix_len, out_offset,
+            __atomic_load_n(&store->header->generation_epoch, __ATOMIC_ACQUIRE);
+        int status = adaptive_radix_tree_resume(store, node_id, key, (int)suffix_length, out_offset,
                                 anchor->epoch != before);
         uint64_t after =
-            __atomic_load_n(&kv->hdr->gen_epoch, __ATOMIC_ACQUIRE);
+            __atomic_load_n(&store->header->generation_epoch, __ATOMIC_ACQUIRE);
         if (before == after)
             return status;
     }
     return KVSPACE_ANCHOR_INVALID;
 }
-static uint8_t *storage_data_base(kvspace_t *kv) {
-    return kv ? kv->sbo_data : NULL;
+static uint8_t *storage_data_base(kvspace_t *store) {
+    return store ? store->slots_box_data : NULL;
 }
-static int resolve_root(kvspace_t *kv, const char *key,
+static int resolve_root(kvspace_t *store, const char *key,
                              uint64_t *out_offset) {
     int32_t id = -1;
-    if (!kv || !key || !out_offset)
+    if (!store || !key || !out_offset)
         return KVSPACE_INVALID;
     *out_offset = 0;
     if (!key_text_valid(key))
         return KVSPACE_INVALID;
-    if (kv_sync(kv) != 0)
+    if (store_sync(store) != 0)
         return KVSPACE_BACKEND;
-    return storage_locate(kv, key, &id, out_offset);
+    return storage_locate(store, key, &id, out_offset);
 }
-static void storage_write_head(uint8_t *dst, uint64_t body_len,
-                               uint64_t attr_len) {
-    kvspaceXvalueHead h;
-    memset(&h, 0, sizeof h);
-    kvspaceXvalueHeadSetLen(&h, body_len);
-    kvspaceXvalueHeadSetAttrsLen(&h, (uint16_t)attr_len);
-    memcpy(dst, &h, sizeof h);
+static void storage_write_head(uint8_t *destination, uint64_t body_length,
+                               uint64_t attribute_length) {
+    kvspaceXvalueHead header;
+    memset(&header, 0, sizeof header);
+    kvspaceXvalueHeadSetLen(&header, body_length);
+    kvspaceXvalueHeadSetAttrsLen(&header, (uint16_t)attribute_length);
+    memcpy(destination, &header, sizeof header);
 }
-static int realloc_key(kvspace_t *kv, const char *key,
-                             uint64_t body_len, uint64_t attr_len,
+static int realloc_key(kvspace_t *store, const char *key,
+                             uint64_t body_length, uint64_t attribute_length,
                              uint64_t *out_offset) {
-    if (!kv || !key || !out_offset)
+    if (!store || !key || !out_offset)
         return KVSPACE_INVALID;
     *out_offset = 0;
     if (!key_text_valid(key))
         return KVSPACE_INVALID;
-    if (attr_len > UINT16_MAX)
+    if (attribute_length > UINT16_MAX)
         return KVSPACE_INVALID;
-    uint64_t need = KVSPACE_XVALUE_HEAD_LEN + body_len;
-    if (need < body_len || need > UINT64_MAX - attr_len)
+    uint64_t need = KVSPACE_XVALUE_HEAD_LEN + body_length;
+    if (need < body_length || need > UINT64_MAX - attribute_length)
         return KVSPACE_INVALID;
-    need += attr_len;
+    need += attribute_length;
     if (need > INT32_MAX)
         return KVSPACE_INVALID;
-    if (kv_sync(kv) != 0)
+    if (store_sync(store) != 0)
         return KVSPACE_BACKEND;
-    art_hdr_t *node = art_search(kv, kv->hdr->art_root, (const uint8_t *)key,
+    adaptive_radix_tree_header_t *node = adaptive_radix_tree_search(store, store->header->adaptive_radix_tree_root, (const uint8_t *)key,
                                  (int)strlen(key));
-    uint64_t ohv = node ? art_val_load(node) : 0;
-    bool retiring = node && AV_HAS(ohv);
-    uint64_t gidx = 0;
-    uint64_t old_cap = 0;
+    uint64_t old_header_value = node ? adaptive_radix_tree_value_load(node) : 0;
+    bool retiring = node && ADAPTIVE_RADIX_TREE_VALUE_HAS(old_header_value);
+    uint64_t garbage_index = 0;
+    uint64_t old_capacity = 0;
     if (retiring) {
-        uint64_t off = AV_OFF(ohv);
-        old_cap = sbo_allocated_size(kv->sbo_meta, off);
-        if (need <= old_cap) {
-            kv_gens_t *g = gens_at(kv, art_id_of(kv, node));
-            if (g)
-                __atomic_add_fetch(&g->value_gen, 1u, __ATOMIC_ACQ_REL);
-            storage_write_head(kv->sbo_data + off, body_len, attr_len);
-            if (g)
-                __atomic_add_fetch(&g->value_gen, 1u, __ATOMIC_ACQ_REL);
-            *out_offset = off;
+        uint64_t offset = ADAPTIVE_RADIX_TREE_VALUE_OFFSET(old_header_value);
+        old_capacity = sbo_allocated_size(store->slots_box_meta, offset);
+        if (need <= old_capacity) {
+            generations_t *generations = generations_at(store, adaptive_radix_tree_id_of(store, node));
+            if (generations)
+                __atomic_add_fetch(&generations->value_generation, 1u, __ATOMIC_ACQ_REL);
+            storage_write_head(store->slots_box_data + offset, body_length, attribute_length);
+            if (generations)
+                __atomic_add_fetch(&generations->value_generation, 1u, __ATOMIC_ACQ_REL);
+            *out_offset = offset;
             return KVSPACE_OK;
         }
-        if (garb_reserve(kv, &gidx) != 0)
+        if (garbage_reserve(store, &garbage_index) != 0)
             return KVSPACE_BACKEND;
     }
-    uint64_t off = kv_sbo_alloc(kv, (size_t)need);
-    if (off == (uint64_t)-1) {
+    uint64_t offset = store_slots_box_alloc(store, (size_t)need);
+    if (offset == (uint64_t)-1) {
         if (retiring)
-            garb_cancel(kv, gidx);
+            garbage_cancel(store, garbage_index);
         return KVSPACE_BACKEND;
     }
-    memset(kv->sbo_data + off, 0, (size_t)need);
-    storage_write_head(kv->sbo_data + off, body_len, attr_len);
-    int32_t root = art_ins(kv, kv->hdr->art_root, (const uint8_t *)key,
-                           (int)strlen(key), 0, off);
+    memset(store->slots_box_data + offset, 0, (size_t)need);
+    storage_write_head(store->slots_box_data + offset, body_length, attribute_length);
+    int32_t root = adaptive_radix_tree_insert(store, store->header->adaptive_radix_tree_root, (const uint8_t *)key,
+                           (int)strlen(key), 0, offset);
     if (root < 0) {
         if (retiring)
-            garb_cancel(kv, gidx);
-        kv_sbo_free(kv, off);
+            garbage_cancel(store, garbage_index);
+        store_slots_box_free(store, offset);
         return KVSPACE_BACKEND;
     }
-    kv->hdr->art_root = root;
+    store->header->adaptive_radix_tree_root = root;
     {
-        int32_t nid = p2_node_at(kv, key);
-        kv_gens_t *g = gens_at(kv, nid);
-        if (g) {
-            gen_bump_struct(kv, nid);
-            gen_bump_value(kv, nid);
+        int32_t node_id = recovery_node_at(store, key);
+        generations_t *generations = generations_at(store, node_id);
+        if (generations) {
+            generation_bump_struct(store, node_id);
+            generation_bump_value(store, node_id);
         }
     }
     if (retiring)
-        garb_commit(kv, gidx, AV_OFF(ohv), old_cap);
+        garbage_commit(store, garbage_index, ADAPTIVE_RADIX_TREE_VALUE_OFFSET(old_header_value), old_capacity);
     else
-        list_gen_bump(kv);
-    *out_offset = off;
+        list_generation_bump(store);
+    *out_offset = offset;
     return KVSPACE_OK;
 }
 static int storage_is_index_key(const char *key) {
-    size_t n = strlen(key);
-    return n > 0 && ending_separator(key, n) != SEPARATOR_NONE;
+    size_t length = strlen(key);
+    return length > 0 && ending_separator(key, length) != SEPARATOR_NONE;
 }
-static int storage_has_children(kvspace_t *kv, const char *key) {
+static int storage_has_children(kvspace_t *store, const char *key) {
     keyscan_t children = {0};
-    char buf[4096];
-    int rc = 0;
-    if (kv->hdr->art_root < 0)
+    char buffer[4096];
+    int return_code = 0;
+    if (store->header->adaptive_radix_tree_root < 0)
         return KVSPACE_OK;
-    if (art_scan_pfx(kv, key, (int)strlen(key), buf, (int)sizeof buf,
+    if (adaptive_radix_tree_scan_prefix(store, key, (int)strlen(key), buffer, (int)sizeof buffer,
                      &children) != 0) {
         keyscan_free(&children);
         return KVSPACE_BACKEND;
     }
     if (children.count > 0)
-        rc = KVSPACE_HAS_CHILDREN;
+        return_code = KVSPACE_HAS_CHILDREN;
     keyscan_free(&children);
-    return rc;
+    return return_code;
 }
-static int free_key(kvspace_t *kv, const char *key) {
-    if (!kv || !key)
+static int free_key(kvspace_t *store, const char *key) {
+    if (!store || !key)
         return KVSPACE_INVALID;
     if (!key_text_valid(key))
         return KVSPACE_INVALID;
-    if (kv_sync(kv) != 0)
+    if (store_sync(store) != 0)
         return KVSPACE_BACKEND;
     if (storage_is_index_key(key)) {
-        char *d = edir(key);
-        int child_rc = storage_has_children(kv, d);
-        free(d);
-        if (child_rc != KVSPACE_OK)
-            return child_rc;
+        char *directory = ending_directory(key);
+        int child_return_code = storage_has_children(store, directory);
+        free(directory);
+        if (child_return_code != KVSPACE_OK)
+            return child_return_code;
     }
-    int rc = shm_del_key(kv, key);
-    if (rc < 0)
+    int return_code = shared_memory_delete_key(store, key);
+    if (return_code < 0)
         return KVSPACE_BACKEND;
-    if (rc == 0)
+    if (return_code == 0)
         return KVSPACE_MISSING;
-    list_gen_bump(kv);
+    list_generation_bump(store);
     return KVSPACE_OK;
 }
-static int makeindex_key(kvspace_t *kv, const char *key) {
-    if (!kv || !key)
+static int makeindex_key(kvspace_t *store, const char *key) {
+    if (!store || !key)
         return KVSPACE_INVALID;
     if (!key_text_valid(key))
         return KVSPACE_INVALID;
     if (!storage_is_index_key(key))
         return KVSPACE_INVALID;
-    uint64_t off = 0;
-    int rc = resolve_root(kv, key, &off);
-    if (rc == KVSPACE_OK)
+    uint64_t offset = 0;
+    int return_code = resolve_root(store, key, &offset);
+    if (return_code == KVSPACE_OK)
         return KVSPACE_OK;
-    if (rc != KVSPACE_MISSING)
-        return rc;
-    rc = realloc_key(kv, key, 0, 0, &off);
-    return rc;
+    if (return_code != KVSPACE_MISSING)
+        return return_code;
+    return_code = realloc_key(store, key, 0, 0, &offset);
+    return return_code;
 }
-static int storage_key_exists(kvspace_t *kv, const char *key) {
-    if (!kv || !key)
+static int storage_key_exists(kvspace_t *store, const char *key) {
+    if (!store || !key)
         return 0;
-    art_hdr_t *h = art_search(kv, kv->hdr->art_root, (const uint8_t *)key,
+    adaptive_radix_tree_header_t *node_header = adaptive_radix_tree_search(store, store->header->adaptive_radix_tree_root, (const uint8_t *)key,
                               (int)strlen(key));
-    if (h && AV_HAS(art_val_load(h)))
+    if (node_header && ADAPTIVE_RADIX_TREE_VALUE_HAS(adaptive_radix_tree_value_load(node_header)))
         return 1;
     if (storage_is_index_key(key)) {
         keyscan_t children = {0};
-        char buf[4096];
-        int rc = 0;
-        if (kv->hdr->art_root >= 0)
-            rc = art_scan_pfx(kv, key, (int)strlen(key), buf, (int)sizeof buf,
+        char buffer[4096];
+        int return_code = 0;
+        if (store->header->adaptive_radix_tree_root >= 0)
+            return_code = adaptive_radix_tree_scan_prefix(store, key, (int)strlen(key), buffer, (int)sizeof buffer,
                               &children);
-        int has = rc == 0 && children.count > 0;
+        int has = return_code == 0 && children.count > 0;
         keyscan_free(&children);
         return has;
     }
-    size_t n = strlen(key);
-    if (n == 0 || n + 2 > 1024)
+    size_t length = strlen(key);
+    if (length == 0 || length + 2 > 1024)
         return 0;
     char *dir = append_separator(key, SEPARATOR_SLASH);
     if (!dir)
         return 0;
-    h = art_search(kv, kv->hdr->art_root, (const uint8_t *)dir, (int)strlen(dir));
-    int exists = h && AV_HAS(art_val_load(h));
+    node_header = adaptive_radix_tree_search(store, store->header->adaptive_radix_tree_root, (const uint8_t *)dir, (int)strlen(dir));
+    int exists = node_header && ADAPTIVE_RADIX_TREE_VALUE_HAS(adaptive_radix_tree_value_load(node_header));
     free(dir);
     return exists;
 }
-static int storage_index_state(kvspace_t *kv, const char *key) {
+static int storage_index_state(kvspace_t *store, const char *key) {
     if (!storage_is_index_key(key))
-        return storage_key_exists(kv, key) ? KVSPACE_NOT_INDEX : KVSPACE_MISSING;
-    if (!storage_key_exists(kv, key))
+        return storage_key_exists(store, key) ? KVSPACE_NOT_INDEX : KVSPACE_MISSING;
+    if (!storage_key_exists(store, key))
         return KVSPACE_MISSING;
     return KVSPACE_OK;
 }
-static int storage_children(kvspace_t *kv, const char *key, keyscan_t *out) {
-    char buf[4096];
-    if (kv->hdr->art_root >= 0 &&
-        art_scan_pfx(kv, key, (int)strlen(key), buf, (int)sizeof buf, out) != 0) {
+static int storage_children(kvspace_t *store, const char *key, keyscan_t *out) {
+    char buffer[4096];
+    if (store->header->adaptive_radix_tree_root >= 0 &&
+        adaptive_radix_tree_scan_prefix(store, key, (int)strlen(key), buffer, (int)sizeof buffer, out) != 0) {
         keyscan_free(out);
         return KVSPACE_BACKEND;
     }
-    if (out->count == 0 && !storage_key_exists(kv, key))
+    if (out->count == 0 && !storage_key_exists(store, key))
         return KVSPACE_MISSING;
     return KVSPACE_OK;
 }
-static int storage_list_prefix(const char *key, char *out, size_t cap) {
-    size_t n = strlen(key);
-    if (n == 0 || n >= cap)
+static int storage_list_prefix(const char *key, char *out, size_t capacity) {
+    size_t length = strlen(key);
+    if (length == 0 || length >= capacity)
         return KVSPACE_INVALID;
-    memcpy(out, key, n + 1);
+    memcpy(out, key, length + 1);
     return KVSPACE_OK;
 }
-static int listlen_key(kvspace_t *kv, const char *key, int64_t *out_count,
+static int listlen_key(kvspace_t *store, const char *key, int64_t *out_count,
                              uint32_t *out_max_name_length) {
-    if (!kv || !key || !out_count || !out_max_name_length)
+    if (!store || !key || !out_count || !out_max_name_length)
         return KVSPACE_INVALID;
     *out_count = 0;
     *out_max_name_length = 0;
     if (!key_text_valid(key))
         return KVSPACE_INVALID;
-    if (kv_sync(kv) != 0)
+    if (store_sync(store) != 0)
         return KVSPACE_BACKEND;
-    int rc = storage_index_state(kv, key);
-    if (rc != KVSPACE_OK)
-        return rc;
-    char pfx[1024];
-    rc = storage_list_prefix(key, pfx, sizeof pfx);
-    if (rc != KVSPACE_OK)
-        return rc;
+    int return_code = storage_index_state(store, key);
+    if (return_code != KVSPACE_OK)
+        return return_code;
+    char prefix[1024];
+    return_code = storage_list_prefix(key, prefix, sizeof prefix);
+    if (return_code != KVSPACE_OK)
+        return return_code;
     keyscan_t children = {0};
-    rc = storage_children(kv, pfx, &children);
-    if (rc != KVSPACE_OK)
-        return rc;
-    uint32_t max_len = 0;
+    return_code = storage_children(store, prefix, &children);
+    if (return_code != KVSPACE_OK)
+        return return_code;
+    uint32_t max_length = 0;
     for (int32_t i = 0; i < children.count; i++) {
-        size_t n = strlen(children.keys[i]);
-        if (n > max_len)
-            max_len = (uint32_t)n;
+        size_t length = strlen(children.keys[i]);
+        if (length > max_length)
+            max_length = (uint32_t)length;
     }
     *out_count = children.count;
-    *out_max_name_length = max_len;
+    *out_max_name_length = max_length;
     keyscan_free(&children);
     return KVSPACE_OK;
 }
-static int list_names_raw(kvspace_t *kv, const char *key, char *out_names,
+static int list_names_raw(kvspace_t *store, const char *key, char *out_names,
                           uint32_t out_capacity, uint32_t *out_length,
                           uint32_t *out_count, uint64_t *out_generation) {
-    if (!kv || !key)
+    if (!store || !key)
         return KVSPACE_INVALID;
     if (out_length)
         *out_length = 0;
@@ -2567,24 +2567,24 @@ static int list_names_raw(kvspace_t *kv, const char *key, char *out_names,
         *out_generation = 0;
     if (!key_text_valid(key))
         return KVSPACE_INVALID;
-    if (kv_sync(kv) != 0)
+    if (store_sync(store) != 0)
         return KVSPACE_BACKEND;
-    int rc = storage_index_state(kv, key);
-    if (rc != KVSPACE_OK)
-        return rc;
-    char pfx[1024];
-    rc = storage_list_prefix(key, pfx, sizeof pfx);
-    if (rc != KVSPACE_OK)
-        return rc;
+    int return_code = storage_index_state(store, key);
+    if (return_code != KVSPACE_OK)
+        return return_code;
+    char prefix[1024];
+    return_code = storage_list_prefix(key, prefix, sizeof prefix);
+    if (return_code != KVSPACE_OK)
+        return return_code;
     keyscan_t children = {0};
-    rc = storage_children(kv, pfx, &children);
-    if (rc != KVSPACE_OK)
-        return rc;
+    return_code = storage_children(store, prefix, &children);
+    if (return_code != KVSPACE_OK)
+        return return_code;
     uint64_t total = 0;
     for (int32_t i = 0; i < children.count; i++)
         total += (uint64_t)strlen(children.keys[i]) + 1;
     if (out_generation)
-        *out_generation = __atomic_load_n(&kv->hdr->list_gen, __ATOMIC_ACQUIRE);
+        *out_generation = __atomic_load_n(&store->header->list_generation, __ATOMIC_ACQUIRE);
     if (out_count)
         *out_count = (uint32_t)children.count;
     if (out_length)
@@ -2594,40 +2594,40 @@ static int list_names_raw(kvspace_t *kv, const char *key, char *out_names,
             keyscan_free(&children);
             return KVSPACE_CAPACITY;
         }
-        char *p = out_names;
+        char *pointer = out_names;
         for (int32_t i = 0; i < children.count; i++) {
-            size_t n = strlen(children.keys[i]) + 1;
-            memcpy(p, children.keys[i], n);
-            p += n;
+            size_t length = strlen(children.keys[i]) + 1;
+            memcpy(pointer, children.keys[i], length);
+            pointer += length;
         }
     }
     keyscan_free(&children);
     return KVSPACE_OK;
 }
-static int kvspace_dsn_path(const char *dsn, char *out, size_t out_size) {
-    if (!dsn)
+static int kvspace_data_source_name_path(const char *data_source_name, char *out, size_t out_size) {
+    if (!data_source_name)
         return -1;
-    const char *separator = strstr(dsn, "://");
-    if (!separator || separator - dsn != 3 || strncmp(dsn, "shm", 3) != 0)
+    const char *separator = strstr(data_source_name, "://");
+    if (!separator || separator - data_source_name != 3 || strncmp(data_source_name, "shm", 3) != 0)
         return -1;
     int written = snprintf(out, out_size, "%s", separator + 3);
     return written > 0 && (size_t)written < out_size ? 0 : -1;
 }
-static int kvspace_fail(int status, char *err, uint32_t err_cap,
+static int kvspace_fail(int status, char *error, uint32_t error_capacity,
                         const char *operation, const char *key) {
-    if (err && err_cap)
-        snprintf(err, err_cap, "kvspace: %s failed at %s", operation,
+    if (error && error_capacity)
+        snprintf(error, error_capacity, "kvspace: %s failed at %s", operation,
                  key ? key : "(null)");
     return status;
 }
-KVSPACE_PUBLIC void *kvspaceConnect(const char *dsn) {
+KVSPACE_PUBLIC void *kvspaceConnect(const char *data_source_name) {
     int entry_errno = errno;
     char path[1024];
-    if (kvspace_dsn_path(dsn, path, sizeof path) != 0) {
+    if (kvspace_data_source_name_path(data_source_name, path, sizeof path) != 0) {
         errno = EINVAL;
         return NULL;
     }
-    void *handle = (void *)open_shm_store(path, kvspace_data_size);
+    void *handle = (void *)open_shared_memory_store(path, kvspace_data_size);
     if (handle != NULL) {
         errno = entry_errno;
         return handle;
@@ -2638,7 +2638,7 @@ KVSPACE_PUBLIC void *kvspaceConnect(const char *dsn) {
 }
 KVSPACE_PUBLIC void kvspaceClose(void *handle) {
     if (handle)
-        close_shm_store((kvspace_t *)handle);
+        close_shared_memory_store((kvspace_t *)handle);
 }
 KVSPACE_PUBLIC uint8_t *kvspaceXvalueInProcessAddress(void *handle) {
     if (!handle)
@@ -2647,8 +2647,8 @@ KVSPACE_PUBLIC uint8_t *kvspaceXvalueInProcessAddress(void *handle) {
 }
 KVSPACE_PUBLIC int kvspaceResolveOffset(void *handle, const char *key,
                                  const kvspace_anchor_t *anchor,
-                                 uint64_t *out_value_offset, char *err,
-                                 uint32_t err_cap) {
+                                 uint64_t *out_value_offset, char *error,
+                                 uint32_t error_capacity) {
     if (!handle || !key || !out_value_offset)
         return KVSPACE_INVALID;
     *out_value_offset = 0;
@@ -2656,108 +2656,108 @@ KVSPACE_PUBLIC int kvspaceResolveOffset(void *handle, const char *key,
                                   out_value_offset);
     if (internal == KVSPACE_OK)
         return KVSPACE_OK;
-    return kvspace_fail(internal, err, err_cap, "resolve", key);
+    return kvspace_fail(internal, error, error_capacity, "resolve", key);
 }
 KVSPACE_PUBLIC int kvspaceAnchorOf(void *handle, const char *directory_key,
-                                   kvspace_anchor_t *out_anchor, char *err,
-                                   uint32_t err_cap) {
+                                   kvspace_anchor_t *out_anchor, char *error,
+                                   uint32_t error_capacity) {
     if (!handle || !directory_key || !out_anchor)
         return KVSPACE_INVALID;
     size_t key_len = strlen(directory_key);
     if (!key_text_valid(directory_key))
-        return kvspace_fail(KVSPACE_INVALID, err, err_cap, "anchor",
+        return kvspace_fail(KVSPACE_INVALID, error, error_capacity, "anchor",
                             directory_key);
     if (!storage_is_index_key(directory_key))
-        return kvspace_fail(KVSPACE_NOT_INDEX, err, err_cap, "anchor",
+        return kvspace_fail(KVSPACE_NOT_INDEX, error, error_capacity, "anchor",
                             directory_key);
-    kvspace_t *kv = (kvspace_t *)handle;
-    if (kv_sync(kv) != 0)
-        return kvspace_fail(KVSPACE_BACKEND, err, err_cap, "anchor",
+    kvspace_t *store = (kvspace_t *)handle;
+    if (store_sync(store) != 0)
+        return kvspace_fail(KVSPACE_BACKEND, error, error_capacity, "anchor",
                             directory_key);
-    art_hdr_t *node = art_search(kv, kv->hdr->art_root,
+    adaptive_radix_tree_header_t *node = adaptive_radix_tree_search(store, store->header->adaptive_radix_tree_root,
                                  (const uint8_t *)directory_key,
                                  (int)key_len);
-    if (!node || !AV_HAS(art_val_load(node)))
-        return kvspace_fail(KVSPACE_MISSING, err, err_cap, "anchor",
+    if (!node || !ADAPTIVE_RADIX_TREE_VALUE_HAS(adaptive_radix_tree_value_load(node)))
+        return kvspace_fail(KVSPACE_MISSING, error, error_capacity, "anchor",
                             directory_key);
-    int32_t id = art_id_of(kv, node);
+    int32_t id = adaptive_radix_tree_id_of(store, node);
     if (id < 0)
-        return kvspace_fail(KVSPACE_BACKEND, err, err_cap, "anchor",
+        return kvspace_fail(KVSPACE_BACKEND, error, error_capacity, "anchor",
                             directory_key);
-    uint64_t offset = (uint64_t)blockdata_offset(kv->art_meta, (uint64_t)id);
+    uint64_t offset = (uint64_t)blockdata_offset(store->adaptive_radix_tree_meta, (uint64_t)id);
     if (offset == 0)
-        return kvspace_fail(KVSPACE_BACKEND, err, err_cap, "anchor",
+        return kvspace_fail(KVSPACE_BACKEND, error, error_capacity, "anchor",
                             directory_key);
     out_anchor->node_offset = offset;
-    out_anchor->epoch = __atomic_load_n(&kv->hdr->gen_epoch, __ATOMIC_ACQUIRE);
+    out_anchor->epoch = __atomic_load_n(&store->header->generation_epoch, __ATOMIC_ACQUIRE);
     out_anchor->depth = (uint32_t)key_len;
     out_anchor->flags = KVSPACE_ANCHOR_FLAG_INDEX;
     return KVSPACE_OK;
 }
 KVSPACE_PUBLIC int kvspaceRealloc(void *handle, const char *key,
-                                 uint64_t body_length, uint64_t attr_length,
-                                 uint64_t *out_value_offset, char *err,
-                                 uint32_t err_cap) {
+                                 uint64_t body_length, uint64_t attribute_length,
+                                 uint64_t *out_value_offset, char *error,
+                                 uint32_t error_capacity) {
     if (!handle || !key || !out_value_offset)
         return KVSPACE_INVALID;
     *out_value_offset = 0;
     int internal = realloc_key((kvspace_t *)handle, key,
-                                            body_length, attr_length,
+                                            body_length, attribute_length,
                                             out_value_offset);
     if (internal == KVSPACE_OK)
         return KVSPACE_OK;
-    return kvspace_fail(internal, err, err_cap, "realloc",
+    return kvspace_fail(internal, error, error_capacity, "realloc",
                         key);
 }
-KVSPACE_PUBLIC int kvspaceFree(void *handle, const char *key, char *err,
-                               uint32_t err_cap) {
+KVSPACE_PUBLIC int kvspaceFree(void *handle, const char *key, char *error,
+                               uint32_t error_capacity) {
     if (!handle || !key)
         return KVSPACE_INVALID;
     int internal = free_key((kvspace_t *)handle, key);
     if (internal == KVSPACE_OK)
         return KVSPACE_OK;
-    return kvspace_fail(internal, err, err_cap, "free", key);
+    return kvspace_fail(internal, error, error_capacity, "free", key);
 }
 KVSPACE_PUBLIC int kvspaceCp(void *handle, const char *old_key,
-                             const char *new_key, char *err,
-                             uint32_t err_cap) {
+                             const char *new_key, char *error,
+                             uint32_t error_capacity) {
     if (!handle || !old_key || !new_key)
         return KVSPACE_INVALID;
     if (copy_key((kvspace_t *)handle, old_key, new_key) != 0)
-        return kvspace_fail(KVSPACE_BACKEND, err, err_cap, "cp", old_key);
+        return kvspace_fail(KVSPACE_BACKEND, error, error_capacity, "cp", old_key);
     return KVSPACE_OK;
 }
-KVSPACE_PUBLIC int kvspaceMkindex(void *handle, const char *key, char *err,
-                                  uint32_t err_cap) {
+KVSPACE_PUBLIC int kvspaceMkindex(void *handle, const char *key, char *error,
+                                  uint32_t error_capacity) {
     if (!handle || !key)
         return KVSPACE_INVALID;
     int internal = makeindex_key((kvspace_t *)handle, key);
     if (internal == KVSPACE_OK)
         return KVSPACE_OK;
-    return kvspace_fail(internal, err, err_cap, "mkindex",
+    return kvspace_fail(internal, error, error_capacity, "mkindex",
                         key);
 }
-KVSPACE_PUBLIC int kvspaceDeltree(void *handle, const char *key, char *err,
-                                  uint32_t err_cap) {
+KVSPACE_PUBLIC int kvspaceDeltree(void *handle, const char *key, char *error,
+                                  uint32_t error_capacity) {
     if (!handle || !key)
         return KVSPACE_INVALID;
     if (delete_tree((kvspace_t *)handle, key) != 0)
-        return kvspace_fail(KVSPACE_BACKEND, err, err_cap, "deltree", key);
+        return kvspace_fail(KVSPACE_BACKEND, error, error_capacity, "deltree", key);
     return KVSPACE_OK;
 }
 KVSPACE_PUBLIC int kvspaceCpdir(void *handle, const char *source_key,
-                                const char *destination_key, char *err,
-                                uint32_t err_cap) {
+                                const char *destination_key, char *error,
+                                uint32_t error_capacity) {
     if (!handle || !source_key || !destination_key)
         return KVSPACE_INVALID;
     if (copy_tree((kvspace_t *)handle, source_key, destination_key) != 0)
-        return kvspace_fail(KVSPACE_BACKEND, err, err_cap, "cpdir", source_key);
+        return kvspace_fail(KVSPACE_BACKEND, error, error_capacity, "cpdir", source_key);
     return KVSPACE_OK;
 }
 KVSPACE_PUBLIC int kvspaceListlen(void *handle, const char *key,
                                   int64_t *out_count,
-                                  uint32_t *out_max_name_length, char *err,
-                                  uint32_t err_cap) {
+                                  uint32_t *out_max_name_length, char *error,
+                                  uint32_t error_capacity) {
     if (!handle || !key || !out_count || !out_max_name_length)
         return KVSPACE_INVALID;
     *out_count = 0;
@@ -2766,13 +2766,13 @@ KVSPACE_PUBLIC int kvspaceListlen(void *handle, const char *key,
                                             out_max_name_length);
     if (internal == KVSPACE_OK)
         return KVSPACE_OK;
-    return kvspace_fail(internal, err, err_cap, "listlen",
+    return kvspace_fail(internal, error, error_capacity, "listlen",
                         key);
 }
 KVSPACE_PUBLIC int kvspaceList(void *handle, const char *key, char *out_names,
                                uint32_t out_capacity, uint32_t *out_length,
                                uint32_t *out_count, uint64_t *out_generation,
-                               char *err, uint32_t err_cap) {
+                               char *error, uint32_t error_capacity) {
     if (!handle || !key)
         return KVSPACE_INVALID;
     int internal = list_names_raw((kvspace_t *)handle, key, out_names,
@@ -2780,5 +2780,5 @@ KVSPACE_PUBLIC int kvspaceList(void *handle, const char *key, char *out_names,
                                          out_generation);
     if (internal == KVSPACE_OK)
         return KVSPACE_OK;
-    return kvspace_fail(internal, err, err_cap, "list", key);
+    return kvspace_fail(internal, error, error_capacity, "list", key);
 }

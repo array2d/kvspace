@@ -8,7 +8,7 @@
 #include <stdlib.h>
 #include <string.h>
 static void *t_open(const char *path, size_t data_size) {
-#ifdef P2_TEST_HOOKS
+#ifdef RECOVERY_TEST_HOOKS
     kvspaceTestSetDataSize(data_size);
 #else
     (void)data_size;
