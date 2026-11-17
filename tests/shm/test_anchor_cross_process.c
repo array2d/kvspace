@@ -122,6 +122,131 @@ static int child_main(const char *dsn, void *inherited,
     kvspaceClose(h);
     return failures ? 1 : 0;
 }
+static int child_resolve_relative(const char *dsn, void *inherited,
+                                  const kvspace_anchor_t *anchor,
+                                  const char *suffix, uint64_t expected_offset,
+                                  const uint8_t *expected, uint32_t expected_len) {
+    char err[256] = {0};
+    int failures = 0;
+    uint64_t offset = 0;
+    kvspaceClose(inherited);
+    void *h = kvspaceConnect(dsn);
+    if (!h) {
+        fprintf(stderr, "child: reconnect %s failed\n", dsn);
+        return 1;
+    }
+    uint8_t *base = kvspaceXvalueInProcessAddress(h);
+    if (!base) {
+        fprintf(stderr, "child: in-process address is NULL\n");
+        kvspaceClose(h);
+        return 1;
+    }
+    int rc = kvspaceResolveOffset(h, suffix, anchor, &offset, err, sizeof err);
+    if (rc != KVSPACE_OK) {
+        fprintf(stderr, "child: resolve \"%s\" rc=%d err=%s\n", suffix, rc, err);
+        ++failures;
+    } else if (offset != expected_offset) {
+        fprintf(stderr,
+                "child: resolve \"%s\" offset %llu differs from expected %llu\n",
+                suffix, (unsigned long long)offset,
+                (unsigned long long)expected_offset);
+        ++failures;
+    } else if (expected_len) {
+        const kvspaceXvalueHead *head =
+            (const kvspaceXvalueHead *)(const void *)(base + offset);
+        uint64_t body = kvspaceXvalueHeadLen(head);
+        if (body != expected_len) {
+            fprintf(stderr, "child: resolve \"%s\" bodylen %llu != %u\n",
+                    suffix, (unsigned long long)body, expected_len);
+            ++failures;
+        } else if (memcmp(base + offset + KVSPACE_XVALUE_HEAD_LEN, expected,
+                          expected_len) != 0) {
+            fprintf(stderr, "child: resolve \"%s\" body bytes differ\n", suffix);
+            ++failures;
+        }
+    }
+    kvspaceClose(h);
+    return failures ? 1 : 0;
+}
+static int run_child_relative(const char *dsn, void *inherited,
+                              const kvspace_anchor_t *anchor,
+                              const char *suffix, uint64_t expected_offset,
+                              const uint8_t *expected, uint32_t expected_len) {
+    pid_t pid = fork();
+    if (pid < 0) {
+        perror("fork");
+        return 1;
+    }
+    if (pid == 0)
+        _exit(child_resolve_relative(dsn, inherited, anchor, suffix,
+                                     expected_offset, expected, expected_len));
+    int status = 0;
+    if (waitpid(pid, &status, 0) != pid) {
+        perror("waitpid");
+        return 1;
+    }
+    if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+        fprintf(stderr, "child failed: status %d (exited=%d code=%d)\n", status,
+                WIFEXITED(status), WIFEXITED(status) ? WEXITSTATUS(status) : -1);
+        return 1;
+    }
+    return 0;
+}
+static int run_child_after_parent_close(const char *dsn, void **handle,
+                                        const kvspace_anchor_t *anchor,
+                                        const char *suffix,
+                                        uint64_t expected_offset,
+                                        const uint8_t *expected,
+                                        uint32_t expected_len) {
+    void *inherited = *handle;
+    int ready[2];
+    int result[2];
+    if (pipe(ready) != 0 || pipe(result) != 0) {
+        perror("pipe");
+        return 1;
+    }
+    pid_t pid = fork();
+    if (pid < 0) {
+        perror("fork");
+        return 1;
+    }
+    if (pid == 0) {
+        char gate = 0;
+        close(ready[1]);
+        close(result[0]);
+        if (gate_read(ready[0], &gate) != 0 || gate != 'x')
+            _exit(1);
+        int code = child_resolve_relative(dsn, inherited, anchor, suffix,
+                                          expected_offset, expected,
+                                          expected_len);
+        if (gate_write(result[1], code ? 0 : 1) != 0)
+            _exit(1);
+        _exit(code);
+    }
+    close(ready[0]);
+    close(result[1]);
+    kvspaceClose(*handle);
+    *handle = NULL;
+    char report = 0;
+    int ok = gate_write(ready[1], 'x') == 0 &&
+             gate_read(result[0], &report) == 0 && report == 1;
+    close(ready[1]);
+    close(result[0]);
+    int status = 0;
+    if (waitpid(pid, &status, 0) != pid) {
+        perror("waitpid");
+        return 1;
+    }
+    if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+        fprintf(stderr, "child after parent close failed: status %d (exited=%d code=%d)\n",
+                status, WIFEXITED(status),
+                WIFEXITED(status) ? WEXITSTATUS(status) : -1);
+        ok = 0;
+    }
+    if (!ok)
+        fprintf(stderr, "child after parent close did not report success\n");
+    return ok ? 0 : 1;
+}
 int main(void) {
     char path[] = "/tmp/kvspace-anchor-xproc-XXXXXX";
     char *dir = mkdtemp(path);
@@ -200,6 +325,102 @@ int main(void) {
     CHECK(WIFEXITED(status) && WEXITSTATUS(status) == 0,
           "child exit status %d (exited=%d code=%d)", status,
           WIFEXITED(status), WIFEXITED(status) ? WEXITSTATUS(status) : -1);
+    {
+        uint8_t y[4] = {0x11, 0x22, 0x33, 0x44};
+        uint64_t y_offset = 0;
+        CHECK(kvspaceMkindex(h, "/ms/", err, sizeof err) == KVSPACE_OK,
+              "mkindex /ms/ err=%s", err);
+        CHECK(kvspaceRealloc(h, "/ms/sub/y", sizeof y, 0, &y_offset, err,
+                             sizeof err) == KVSPACE_OK,
+              "realloc /ms/sub/y err=%s", err);
+        if (base)
+            memcpy(base + y_offset + KVSPACE_XVALUE_HEAD_LEN, y, sizeof y);
+        uint64_t absolute = 0;
+        CHECK(kvspaceResolveOffset(h, "/ms/sub/y", NULL, &absolute, err,
+                                   sizeof err) == KVSPACE_OK &&
+                  absolute == y_offset,
+              "parent absolute /ms/sub/y err=%s", err);
+        kvspace_anchor_t anchor = {0};
+        CHECK(kvspaceAnchorOf(h, "/ms/", &anchor, err, sizeof err) == KVSPACE_OK,
+              "anchor_of /ms/ err=%s", err);
+        CHECK(run_child_relative(dsn, h, &anchor, "sub/y", y_offset, y,
+                                 sizeof y) == 0,
+              "multi-segment relative suffix failed across process");
+    }
+    {
+        uint8_t body[8] = {9, 8, 7, 6, 5, 4, 3, 2};
+        uint64_t c_offset = 0;
+        CHECK(kvspaceMkindex(h, "/mv/", err, sizeof err) == KVSPACE_OK,
+              "mkindex /mv/ err=%s", err);
+        CHECK(kvspaceRealloc(h, "/mv/c", sizeof body, 0, &c_offset, err,
+                             sizeof err) == KVSPACE_OK,
+              "realloc /mv/c err=%s", err);
+        if (base)
+            memcpy(base + c_offset + KVSPACE_XVALUE_HEAD_LEN, body,
+                   sizeof body);
+        kvspace_anchor_t old_anchor = {0};
+        CHECK(kvspaceAnchorOf(h, "/mv/", &old_anchor, err, sizeof err) ==
+                  KVSPACE_OK,
+              "anchor_of /mv/ err=%s", err);
+        static const char extra[] = "abdefghi";
+        for (size_t i = 0; i < sizeof extra - 1; i++) {
+            char key[32];
+            uint64_t temporary = 0;
+            snprintf(key, sizeof key, "/mv/%c", extra[i]);
+            CHECK(kvspaceRealloc(h, key, 1, 0, &temporary, err, sizeof err) ==
+                      KVSPACE_OK,
+                  "realloc %s err=%s", key, err);
+        }
+        kvspace_anchor_t moved = {0};
+        CHECK(kvspaceAnchorOf(h, "/mv/", &moved, err, sizeof err) == KVSPACE_OK,
+              "anchor_of /mv/ after growth err=%s", err);
+        CHECK(moved.node_offset != old_anchor.node_offset,
+              "anchor node did not move after growth (offset %llu)",
+              (unsigned long long)old_anchor.node_offset);
+        CHECK(moved.epoch != old_anchor.epoch,
+              "epoch did not advance after growth (%llu)",
+              (unsigned long long)old_anchor.epoch);
+        CHECK(run_child_relative(dsn, h, &old_anchor, "c", c_offset, body,
+                                 sizeof body) == 0,
+              "MOVED old anchor relative resolve failed across process");
+    }
+    {
+        uint8_t dbody[2] = {0x5a, 0x5b};
+        uint64_t x_offset = 0;
+        CHECK(kvspaceMkindex(h, "/m·", err, sizeof err) == KVSPACE_OK,
+              "mkindex /m· err=%s", err);
+        CHECK(kvspaceRealloc(h, "/m·x", sizeof dbody, 0, &x_offset, err,
+                             sizeof err) == KVSPACE_OK,
+              "realloc /m·x err=%s", err);
+        if (base)
+            memcpy(base + x_offset + KVSPACE_XVALUE_HEAD_LEN, dbody,
+                   sizeof dbody);
+        kvspace_anchor_t anchor = {0};
+        CHECK(kvspaceAnchorOf(h, "/m·", &anchor, err, sizeof err) == KVSPACE_OK,
+              "anchor_of /m· err=%s", err);
+        CHECK(run_child_relative(dsn, h, &anchor, "x", x_offset, dbody,
+                                 sizeof dbody) == 0,
+              "dot separator anchor relative resolve failed across process");
+    }
+    {
+        uint8_t pbody[4] = {1, 2, 3, 4};
+        uint64_t p_offset = 0;
+        CHECK(kvspaceMkindex(h, "/pc/", err, sizeof err) == KVSPACE_OK,
+              "mkindex /pc/ err=%s", err);
+        CHECK(kvspaceRealloc(h, "/pc/v", sizeof pbody, 0, &p_offset, err,
+                             sizeof err) == KVSPACE_OK,
+              "realloc /pc/v err=%s", err);
+        if (base)
+            memcpy(base + p_offset + KVSPACE_XVALUE_HEAD_LEN, pbody,
+                   sizeof pbody);
+        kvspace_anchor_t anchor = {0};
+        CHECK(kvspaceAnchorOf(h, "/pc/", &anchor, err, sizeof err) ==
+                  KVSPACE_OK,
+              "anchor_of /pc/ err=%s", err);
+        CHECK(run_child_after_parent_close(dsn, &h, &anchor, "v", p_offset,
+                                           pbody, sizeof pbody) == 0,
+              "anchor after parent close failed across process");
+    }
     kvspaceClose(h);
     char cmd[600];
     snprintf(cmd, sizeof cmd, "rm -rf '%s'", dir);

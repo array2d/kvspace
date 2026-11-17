@@ -110,6 +110,8 @@ if(BUILD_TESTING)
         "anchor_cross_process|test_anchor_cross_process"
         "shm_split|test_shm_split"
         "storage_abi|test_storage_abi"
+        "xvalue_layout|test_xvalue_layout"
+        "storage_boundary|test_storage_boundary"
                                                                       
                                                   
         )
