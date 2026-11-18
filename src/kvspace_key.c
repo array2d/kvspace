@@ -95,81 +95,11 @@ static int adaptive_radix_tree_node_size(int node_type) {
            : node_type == ADAPTIVE_RADIX_TREE_N48 ? sizeof(adaptive_radix_tree_node48_t)
                           : sizeof(adaptive_radix_tree_node256_t);
 }
-static uint64_t generation_capacity(const kvspace_t *store) {
-    blocks_meta_t *meta = store->adaptive_radix_tree_meta;
-    uint64_t head = (uint64_t)meta->sizeof_block_head;
-    return meta->total_size / (head + meta->block_size);
-}
 int32_t adaptive_radix_tree_id_of(kvspace_t *store, const void *pointer) {
     if (!pointer || !store->adaptive_radix_tree_data)
         return -1;
     return (int32_t)kvspace_block_id_by_data_offset(store->adaptive_radix_tree_meta,
                                          (uint64_t)((const uint8_t *)pointer - store->adaptive_radix_tree_data));
-}
-generations_t *generations_at(kvspace_t *store, int32_t id) {
-    if (id < 0 || !store->region_generations.base)
-        return NULL;
-    if ((uint64_t)id >= store->generation_count)
-        return NULL;
-    return (generations_t *)store->region_generations.base + id;
-}
-void generation_bump_struct(kvspace_t *store, int32_t id) {
-    generations_t *generations = generations_at(store, id);
-    if (generations)
-        __atomic_add_fetch(&generations->struct_generation, 1u, __ATOMIC_ACQ_REL);
-}
-void generation_bump_value(kvspace_t *store, int32_t id) {
-    generations_t *generations = generations_at(store, id);
-    if (generations)
-        __atomic_add_fetch(&generations->value_generation, 2u, __ATOMIC_ACQ_REL);
-}
-static int64_t generation_alloc_epoch(kvspace_t *store) {
-    return (int64_t)__atomic_add_fetch(&store->header->generation_epoch, 1ull, __ATOMIC_ACQ_REL);
-}
-int32_t recovery_node_at(kvspace_t *store, const char *key) {
-    int key_length = (int)strlen(key);
-    int depth = 0;
-    int32_t node_id = store->header->adaptive_radix_tree_root;
-    while (node_id >= 0) {
-        adaptive_radix_tree_header_t *node_header = adaptive_radix_tree_header(store, node_id);
-        if (!node_header || node_header->type == ADAPTIVE_RADIX_TREE_MOVED)
-            return -1;
-        if (node_header->prefix_len) {
-            int shared = shared_prefix_length(node_header->prefix, node_header->prefix_len,
-                               (const uint8_t *)key + depth, key_length - depth);
-            if (shared != node_header->prefix_len && depth + shared != key_length)
-                return -1;
-            depth += shared;
-        }
-        if (depth == key_length)
-            return node_id;
-        node_id = adaptive_radix_tree_child(store, node_header, (uint8_t)key[depth]);
-        depth++;
-    }
-    return -1;
-}
-#define GENERATIONS_RESERVE (8ULL << 30)
-int generations_grow(kvspace_t *store) {
-    uint64_t want = generation_capacity(store) * sizeof(generations_t);
-    if (want > GENERATIONS_RESERVE)
-        return -1;
-    store->generation_count = want / sizeof(generations_t);
-    store->adaptive_radix_tree_total_seen = store->adaptive_radix_tree_meta->total_size;
-    if (want <= store->region_generations.mapped)
-        return 0;
-    if (!store->region_generations.base) {
-        void *mapping = mmap(NULL, GENERATIONS_RESERVE, PROT_NONE,
-                       MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
-        if (mapping == MAP_FAILED)
-            return -1;
-        store->region_generations.base = mapping;
-        store->region_generations.reserve = GENERATIONS_RESERVE;
-    }
-    if (ftruncate(store->region_generations.file_descriptor, (off_t)want) != 0)
-        return -1;
-    if (region_map(&store->region_generations, (size_t)want) != 0)
-        return -1;
-    return 0;
 }
 #ifdef RECOVERY_TEST_HOOKS
 int64_t kvspaceTestArtAlignCheck(kvspace_t *store) {
@@ -228,18 +158,11 @@ static int32_t adaptive_radix_tree_block_alloc(kvspace_t *store, int node_type) 
                                   stride);
     int64_t id = adaptive_radix_tree_bump(store, block_count);
     while (id < 0) {
-        if (adaptive_radix_tree_slab_grow(store) != 0 || generations_grow(store) != 0)
+        if (adaptive_radix_tree_slab_grow(store) != 0)
             return -1;
         id = adaptive_radix_tree_bump(store, block_count);
     }
-    if (id >= 0) {
-        generations_t *generations = generations_at(store, (int32_t)id);
-        if (generations) {
-            __atomic_store_n(&generations->struct_generation,
-                             (uint32_t)generation_alloc_epoch(store), __ATOMIC_RELEASE);
-            __atomic_store_n(&generations->value_generation, 0u, __ATOMIC_RELEASE);
-        }
-    }
+    __atomic_add_fetch(&store->header->structure_epoch, 1ull, __ATOMIC_ACQ_REL);
     return (int32_t)id;
 }
 static adaptive_radix_tree_header_t *adaptive_radix_tree_header(kvspace_t *store, int32_t id) {
@@ -449,17 +372,11 @@ static int32_t adaptive_radix_tree_grow(kvspace_t *store, void *old_node) {
                     node_data->children[j] = temporary_child;
                 }
     }
-    {
-        int32_t old_id = adaptive_radix_tree_id_of(store, old_header);
-        generation_bump_struct(store, node_id);
-        generation_bump_struct(store, old_id);
-    }
     old_header->type = ADAPTIVE_RADIX_TREE_MOVED;
     adaptive_radix_tree_value_store(old_header, ADAPTIVE_RADIX_TREE_VALUE_MAKE(0, (uint32_t)node_id));
     return node_id;
 }
 static int adaptive_radix_tree_add(kvspace_t *store, void *node, uint8_t byte, int32_t child_id) {
-    generation_bump_struct(store, adaptive_radix_tree_id_of(store, node));
     adaptive_radix_tree_header_t *node_header = node;
     switch (node_header->type) {
     case ADAPTIVE_RADIX_TREE_N4: {
@@ -692,8 +609,6 @@ int32_t adaptive_radix_tree_delete(kvspace_t *store, int32_t node_id, const uint
             return node_id;
         if (!adaptive_radix_tree_value_compare_and_swap(node_header, &header_value, 0))
             return node_id;
-        generation_bump_value(store, adaptive_radix_tree_id_of(store, node_header));
-        generation_bump_struct(store, adaptive_radix_tree_id_of(store, node_header));
         *out_retired_offset = ADAPTIVE_RADIX_TREE_VALUE_OFFSET(header_value);
         *deleted = true;
     } else {
@@ -1068,11 +983,11 @@ int resolve_anchor(kvspace_t *store, const char *key,
         return KVSPACE_ANCHOR_INVALID;
     for (int attempt = 0; attempt < 3; attempt++) {
         uint64_t before =
-            __atomic_load_n(&store->header->generation_epoch, __ATOMIC_ACQUIRE);
+            __atomic_load_n(&store->header->structure_epoch, __ATOMIC_ACQUIRE);
         int status = adaptive_radix_tree_resume(store, node_id, key, (int)suffix_length, out_offset,
                                 anchor->epoch != before);
         uint64_t after =
-            __atomic_load_n(&store->header->generation_epoch, __ATOMIC_ACQUIRE);
+            __atomic_load_n(&store->header->structure_epoch, __ATOMIC_ACQUIRE);
         if (before == after)
             return status;
     }
