@@ -76,6 +76,9 @@ Go/Python/Rust 扩展运行期取，免去硬编码裸字面量。运行期成�
 - **shm store 布局**：共享头字段、退役环侧车 `.retirement` 与旧版本不同；旧 store
   不能打开。magic 不承载版本号，按「只有一个 version、不向后兼容」处理：删除旧
   store 后重建。
+- **`.gen` 旁路文件删除**：节点级 generation 是只写不读的死状态，连同
+  `generations_grow` / `generations_at` 一并移除；旧 store 遗留的 `.gen` 文件可以
+  直接删掉。anchor 用的版本号改由共享头的 `structure_epoch` 承担。
 - **anchor ABI**：`kvspaceResolveOffset` 的 anchor 参数由整数改为
   `const kvspace_anchor_t *`。`NULL` 表示从根按绝对 key 解析；非零 anchor 表示从
   该目录节点按相对后缀解析。跨仓调用方必须同步声明与调用点。

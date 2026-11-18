@@ -74,11 +74,6 @@ adaptive_radix_tree_header_t *adaptive_radix_tree_search(kvspace_t *store, int32
 int32_t adaptive_radix_tree_insert(kvspace_t *store, int32_t node_id, const uint8_t *key, int key_length, int depth, uint64_t offset);
 int32_t adaptive_radix_tree_delete(kvspace_t *store, int32_t node_id, const uint8_t *key, int key_length, int depth, bool *deleted, uint64_t *out_retired_offset);
 int adaptive_radix_tree_scan_keys(kvspace_t *store, const char *prefix, int prefix_length, keyscan_t *scan);
-int32_t recovery_node_at(kvspace_t *store, const char *key);
-generations_t *generations_at(kvspace_t *store, int32_t id);
-void generation_bump_struct(kvspace_t *store, int32_t id);
-void generation_bump_value(kvspace_t *store, int32_t id);
-int generations_grow(kvspace_t *store);
 int resolve_root(kvspace_t *store, const char *key, uint64_t *out_offset);
 int resolve_anchor(kvspace_t *store, const char *key, const kvspace_anchor_t *anchor, uint64_t *out_offset);
 int listlen_key(kvspace_t *store, const char *key, int64_t *out_count, uint32_t *out_max_name_length);

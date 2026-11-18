@@ -9,10 +9,6 @@
 #include <stddef.h>
 #include <stdint.h>
 #include <string.h>
-typedef struct {
-    uint32_t struct_generation;
-    uint32_t value_generation;
-} generations_t;
 typedef struct kvspace kvspace_t;
 #define KVSPACE_MAGIC "kvspace-c"
 #define ADAPTIVE_RADIX_TREE_PREFIX_MAX 10
@@ -50,7 +46,7 @@ typedef struct {
     char magic[sizeof(KVSPACE_MAGIC)];
     uint64_t adaptive_radix_tree_slab_size, slots_box_head_size, slots_box_data_size;
     int32_t adaptive_radix_tree_root;
-    uint64_t generation_epoch;
+    uint64_t structure_epoch;
     uint32_t recovery_epoch;
     uint32_t ack_sequence;
     uint32_t barrier_state;
@@ -83,10 +79,8 @@ typedef struct {
     size_t reserve;
 } shared_memory_region_t;
 struct kvspace {
-    shared_memory_region_t region_adaptive_radix_tree, region_header, region_data, region_generations, region_retirement;
+    shared_memory_region_t region_adaptive_radix_tree, region_header, region_data, region_retirement;
     retirement_entry_t *retirement;
-    uint64_t generation_count;
-    uint64_t adaptive_radix_tree_total_seen;
     kvspace_header_t *header;
     int recovery_slot;
     uint32_t process_id;

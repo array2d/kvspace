@@ -79,9 +79,6 @@ void kvspaceTestSetDataSize(size_t data_size) {
 int store_sync(kvspace_t *store) {
     if (region_map(&store->region_adaptive_radix_tree, ADAPTIVE_RADIX_TREE_OFFSET + (size_t)store->header->adaptive_radix_tree_slab_size) != 0)
         return -1;
-    if (store->adaptive_radix_tree_meta->total_size != store->adaptive_radix_tree_total_seen &&
-        generations_grow(store) != 0)
-        return -1;
     if (region_map(&store->region_header, (size_t)store->header->slots_box_head_size) != 0)
         return -1;
     return region_map(&store->region_data, (size_t)store->header->slots_box_data_size);
@@ -107,14 +104,11 @@ static kvspace_t *open_shared_memory_store(const char *path, size_t data_size) {
         fprintf(stderr, "kvspace: unexpected blockmalloc blocks_meta_t layout\n");
         return NULL;
     }
-    char head_path[PATH_MAX], data_path[PATH_MAX], generation_path[PATH_MAX],
-        retirement_path[PATH_MAX];
+    char head_path[PATH_MAX], data_path[PATH_MAX], retirement_path[PATH_MAX];
     if (snprintf(head_path, sizeof head_path, "%s.sbo.head", path) >=
             (int)sizeof head_path ||
         snprintf(data_path, sizeof data_path, "%s.sbo.data", path) >=
             (int)sizeof data_path ||
-        snprintf(generation_path, sizeof generation_path, "%s.gen", path) >=
-            (int)sizeof generation_path ||
         snprintf(retirement_path, sizeof retirement_path, "%s.retirement", path) >=
             (int)sizeof retirement_path)
         return NULL;
@@ -122,7 +116,7 @@ static kvspace_t *open_shared_memory_store(const char *path, size_t data_size) {
     if (!store)
         return NULL;
     store->recovery_slot = -1;
-    store->region_adaptive_radix_tree.file_descriptor = store->region_header.file_descriptor = store->region_data.file_descriptor = store->region_generations.file_descriptor =
+    store->region_adaptive_radix_tree.file_descriptor = store->region_header.file_descriptor = store->region_data.file_descriptor =
         store->region_retirement.file_descriptor = -1;
     bool created = false;
     store->region_adaptive_radix_tree.file_descriptor = open(path, O_RDWR);
@@ -154,7 +148,6 @@ static kvspace_t *open_shared_memory_store(const char *path, size_t data_size) {
         region_attach(&store->region_header, created, slots_box_head, SHARED_MEMORY_REGION_RESERVE) != 0 ||
         (store->region_data.file_descriptor = open(data_path, open_flags, 0644)) < 0 ||
         region_attach(&store->region_data, created, data_size, DATA_RESERVE) != 0 ||
-        (store->region_generations.file_descriptor = open(generation_path, open_flags, 0644)) < 0 ||
         (store->region_retirement.file_descriptor = open(retirement_path, open_flags, 0644)) < 0 ||
         region_attach(&store->region_retirement, created,
                       (size_t)RETIREMENT_CAPACITY * sizeof(retirement_entry_t),
@@ -178,8 +171,6 @@ static kvspace_t *open_shared_memory_store(const char *path, size_t data_size) {
         store->adaptive_radix_tree_meta->sizeof_block_head = 8;
         memcpy(store->header->magic, KVSPACE_MAGIC, sizeof(KVSPACE_MAGIC) - 1);
     }
-    if (generations_grow(store) != 0)
-        goto fail;
     store->recovery_slot = recovery_register_claim(store);
     if (store->recovery_slot == -2) {
         fprintf(stderr, "kvspace: too many processes, N=%d\n", RECOVERY_SLOT_COUNT);
@@ -208,14 +199,12 @@ fail:
     region_close(&store->region_adaptive_radix_tree);
     region_close(&store->region_header);
     region_close(&store->region_data);
-    region_close(&store->region_generations);
     region_close(&store->region_retirement);
     free(store);
     if (created) {
         unlink(path);
         unlink(head_path);
         unlink(data_path);
-        unlink(generation_path);
         unlink(retirement_path);
     }
     return NULL;
@@ -236,7 +225,6 @@ static void close_shared_memory_store(kvspace_t *store) {
     region_close(&store->region_adaptive_radix_tree);
     region_close(&store->region_header);
     region_close(&store->region_data);
-    region_close(&store->region_generations);
     region_close(&store->region_retirement);
     free(store);
 }
@@ -477,12 +465,7 @@ static int realloc_key(kvspace_t *store, const char *key,
         uint64_t offset = ADAPTIVE_RADIX_TREE_VALUE_OFFSET(old_header_value);
         old_capacity = sbo_allocated_size(store->slots_box_meta, offset);
         if (need <= old_capacity) {
-            generations_t *generations = generations_at(store, adaptive_radix_tree_id_of(store, node));
-            if (generations)
-                __atomic_add_fetch(&generations->value_generation, 1u, __ATOMIC_ACQ_REL);
             storage_write_head(store->slots_box_data + offset, body_length, attribute_length);
-            if (generations)
-                __atomic_add_fetch(&generations->value_generation, 1u, __ATOMIC_ACQ_REL);
             *out_offset = offset;
             return KVSPACE_OK;
         }
@@ -506,14 +489,6 @@ static int realloc_key(kvspace_t *store, const char *key,
         return KVSPACE_BACKEND;
     }
     store->header->adaptive_radix_tree_root = root;
-    {
-        int32_t node_id = recovery_node_at(store, key);
-        generations_t *generations = generations_at(store, node_id);
-        if (generations) {
-            generation_bump_struct(store, node_id);
-            generation_bump_value(store, node_id);
-        }
-    }
     if (retiring)
         retirement_commit(store, retirement_index, ADAPTIVE_RADIX_TREE_VALUE_OFFSET(old_header_value), old_capacity);
     else
@@ -614,7 +589,7 @@ KVSPACE_PUBLIC int kvspaceAnchorOf(void *handle, const char *directory_key,
     if (offset == 0)
         return KVSPACE_BACKEND;
     out_anchor->node_offset = offset;
-    out_anchor->epoch = __atomic_load_n(&store->header->generation_epoch, __ATOMIC_ACQUIRE);
+    out_anchor->epoch = __atomic_load_n(&store->header->structure_epoch, __ATOMIC_ACQUIRE);
     out_anchor->depth = (uint32_t)key_len;
     out_anchor->flags = KVSPACE_ANCHOR_FLAG_INDEX;
     return KVSPACE_OK;
