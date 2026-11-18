@@ -46,6 +46,7 @@ typedef struct {
     char magic[sizeof(KVSPACE_MAGIC)];
     uint64_t adaptive_radix_tree_slab_size, slots_box_head_size, slots_box_data_size;
     int32_t adaptive_radix_tree_root;
+    uint32_t write_lock;
     uint64_t structure_epoch;
     uint32_t recovery_epoch;
     uint32_t ack_sequence;
@@ -85,7 +86,9 @@ struct kvspace {
     int recovery_slot;
     uint32_t process_id;
     uint32_t fork_generation;
-    uint32_t quiesced;
+    pthread_mutex_t local_write_lock;
+    pthread_mutex_t map_lock;
+    uint32_t locks_initialized;
     pthread_t maintenance_thread;
     uint32_t maintenance_sequence;
     uint32_t maintenance_started, maintenance_stop;
@@ -95,6 +98,15 @@ struct kvspace {
     sbo_meta_t *slots_box_meta;
     uint8_t *slots_box_data;
 };
+static inline void kvspace_cpu_relax(void) {
+#if defined(__x86_64__) || defined(__i386__)
+    __asm__ __volatile__("pause" ::: "memory");
+#elif defined(__aarch64__) || defined(__arm__)
+    __asm__ __volatile__("yield" ::: "memory");
+#else
+    (void)0;
+#endif
+}
 _Static_assert(offsetof(blocks_meta_t, used_blocks) ==
                    offsetof(blocks_meta_t, block_size) + 2 * sizeof(uint64_t),
                "blockmalloc: sizeof_block_head/malloc_blocks must share one u64 word");
@@ -120,7 +132,6 @@ static inline void kvspace_block_set_malloc_blocks(blocks_meta_t *meta, uint64_t
     __atomic_store_n(word, (old & ~mask) | ((count << shift) & mask), __ATOMIC_RELEASE);
 }
 #endif
-
 #ifdef BLOCKMALLOC_COUNT_MASK
 #define KVSPACE_BLOCKMALLOC_MALLOC_BLOCKS(metadata) blocks_malloc_count(metadata)
 #define KVSPACE_BLOCKMALLOC_HEAD_SIZE(metadata) blocks_head_size(metadata)

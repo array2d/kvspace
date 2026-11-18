@@ -34,7 +34,7 @@ KVSPACE_PUBLIC int kvspaceXvalueGetAttr(const uint8_t *wire, uint64_t wire_lengt
         }
         pointer += 3 + record_length;
     }
-    if (!found)
+    if (pointer != end || !found)
         return -1;
     if (out_data)
         *out_data = found;
@@ -60,19 +60,21 @@ KVSPACE_PUBLIC int kvspaceXvalueSetAttr(uint8_t *wire, uint64_t wire_capacity, u
     uint8_t *const end = begin + kvspaceXvalueHeadAttrsLen(header);
     uint8_t *found = NULL;
     uint16_t found_length = 0;
-    for (uint8_t *pointer = begin; pointer + 3 <= end;) {
+    uint8_t *pointer = begin;
+    while (pointer + 3 <= end) {
         const uint16_t record_length =
             (uint16_t)((uint16_t)pointer[1] | ((uint16_t)pointer[2] << 8));
         if (pointer + 3 + record_length > end ||
             pointer[0] == KVSPACE_XVALUE_ATTR_TAG_RETIRED_REALLEN)
             return -1;
-        if (pointer[0] == tag) {
+        if (pointer[0] == tag && !found) {
             found = pointer;
             found_length = record_length;
-            break;
         }
         pointer += 3 + record_length;
     }
+    if (pointer != end)
+        return -1;
     const int removing = (length == 0 && data == NULL);
     if (removing && !found) {
         *out_new_length = total;
@@ -124,6 +126,8 @@ KVSPACE_PUBLIC int kvspaceXvalueHeadEffectiveLen(const uint8_t *wire, uint64_t w
             return -1;
         record += 3 + record_length;
     }
+    if (record != end)
+        return -1;
     *out = header->bodylen;
     return 0;
 }
