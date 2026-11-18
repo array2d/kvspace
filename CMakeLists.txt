@@ -7,46 +7,26 @@ set(CMAKE_C_EXTENSIONS ON)
 
 include(GNUInstallDirs)
 
-# 默认 prefix=/usr；库装 <prefix>/lib/kvspace，与历史安装布局一致（已装的消费者不用改链接路径）。
 if(CMAKE_INSTALL_PREFIX_INITIALIZED_TO_DEFAULT)
     set(CMAKE_INSTALL_PREFIX "/usr" CACHE PATH "" FORCE)
 endif()
 
-# kvspace 就是标准实现本身：没有 adapter/dispatch 层，也不 dlopen 任何后端。
-# 单库直接包含 shm 引擎 + 字节层（head/attr）+ 存储常量。
-# 语言层（构造器、langtype、坐标比较）不在本仓，见 <kvlang/xvalue.h>。
 add_library(kvspace SHARED
-    src/shm/kvspace.c
+    src/kvspace.c
+    src/kvspace_recovery.c
+    src/kvspace_key.c
+    src/kvspace_xvalue_internal.c
     src/xvalue_head.c
     src/const.c)
-target_include_directories(kvspace PRIVATE src/shm)
 
-# ── header-only ABI 依赖 ────────────────────────────────────────────
-# src/shm/kvspace.c 直接 include 两个头（`#define *_IMPLEMENTATION` 后把实现体编进
-# 本 TU）。从前 CMakeLists 一个字没提它们，全靠 `/usr/include` 隐式命中——于是换 pod
-# 之后得到的是 `fatal error: blockmalloc/blockmalloc.h: No such file or directory`，
-# 报错里看不出缺哪个仓、哪个版本、怎么修。
-#
-# **版本不写在这里**：pin 的唯一事实源是 `ci/deps.sh` 的两行。CMake 里再写一份就是
-# 第二个真相，下次升级必漏一个。
-#
-# **默认假定兄弟仓不存在。** 候选只有三个，全是「装好的 pin」：
-#
-#   1. /usr/local/include     ci/deps.sh 的目标（macOS 也是这里）
-#   2. /usr/include           ci/deps.sh 的目标（Linux）
-#
-# **兄弟仓不进候选，一个都不留。** 三条理由：
-#   - 兄弟布局是开发者本地的偶然状态，不是契约。契约是「装好的 pin」。
-#   - 默认值一旦存在，正确路径就变成「没被默认值遮住的那条」，而没有人会去验它——
-#     验的永远是侥幸命中的那条。
-#   - 它已经造成过实际事故：兄弟仓排在前面时，构建用的其实不是 `ci/deps.sh` pin 的
-#     版本，而是某个检出；两者恰好同 tag 时完全看不出来。
-#
-# 需要本地仓时用 `-DKVSPACE_<name>_INCLUDE_DIRECTORY=<dir>` 显式指定。显式即留痕：
-# 构建日志里能看到这个决定，而默认兜底是看不见的。
-#
-# `NO_DEFAULT_PATH` 是必须的：不加的话 find_path 还会去编译器默认目录里扫，命中一个
-# 同名但版本不符的目录时，症状是链接期或运行期才炸，而不是配置期点名。
+target_include_directories(kvspace
+    PUBLIC
+        $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+        $<INSTALL_INTERFACE:include>
+    PRIVATE
+        src
+)
+
 foreach(header IN ITEMS blockmalloc/blockmalloc.h slotsboxmalloc/slotsboxobj.h)
     string(REGEX REPLACE "/[^/]+$" "" header_directory "${header}")
     set(pin_candidates
@@ -57,8 +37,6 @@ foreach(header IN ITEMS blockmalloc/blockmalloc.h slotsboxmalloc/slotsboxobj.h)
         PATHS ${pin_candidates}
         NO_DEFAULT_PATH)
     if(NOT KVSPACE_${header_directory}_INCLUDE_DIRECTORY)
-        # 候选逐行列出。写成 `${pin_candidates}` 会被 CMake 用 `;` 拼成一行
-        # （`/usr/local/include;/usr/include`），一眼看不出是几个目录。
         set(candidate_lines "")
         set(candidate_index 1)
         foreach(candidate IN LISTS pin_candidates)
@@ -74,97 +52,62 @@ foreach(header IN ITEMS blockmalloc/blockmalloc.h slotsboxmalloc/slotsboxobj.h)
             "    2. 用 -DKVSPACE_${header_directory}_INCLUDE_DIRECTORY=<包含 ${header_directory}/ 的目录> 显式指定。")
     endif()
     message(STATUS "kvspace: <${header}> → ${KVSPACE_${header_directory}_INCLUDE_DIRECTORY}")
-    target_include_directories(kvspace PRIVATE
+    target_include_directories(kvspace SYSTEM PRIVATE
         "${KVSPACE_${header_directory}_INCLUDE_DIRECTORY}")
 endforeach()
 
-# **kvspace 不依赖 kvlang**——这条是分层的方向，不是偏好：语言层依赖存储层，
-# 反过来不行。测试造值也不借用语言层的构造器：它们用 `tests/shm/test_wire.h` 里
-# 那几个本地拼 wire 的 inline（格式知识重复，由同一组测试矩阵约束，含与 kvlang
-# 金标准的逐字节比对）。共享符号会把两个仓编译期绑死，那是更贵的耦合。
-
 include(CTest)
 if(BUILD_TESTING)
-    # XValue 构造器与 codec 的测试随实现迁往 kvlang（`kvlang/xvalue/tests/`）。
-    # kvspace 侧只保留字节层与存储契约的测试。
-
-    # 存储契约 smoke：单库就是标准实现，直接链接即可，不再有「真/假后端」之分，
-    # 也就不再需要独立构建目录与 dlopen 搜索路径。
     add_executable(test_storage_shm tests/test_storage_shm.c)
     target_include_directories(test_storage_shm PRIVATE include)
     target_link_libraries(test_storage_shm PRIVATE kvspace)
     add_test(NAME storage_shm_contract COMMAND test_storage_shm)
-endif()
 
-# shm 后端测试（原 kvspace-c/tests，已迁入 tests/shm/）。
-# 统一 `shm_` 前缀：与前端测试有同名文件（xvalue_head、xvalue_wire_golden），
-# 不前缀会在 ctest 里出现两个同名项，红的时候分不清是哪一个。
-if(BUILD_TESTING)
-    # 枚举 (ctest 名|源文件)：CMake 的 `;` 是列表分隔符，写进字符串会在
-    # `foreach(IN LISTS)` 里被拆成两个元素（实测每个 pair 跑了两遍，第二次
-    # 名字变成 "test_xxx" 就撞了前端 target）。故用 `|` 作内部分隔符。
     set(KVSPACE_SHM_TEST_PAIRS
         "art_scan|test_art_scan"
         "art_alignment|test_art_alignment"
         "anchor_hook|test_anchor_hook"
+        "anchor_cross_process|test_anchor_cross_process"
         "shm_split|test_shm_split"
         "storage_abi|test_storage_abi"
-        # xvalue_head / new_wire_shm / xvalue_wire_golden 造的是语言层 wire，
-        # 随构造器一起迁往 kvlang（`kvlang/xvalue/tests/`）。
-        )
+        "xvalue_layout|test_xvalue_layout"
+        "storage_boundary|test_storage_boundary"
+    )
     foreach(pair IN LISTS KVSPACE_SHM_TEST_PAIRS)
         string(FIND "${pair}" "|" pair_sep)
         string(SUBSTRING "${pair}" 0 ${pair_sep} shm_name)
         math(EXPR pair_tail "${pair_sep} + 1")
         string(SUBSTRING "${pair}" ${pair_tail} -1 shm_source)
         add_executable(shm_${shm_name} tests/shm/${shm_source}.c)
-        target_include_directories(shm_${shm_name} PRIVATE
-            src/shm include)
-        # 测试要调 P2_TEST_HOOKS 里的内部钩子（TestAnchorOf/ArtAlignCheck/
-        # TestSetFormatVersion）。宏必须与库一致，否则头里的声明被 #ifdef 挡掉，
-        # 调用方靠隐式声明链接成功——正是 -Werror=implicit-function-declaration
-        # 要抓的那类缺口。
-        target_compile_definitions(shm_${shm_name} PRIVATE P2_TEST_HOOKS)
+        target_include_directories(shm_${shm_name} PRIVATE src include)
+        target_compile_definitions(shm_${shm_name} PRIVATE RECOVERY_TEST_HOOKS)
         target_link_libraries(shm_${shm_name} PRIVATE kvspace)
         add_test(NAME shm_${shm_name} COMMAND shm_${shm_name})
     endforeach()
 
-    # 导出面链接测试：逐个引用全部 16 个导出符号，缺一个即链接失败。
-    #
-    # 为什么单独一条：头文件声明与 .so 导出**各说各话**时，编译期与运行期都不会报错
-    # ——`const.h` 曾声明 `kvspaceConst` 而实现/导出叫 `kvspaceConstStorage`，
-    # 用头文件写代码的人「能编过、一链接就找不到符号」，而当时 tests/cli 里零覆盖。
-    # 取地址是唯一在「不运行」的情况下就能挡住这类缺陷的形态：漏掉的符号没人调用，
-    # 运行期测试永远不会红。
     add_executable(test_export_surface tests/test_export_surface.c)
     target_include_directories(test_export_surface PRIVATE include)
     target_link_libraries(test_export_surface PRIVATE kvspace)
     add_test(NAME export_surface COMMAND test_export_surface)
+
+    find_program(PYTHON3_EXECUTABLE NAMES python3)
+    if(NOT PYTHON3_EXECUTABLE)
+        message(FATAL_ERROR "python3 is required for the separator hardcode check")
+    endif()
+    add_test(NAME separator_hardcode
+             COMMAND ${PYTHON3_EXECUTABLE}
+                     ${CMAKE_CURRENT_SOURCE_DIR}/tests/check_separator_hardcode.py
+                     ${CMAKE_CURRENT_SOURCE_DIR}/src)
 endif()
 
-# 前端 SONAME：libkvspace.so.1
 set_target_properties(kvspace PROPERTIES
     VERSION 1.0.0
     SOVERSION 1
 )
 
-target_include_directories(kvspace
-    PUBLIC
-        $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
-        $<INSTALL_INTERFACE:include>
-)
-
-# 活跃句柄表（退出兜底落盘）用 pthread 互斥。单库后没有 dlopen/dlsym，不再链 libdl。
 find_package(Threads REQUIRED)
 target_link_libraries(kvspace PRIVATE Threads::Threads)
 
-# 生产库只导出公开头声明的符号；内部实现（kvspaceShm*、测试钩子）不是 API。
-# 测试构建需要直接链接内部函数，故保持默认可见。
-# 这条随原 kvspace-c target 一起在单库合并时丢失过一次——缺它的后果是 58 个
-# 符号全部导出，其中 27 个 kvspaceShm* 内部实现泄漏到公开面。
-# C_VISIBILITY_PRESET 在部分 CMake 版本/生成器上不会落到 C 的编译命令行
-# （实测 flags.make 里没有 -fvisibility=hidden），故两个都设——属性管预期，
-# 编译选项管实际。缺了它 27 个 kvspaceShm* 会全部泄漏到公开面。
 if(NOT BUILD_TESTING)
     set_target_properties(kvspace PROPERTIES C_VISIBILITY_PRESET hidden)
     target_compile_options(kvspace PRIVATE -fvisibility=hidden)
@@ -172,17 +115,10 @@ endif()
 
 target_compile_definitions(kvspace PRIVATE _GNU_SOURCE)
 
-# 测试构建启用内部观测/注入钩子（生产库不含）：kvspaceShmTestAnchorOf、
-# kvspaceShmArtAlignCheck、kvspaceShmTestSetFormatVersion。
 if(BUILD_TESTING)
-    target_compile_definitions(kvspace PRIVATE P2_TEST_HOOKS)
+    target_compile_definitions(kvspace PRIVATE RECOVERY_TEST_HOOKS)
 endif()
 
-# 门禁：隐式函数声明一律当错误。
-#
-# 它抓的是「实现导出了、头里没声明」这类缺口——C 的老默认（隐式返回 int）
-# 会把 `kvspaceNewInt64(...)` 的返回值当 int，指针被截断，崩在别处。
-# 改成硬错误后，每个未声明的调用都在**编译期**点名。
 target_compile_options(kvspace PRIVATE -Werror=implicit-function-declaration)
 
 install(TARGETS kvspace
@@ -193,18 +129,6 @@ install(DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/include/ DESTINATION ${CMAKE_INSTA
 configure_file(kvspace.pc.in ${CMAKE_CURRENT_BINARY_DIR}/kvspace.pc @ONLY)
 install(FILES ${CMAKE_CURRENT_BINARY_DIR}/kvspace.pc DESTINATION ${CMAKE_INSTALL_LIBDIR}/pkgconfig)
 
-# ── CLI（cli/ 独立 Cargo 项目）──────────────────────────────────────
-# 走本仓 dispatch 前端的 C ABI，故须在 kvspace 目标之后构建；
-# 安装到 <prefix>/bin（prefix 默认 /usr → /usr/bin，与 kvlang 的 CLI 一致）。
-# Embed relative RUNPATH entries:
-#   $ORIGIN/../lib                      -- release tarball (bin/ + lib/)
-#   $ORIGIN/../<libdir>/kvspace         -- cmake --install (<prefix>/<libdir>/kvspace)
-# Use @loader_path on macOS; escape $ as $$ for CMake.
-# release.yml packages this binary directly without rebuilding.
-#
-# CLI 只做**存储**子命令（del/deltree/cp/cpdir/mkindex/clear/list/tree/head/attr），
-# 因此只链 libkvspace，**不依赖 kvlang**。语言层命令（get/set/list --kind/tree --kind）
-# 在 kvlang 仓自己的 CLI 里，那个 CLI 才同时链 libkvspace + libkvlang_xvalue。
 find_program(CARGO_EXECUTABLE cargo)
 if(CARGO_EXECUTABLE)
   set(KVSPACE_CLI_BIN "${CMAKE_CURRENT_SOURCE_DIR}/cli/target/release/kvspace")

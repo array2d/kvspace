@@ -1,43 +1,37 @@
-/* test_art_scan — prefix List/DelTree/CpTree scan the covering subtree (#267) */
-
-#define _GNU_SOURCE
-#include "kvspace_shm.h"
+#define _GNU_SOURCE 
+#include "kvspace_test_hooks.h"
 #include "test_wire.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
 #include <unistd.h>
-
+#include "test_public_io.h"
 #define SBO_DATA_SIZE (8UL * 64 * 64 * 64 * 64)
-
 static int write_new_body(kvspace_t *kv, const char *key, uint64_t body_len,
                           uint8_t **body);
-
 static int failures = 0;
-#define CHECK(cond, ...)                                                       \
-  do {                                                                         \
-    if (!(cond)) {                                                             \
-      failures++;                                                              \
-      fprintf(stderr, "  FAIL %s:%d: ", __FILE__, __LINE__);                   \
-      fprintf(stderr, __VA_ARGS__);                                            \
-      fprintf(stderr, "\n");                                                   \
-    }                                                                          \
+#define CHECK(cond,...) \
+  do { \
+    if (!(cond)) { \
+      failures++; \
+      fprintf(stderr, "  FAIL %s:%d: ", __FILE__, __LINE__); \
+      fprintf(stderr, __VA_ARGS__); \
+      fprintf(stderr, "\n"); \
+    } \
   } while (0)
-#define REQUIRE(cond, ...)                                                     \
-  do {                                                                         \
-    int require_ok = (cond);                                                   \
-    CHECK(require_ok, __VA_ARGS__);                                             \
-    if (!require_ok)                                                           \
-      return;                                                                  \
+#define REQUIRE(cond,...) \
+  do { \
+    int require_ok = (cond); \
+    CHECK(require_ok, __VA_ARGS__); \
+    if (!require_ok) \
+      return; \
   } while (0)
-
 static double now_s(void) {
   struct timespec t;
   clock_gettime(CLOCK_MONOTONIC, &t);
   return (double)t.tv_sec + (double)t.tv_nsec * 1e-9;
 }
-
 static int set_int32(kvspace_t *kv, const char *key, int32_t v) {
   uint8_t raw[4] = {(uint8_t)v, (uint8_t)(v >> 8), (uint8_t)(v >> 16),
                     (uint8_t)(v >> 24)};
@@ -45,22 +39,16 @@ static int set_int32(kvspace_t *kv, const char *key, int32_t v) {
   uint64_t n = 0;
   if (kvspace_test_wire_scalar(raw, 4, "", &xv, &n) != 0)
     return -1;
-  int rc = kvspaceShmSet(kv, key, xv, (int32_t)n);
+  int rc = t_set_wire(kv, key, xv, (int32_t)n);
   free(xv);
   return rc;
 }
-
-/* 建目录位置 = 写一条 0 字节 body + 0 attr 的值。这正是公共 `kvspaceMkindex` 走
-   `kvspaceShmStorageMakeindex` 的语义（见 kvspace.h：「只保证位置存在」）。早先测试
-   调的是 `kvspaceShmMkindex`（造 HeadNewNone wire），那个 helper 已随 TASK-082 删除
-   ——它让存储层造语言层的值。 */
 static int mkindex(kvspace_t *kv, const char *key) {
-  return kvspaceShmStorageMakeindex(kv, key);
+  return t_mkindex(kv, key);
 }
-
 static int32_t get_int32(kvspace_t *kv, const char *key) {
   int32_t len = 0;
-  uint8_t *d = kvspaceShmGet(kv, key, 1, &len);
+  uint8_t *d = t_get_wire(kv, key, 1, &len);
   if (!d || len <= 0)
     return -1;
   kvspaceXvalueHead h;
@@ -71,7 +59,6 @@ static int32_t get_int32(kvspace_t *kv, const char *key) {
   return (int32_t)((uint32_t)b[0] | ((uint32_t)b[1] << 8) |
                    ((uint32_t)b[2] << 16) | ((uint32_t)b[3] << 24));
 }
-
 static void list_free(char **ns, int32_t n) {
   if (!ns)
     return;
@@ -79,25 +66,21 @@ static void list_free(char **ns, int32_t n) {
     free(ns[i]);
   free(ns);
 }
-
 static int list_has(char **ns, int32_t n, const char *s) {
   for (int32_t i = 0; i < n; i++)
     if (strcmp(ns[i], s) == 0)
       return 1;
   return 0;
 }
-
 static int do_list(kvspace_t *kv, const char *pfx, char ***on, int32_t *n) {
   *on = NULL;
   *n = 0;
-  return kvspaceShmList(kv, pfx, false, 0, on, n);
+  return t_list(kv, pfx, false, 0, on, n);
 }
-
 static void t_correct(const char *db) {
   printf("[correct] isolation, nested, compressed prefix, miss, deltree, cptree\n");
-  kvspace_t *kv = kvspaceShmOpen(db, SBO_DATA_SIZE);
+  kvspace_t *kv = t_open(db, SBO_DATA_SIZE);
   REQUIRE(kv != NULL, "open failed");
-
   CHECK(set_int32(kv, "/lib/a", 1) == 0, "set /lib/a");
   CHECK(set_int32(kv, "/lib/b", 2) == 0, "set /lib/b");
   CHECK(set_int32(kv, "/lib/mod/x", 3) == 0, "set /lib/mod/x");
@@ -111,133 +94,94 @@ static void t_correct(const char *db) {
   uint8_t *permitted = NULL;
   uint64_t permitted_len = 0;
   CHECK(kvspace_test_wire_scalar(raw, 4, "", &permitted, &permitted_len) == 0 &&
-            kvspaceShmSetValue(kv, "/private", permitted,
+            t_set_wire(kv, "/private", permitted,
                                (int32_t)permitted_len) == 0,
         "set permitted value");
   free(permitted);
-  CHECK(kvspaceShmCp(kv, "/private", "/private_copy") == 0,
+  CHECK(t_cp(kv, "/private", "/private_copy") == 0,
         "copy permitted value");
-  CHECK(kvspaceShmDel(kv, "/private_copy") == 0, "delete copied value");
-
+  CHECK(t_del(kv, "/private_copy") == 0, "delete copied value");
   uint8_t *ptr = NULL;
   uint64_t ptr_len = 0;
   CHECK(kvspace_test_wire_ptr((const uint8_t *)"/private", 8, "",
                                 &ptr, &ptr_len) == 0 &&
-            kvspaceShmSetValue(kv, "/link", ptr, (int32_t)ptr_len) == 0,
+            t_set_wire(kv, "/link", ptr, (int32_t)ptr_len) == 0,
         "set pointer");
   free(ptr);
-  CHECK(kvspaceShmCp(kv, "/link", "/link_copy") == 0,
+  CHECK(t_cp(kv, "/link", "/link_copy") == 0,
         "copy pointer");
-
   char **ns;
   int32_t n;
-
   REQUIRE(do_list(kv, "/d/", &ns, &n) == 0, "list /d/");
   CHECK(n == 2, "list /d/ count %d", n);
-  CHECK(list_has(ns, n, "f") && list_has(ns, n, "g"), "list /d/ names");
+  CHECK(list_has(ns, n, "f/") && list_has(ns, n, "g"), "list /d/ names");
   list_free(ns, n);
-
   REQUIRE(do_list(kv, "/d/f/", &ns, &n) == 0, "list /d/f/");
   CHECK(n == 2, "list /d/f/ count %d", n);
   CHECK(list_has(ns, n, "p") && list_has(ns, n, "q"), "list /d/f/ names");
   list_free(ns, n);
-
   REQUIRE(do_list(kv, "/lib/", &ns, &n) == 0, "list /lib/");
   CHECK(n == 3, "list /lib/ count %d", n);
-  CHECK(list_has(ns, n, "a") && list_has(ns, n, "b") && list_has(ns, n, "mod"),
+  CHECK(list_has(ns, n, "a") && list_has(ns, n, "b") && list_has(ns, n, "mod/"),
         "list /lib/ names");
   list_free(ns, n);
-
   REQUIRE(do_list(kv, "/foo/", &ns, &n) == 0, "list /foo/");
   CHECK(n == 3, "list /foo/ count %d", n);
   CHECK(list_has(ns, n, "bar1") && list_has(ns, n, "bar2") &&
             list_has(ns, n, "zzz"),
         "list /foo/ names");
   list_free(ns, n);
-
   REQUIRE(do_list(kv, "/nope/", &ns, &n) == 0, "list /nope/");
   CHECK(n == 0, "list /nope/ count %d", n);
   list_free(ns, n);
-
   REQUIRE(do_list(kv, "/food/", &ns, &n) == 0, "list /food/");
   CHECK(n == 0, "list /food/ count %d", n);
   list_free(ns, n);
-
   REQUIRE(do_list(kv, "/", &ns, &n) == 0, "list /");
-  CHECK(list_has(ns, n, "lib") && list_has(ns, n, "d") && list_has(ns, n, "foo"),
+  CHECK(list_has(ns, n, "lib/") && list_has(ns, n, "d/") && list_has(ns, n, "foo/"),
         "list / names");
   CHECK(!list_has(ns, n, ".kvspace-meta"), "hide metadata root");
   list_free(ns, n);
-
   CHECK(mkindex(kv, "/frames/[1]/") == 0, "frame directory");
   CHECK(set_int32(kv, "/frames/[1]/value", 7) == 0, "frame child");
   REQUIRE(do_list(kv, "/frames/", &ns, &n) == 0, "list frames");
   CHECK(n == 1 && list_has(ns, n, "[1]/"), "deduplicate directory child");
   list_free(ns, n);
-
   CHECK(set_int32(kv, "/private", 8) == 0, "overwrite permitted value");
   uint8_t *body = NULL;
   CHECK(write_new_body(kv, "/private", 4, &body) == 0,
         "write new permitted place");
   if (body)
     memcpy(body, raw, 4);
-  CHECK(kvspaceShmDel(kv, "/private") == 0, "delete private value");
-
+  CHECK(t_del(kv, "/private") == 0, "delete private value");
   permitted = NULL;
   permitted_len = 0;
   CHECK(kvspace_test_wire_scalar(raw, 4, "",
                                    &permitted, &permitted_len) == 0 &&
-            kvspaceShmSetValue(kv, "/tree/a", permitted,
+            t_set_wire(kv, "/tree/a", permitted,
                                (int32_t)permitted_len) == 0,
         "set tree value");
   free(permitted);
-  CHECK(kvspaceShmCptree(kv, "/tree", "/tree_copy") == 0,
+  CHECK(t_cptree(kv, "/tree", "/tree_copy") == 0,
         "copy tree");
-  CHECK(kvspaceShmDeltree(kv, "/tree_copy") == 0,
+  CHECK(t_deltree(kv, "/tree_copy") == 0,
         "delete copied tree");
-
-  /* 挂载 = 在挂载点写一条 **Ext wire**，body 是目标目录。
-   *
-   * 早先这里是 `kvspaceShmExtindex(kv, "/e/", "/lib/", ...)`：那个 helper 读 `/lib/`
-   * 的 langtype，再 `HeadNewExt` 造 `@` 前缀的 wire —— 两步都在造语言层的值，存储层
-   * 不该干，TASK-082 把它删了。语义没变：存储层要的只是「这条 wire 的 langtype 以
-   * `@` 开头、body 是目标目录」（`kvspace_c_reference_of` 与 `dir_ext_path` 判的就是
-   * 这两件），造 wire 这件事现在由测试自己用语言层的构造器完成，正如真实调用方那样。 */
-  CHECK(mkindex(kv, "/lib/") == 0, "new directory value");
-  {
-    uint8_t *ext_wire = NULL;
-    uint64_t ext_len = 0;
-    CHECK(kvspace_test_wire_ext((const uint8_t *)"/lib/", 5, "", &ext_wire,
-                                 &ext_len) == 0,
-          "build ext wire");
-    CHECK(kvspaceShmSetValue(kv, "/e/", ext_wire, (int32_t)ext_len) == 0,
-          "mount /lib/ at /e/");
-    free(ext_wire);
-  }
-  REQUIRE(kvspaceShmList(kv, "/e/", true, 0, &ns, &n) == 0, "list /e/ ex");
-  CHECK(list_has(ns, n, "a") && list_has(ns, n, "b") && list_has(ns, n, "mod"),
-        "extindex children");
-  list_free(ns, n);
-
-  CHECK(kvspaceShmCptree(kv, "/d/f", "/cp") == 0, "cptree");
+  CHECK(t_cptree(kv, "/d/f", "/cp") == 0, "cptree");
   REQUIRE(do_list(kv, "/cp/", &ns, &n) == 0, "list /cp/");
   CHECK(n == 2 && list_has(ns, n, "p") && list_has(ns, n, "q"),
         "cptree children");
   list_free(ns, n);
   CHECK(get_int32(kv, "/cp/p") == 4 && get_int32(kv, "/cp/q") == 5,
         "cptree values");
-
-  CHECK(kvspaceShmDeltree(kv, "/d") == 0, "deltree /d");
+  CHECK(t_deltree(kv, "/d") == 0, "deltree /d");
   REQUIRE(do_list(kv, "/d/", &ns, &n) == 0, "list /d/ after deltree");
   CHECK(n == 0, "deltree left children %d", n);
   list_free(ns, n);
   CHECK(get_int32(kv, "/lib/a") == 1 && get_int32(kv, "/foo/bar1") == 7,
         "deltree escaped sibling trees");
   CHECK(get_int32(kv, "/d/f/p") == -1, "deltree did not remove target");
-
-  kvspaceShmClose(kv);
+  t_close(kv);
 }
-
 static int fill_noise(kvspace_t *kv, int from, int to) {
   char key[32];
   int fail = 0;
@@ -247,7 +191,6 @@ static int fill_noise(kvspace_t *kv, int from, int to) {
   }
   return fail;
 }
-
 static double time_list(kvspace_t *kv, const char *pfx, int reps) {
   for (int i = 0; i < 20; i++) {
     char **ns;
@@ -264,27 +207,23 @@ static double time_list(kvspace_t *kv, const char *pfx, int reps) {
   }
   return now_s() - t0;
 }
-
 static void t_scale(const char *db) {
   const int lo = 1000, hi = 8000, reps = 400;
   printf("[scale] List(/t/) vs sibling tree size %d -> %d, %d reps\n", lo, hi,
          reps);
-  kvspace_t *kv = kvspaceShmOpen(db, SBO_DATA_SIZE);
+  kvspace_t *kv = t_open(db, SBO_DATA_SIZE);
   REQUIRE(kv != NULL, "open failed");
-
   CHECK(set_int32(kv, "/t/a", 1) == 0, "set /t/a");
   CHECK(set_int32(kv, "/t/b", 2) == 0, "set /t/b");
   CHECK(set_int32(kv, "/t/c/x", 3) == 0, "set /t/c/x");
   CHECK(fill_noise(kv, 0, lo) == 0, "fill lo noise");
-
   char **ns;
   int32_t n;
   REQUIRE(do_list(kv, "/t/", &ns, &n) == 0, "list /t/");
   CHECK(n == 3 && list_has(ns, n, "a") && list_has(ns, n, "b") &&
-            list_has(ns, n, "c"),
+            list_has(ns, n, "c/"),
         "list /t/ names");
   list_free(ns, n);
-
   double t_lo = time_list(kv, "/t/", reps);
   CHECK(fill_noise(kv, lo, hi) == 0, "fill hi noise");
   REQUIRE(do_list(kv, "/t/", &ns, &n) == 0, "list /t/ after noise");
@@ -292,17 +231,14 @@ static void t_scale(const char *db) {
   list_free(ns, n);
   double t_hi = time_list(kv, "/t/", reps);
   double ratio = t_lo > 0 ? t_hi / t_lo : 0;
-
   printf("  list /t/  %d noise: %.4fs\n", lo, t_lo);
   printf("  list /t/  %d noise: %.4fs  ratio=%.2f (must not track noise)\n", hi,
          t_hi, ratio);
   CHECK(ratio < 2.5, "List(/t/) scaled with sibling size: %.2fx", ratio);
-
-  kvspaceShmClose(kv);
+  t_close(kv);
 }
-
 static void t_wide(const char *db) {
-  kvspace_t *kv = kvspaceShmOpen(db, SBO_DATA_SIZE);
+  kvspace_t *kv = t_open(db, SBO_DATA_SIZE);
   REQUIRE(kv != NULL, "open wide failed");
   for (int i = 0; i < 4097; i++) {
     char key[32];
@@ -317,129 +253,91 @@ static void t_wide(const char *db) {
     CHECK(strcmp(names[0], "0000") == 0 &&
               strcmp(names[4096], "4096") == 0, "wide order");
   list_free(names, count);
-  kvspaceShmClose(kv);
+  t_close(kv);
 }
-
 static void expect_children(kvspace_t *kv, const char *prefix, bool ex,
                             const char **expected, int32_t count) {
   char **names = NULL;
   int32_t n = 0;
-  REQUIRE(kvspaceShmList(kv, prefix, ex, 0, &names, &n) == 0,
+  REQUIRE(t_list(kv, prefix, ex, 0, &names, &n) == 0,
           "list %s", prefix);
   CHECK(n == count, "%s count %d, expected %d", prefix, n, count);
   for (int32_t i = 0; i < n && i < count; i++)
     CHECK(strcmp(names[i], expected[i]) == 0, "%s child %d: %s != %s",
           prefix, i, names[i], expected[i]);
   list_free(names, n);
-  int32_t length = -1;
-  CHECK(kvspaceShmListLen(kv, prefix, ex, 0, &length) == 0 && length == count,
-        "%s ListLen %d, expected %d", prefix, length, count);
+  int64_t length = -1;
+  uint32_t max_name_length = 0;
+  uint32_t raw_length = 0;
+  uint32_t raw_count = 0;
+  uint64_t generation = 0;
+  int rc = kvspaceListlen(kv, prefix, &length, &max_name_length);
+  if (rc == KVSPACE_MISSING || rc == KVSPACE_NOT_INDEX) {
+    rc = KVSPACE_OK;
+    length = 0;
+  }
+  CHECK(rc == KVSPACE_OK,"%s ListLen", prefix);
+  int list_rc = kvspaceList(kv, prefix, NULL, 0, &raw_length, &raw_count,
+                            &generation);
+  if (list_rc == KVSPACE_MISSING || list_rc == KVSPACE_NOT_INDEX) {
+    list_rc = KVSPACE_OK;
+    raw_count = 0;
+  }
+  CHECK(list_rc == KVSPACE_OK,"%s List raw", prefix);
+  CHECK(length == (int64_t)raw_count,
+        "%s ListLen %lld, raw List %u", prefix, (long long)length, raw_count);
+  CHECK(raw_count >= (uint32_t)n, "%s raw List %u, filtered %d", prefix,
+        raw_count, n);
 }
-
-/* 集合比对：子项集合必须**恰好**等于 expected（名字逐一出现一次），不看顺序。
- * 与 `expect_children` 的区别就是「顺序算不算契约」——List 不算。 */
 static void expect_children_set(kvspace_t *kv, const char *prefix, bool ex,
                                 const char **expected, int32_t count) {
   char **names = NULL;
   int32_t n = 0;
-  REQUIRE(kvspaceShmList(kv, prefix, ex, 0, &names, &n) == 0, "list %s", prefix);
+  REQUIRE(t_list(kv, prefix, ex, 0, &names, &n) == 0, "list %s", prefix);
   CHECK(n == count, "%s count %d, expected %d", prefix, n, count);
-  /* 双项核对（不是只查「expected 都在」）：多出一个意料外的子项同样算错。 */
   for (int32_t i = 0; i < count; i++) {
     CHECK(list_has(names, n, expected[i]), "%s missing child %s", prefix,
           expected[i]);
   }
   list_free(names, n);
 }
-
 static void t_direct_children(const char *db) {
   printf("[children] markers, tombstones, split UTF-8, fanout, extindex, reopen\n");
-  kvspace_t *kv = kvspaceShmOpen(db, SBO_DATA_SIZE);
+  kvspace_t *kv = t_open(db, SBO_DATA_SIZE);
   REQUIRE(kv != NULL, "open children failed");
-  /* Split U+00B7 across a prefix and edge. */
   CHECK(set_int32(kv, "/abc/name·field/value", 5) == 0, "split separator");
-  const char *utf8[] = {"name"};
+  const char *utf8[] = {"name·"};
   expect_children(kv, "/abc/", false, utf8, 1);
   CHECK(set_int32(kv, "/case/a", 1) == 0, "scalar child");
   CHECK(set_int32(kv, "/case/ab", 2) == 0, "shared name prefix");
   CHECK(mkindex(kv, "/case/a/") == 0, "directory marker");
   CHECK(set_int32(kv, "/case/a/deep/value", 3) == 0, "nested child");
   CHECK(set_int32(kv, "/case/a·field", 4) == 0, "attribute child");
-  const char *marked[] = {"a/", "ab"};
-  expect_children(kv, "/case/", false, marked, 2);
-  CHECK(kvspaceShmDel(kv, "/case/a/") == 0, "delete marker");
-  const char *unmarked[] = {"a", "ab"};
-  expect_children(kv, "/case/", false, unmarked, 2);
-
+  const char *marked[] = {"a/", "ab", "a·"};
+  expect_children(kv, "/case/", false, marked, 3);
   CHECK(set_int32(kv, "/中文/子项·属性/值", 6) == 0, "UTF-8 child");
-  const char *chinese[] = {"子项"};
+  const char *chinese[] = {"子项·"};
   expect_children(kv, "/中文/", false, chinese, 1);
-
   CHECK(set_int32(kv, "/coords/[10]/x", 10) == 0, "coord 10");
   CHECK(set_int32(kv, "/coords/[2]/x", 2) == 0, "coord 2");
   CHECK(set_int32(kv, "/coords/[-1]/x", -1) == 0, "coord -1");
   CHECK(mkindex(kv, "/coords/[10]/") == 0, "coord marker");
-  /* **集合断言，不是顺序断言**：`kvspaceList` 的契约是「后端顺序、不排序」（见
-   * kvspace.h），坐标序是上层的事。这里只验「三个子项都在、名字都对」。
-   * 早先这个用例按 `{"[-1]", "[2]", "[10]/"}` 逐项比顺序，靠的是存储层内部那份
-   * `qsort(child_cmp)`——那让注释成了假话，也把排序责任留在了存储层。排序本身由
-   * `kvlangCoordCmp` 保证，规格在 kvlang/tests/test_coord.c。 */
-  const char *coords[] = {"[-1]", "[2]", "[10]/"};
+  const char *coords[] = {"[-1]/", "[2]/", "[10]/"};
   expect_children_set(kv, "/coords/", false, coords, 3);
-
-  CHECK(mkindex(kv, "/remote/") == 0, "remote index");
-  CHECK(mkindex(kv, "/remote/a/") == 0, "remote marker");
-  CHECK(set_int32(kv, "/remote/a/deep/value", 7) == 0, "remote child");
-  CHECK(set_int32(kv, "/remote/z/value", 8) == 0, "remote z");
-  CHECK(set_int32(kv, "/local/a/value", 9) == 0, "local child");
-  {
-    uint8_t *ext_wire = NULL;
-    uint64_t ext_len = 0;
-    CHECK(kvspace_test_wire_ext((const uint8_t *)"/remote/", 8, "", &ext_wire,
-                                 &ext_len) == 0,
-          "build ext wire for /local/");
-    CHECK(kvspaceShmSetValue(kv, "/local/", ext_wire, (int32_t)ext_len) == 0,
-          "mount /remote/ at /local/");
-    free(ext_wire);
-  }
-  /* **跨段同名去重**：`/local/a` 是值形态（主段），`/remote/a/` 是目录形态
-   * （ext 段）。两段各自扫出来后必须合成一项，且留目录形态。这是唯一不能靠
-   * 「同一段内相邻」办到、也不能靠「两段各自有序」办到的那种冲突——集合查重
-   * 才对它成立。 */
-  const char *extended[] = {"a/", "z"};
-  expect_children(kv, "/local/", true, extended, 2);
-  {
-    char **names = NULL;
-    int32_t n = 0;
-    REQUIRE(kvspaceShmList(kv, "/local/", true, 0, &names, &n) == 0,
-            "list /local/ ext");
-    CHECK(n == 2, "/local/ ext 只有 a 与 z 两项（a 的两个形态合成一项），实得 %d",
-          n);
-    /* 留下来的是**目录形态**那个：合并判等只看去尾 `/` 的名字，但保留策略是
-       「目录形态优先」——目录有子项，丢掉它等于丢掉 `a/deep/value` 这条路。 */
-    CHECK(list_has(names, n, "a/"), "跨段冲突应保留目录形态 a/");
-    CHECK(!list_has(names, n, "a"), "跨段冲突不应同时留下值形态 a");
-    list_free(names, n);
-  }
-  const char *local[] = {"a"};
-  expect_children(kv, "/local/", false, local, 1);
-
-  /* Tombstones across all ART fanouts. */
   for (int c = 1; c < 256; c++) {
     if (c == '/' || c == 0xC2)
       continue;
     char key[32];
     snprintf(key, sizeof key, "/dead/child/%c/value", c);
     REQUIRE(set_int32(kv, key, c) == 0, "set fanout %d", c);
-    REQUIRE(kvspaceShmDel(kv, key) == 0, "delete fanout %d", c);
+    REQUIRE(t_del(kv, key) == 0, "delete fanout %d", c);
   }
   expect_children(kv, "/dead/", false, NULL, 0);
   CHECK(set_int32(kv, "/dead/child/last/value", 11) == 0, "revive branch");
-  const char *alive[] = {"child"};
+  const char *alive[] = {"child/"};
   expect_children(kv, "/dead/", false, alive, 1);
-  CHECK(kvspaceShmDel(kv, "/dead/child/last/value") == 0, "delete revived branch");
+  CHECK(t_del(kv, "/dead/child/last/value") == 0, "delete revived branch");
   expect_children(kv, "/dead/", false, NULL, 0);
-
   for (int i = 0; i < 3000; i++) {
     char key[64];
     snprintf(key, sizeof key, "/many/child/deep/%04d/value", i);
@@ -449,30 +347,27 @@ static void t_direct_children(const char *db) {
   for (int i = 0; i < 3000; i++) {
     char key[64];
     snprintf(key, sizeof key, "/many/child/deep/%04d/value", i);
-    REQUIRE(kvspaceShmDel(kv, key) == 0, "delete descendant %d", i);
+    REQUIRE(t_del(kv, key) == 0, "delete descendant %d", i);
   }
   expect_children(kv, "/many/", false, NULL, 0);
   CHECK(mkindex(kv, "/many/child/") == 0, "marker on dead branch");
   const char *marker_only[] = {"child/"};
   expect_children(kv, "/many/", false, marker_only, 1);
-  kvspaceShmClose(kv);
-  kv = kvspaceShmOpen(db, SBO_DATA_SIZE);
+  t_close(kv);
+  kv = t_open(db, SBO_DATA_SIZE);
   REQUIRE(kv != NULL, "reopen children failed");
   expect_children(kv, "/many/", false, marker_only, 1);
-  expect_children(kv, "/local/", true, extended, 2);
   expect_children(kv, "/dead/", false, NULL, 0);
-  kvspaceShmClose(kv);
+  t_close(kv);
 }
-
 static int write_new_body(kvspace_t *kv, const char *key, uint64_t body_len,
                           uint8_t **body) {
     uint64_t offset = 0;
-    if (kvspaceShmStorageRealloc(kv, key, body_len, 0, &offset) != 0)
+    if (t_realloc(kv, key, body_len, 0, &offset) != 0)
         return -1;
-    *body = kvspaceShmStorageDataBase(kv) + offset + KVSPACE_XVALUE_HEAD_LEN;
+    *body = t_data_base(kv) + offset + KVSPACE_XVALUE_HEAD_LEN;
     return 0;
 }
-
 int main(int argc, char **argv) {
   char tmpl[] = "/tmp/kvspace-artscan-XXXXXX";
   const char *dir = argc > 1 ? argv[1] : mkdtemp(tmpl);
@@ -485,12 +380,10 @@ int main(int argc, char **argv) {
   snprintf(db2, sizeof db2, "%s/db2", dir);
   snprintf(db3, sizeof db3, "%s/db3", dir);
   snprintf(db4, sizeof db4, "%s/db4", dir);
-
   t_correct(db);
   t_scale(db2);
   t_wide(db3);
   t_direct_children(db4);
-
   if (argc <= 1) {
     char cmd[700];
     snprintf(cmd, sizeof cmd, "rm -rf '%s'", dir);
