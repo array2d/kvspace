@@ -35,20 +35,20 @@ void kvspace_block_mark_used(blocks_meta_t *meta, void *block_pointer) {
     setblock_t(meta, block_pointer, 1, -1);
 }
 static uint8_t *storage_data_base(kvspace_t *store);
-static int realloc_key(kvspace_t *store, const char *key, uint64_t body_length,
-                       uint64_t attribute_length, uint64_t *out_offset);
+static int realloc_key_locked(kvspace_t *store, const char *key, uint64_t body_length,
+                              uint64_t attribute_length, uint64_t *out_offset);
 static inline void list_generation_bump(kvspace_t *store) {
     __atomic_add_fetch(&store->header->list_generation, 1ull, __ATOMIC_RELEASE);
 }
 int region_map(shared_memory_region_t *region, size_t size) {
     if (size > region->reserve)
         return -1;
-    if (size <= region->mapped)
+    if (size <= __atomic_load_n(&region->mapped, __ATOMIC_ACQUIRE))
         return 0;
     if (mmap(region->base, size, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED,
              region->file_descriptor, 0) == MAP_FAILED)
         return -1;
-    region->mapped = size;
+    __atomic_store_n(&region->mapped, size, __ATOMIC_RELEASE);
     return 0;
 }
 static int region_attach(shared_memory_region_t *region, bool create, size_t size,
@@ -77,11 +77,22 @@ void kvspaceTestSetDataSize(size_t data_size) {
 }
 #endif
 int store_sync(kvspace_t *store) {
-    if (region_map(&store->region_adaptive_radix_tree, ADAPTIVE_RADIX_TREE_OFFSET + (size_t)store->header->adaptive_radix_tree_slab_size) != 0)
-        return -1;
-    if (region_map(&store->region_header, (size_t)store->header->slots_box_head_size) != 0)
-        return -1;
-    return region_map(&store->region_data, (size_t)store->header->slots_box_data_size);
+    size_t art_size = ADAPTIVE_RADIX_TREE_OFFSET +
+                      (size_t)__atomic_load_n(&store->header->adaptive_radix_tree_slab_size, __ATOMIC_ACQUIRE);
+    size_t head_size = (size_t)__atomic_load_n(&store->header->slots_box_head_size, __ATOMIC_ACQUIRE);
+    size_t data_size = (size_t)__atomic_load_n(&store->header->slots_box_data_size, __ATOMIC_ACQUIRE);
+    if (art_size <= __atomic_load_n(&store->region_adaptive_radix_tree.mapped, __ATOMIC_ACQUIRE) &&
+        head_size <= __atomic_load_n(&store->region_header.mapped, __ATOMIC_ACQUIRE) &&
+        data_size <= __atomic_load_n(&store->region_data.mapped, __ATOMIC_ACQUIRE))
+        return 0;
+    pthread_mutex_lock(&store->map_lock);
+    int return_code = 0;
+    if (region_map(&store->region_adaptive_radix_tree, art_size) != 0 ||
+        region_map(&store->region_header, head_size) != 0 ||
+        region_map(&store->region_data, data_size) != 0)
+        return_code = -1;
+    pthread_mutex_unlock(&store->map_lock);
+    return return_code;
 }
 static bool blockmalloc_layout_ok(void) {
     blocks_meta_t metadata;
@@ -102,6 +113,7 @@ static bool slots_box_data_size_ok(size_t data_size) {
 static kvspace_t *open_shared_memory_store(const char *path, size_t data_size) {
     if (!blockmalloc_layout_ok()) {
         fprintf(stderr, "kvspace: unexpected blockmalloc blocks_meta_t layout\n");
+        errno = EINVAL;
         return NULL;
     }
     char head_path[PATH_MAX], data_path[PATH_MAX], retirement_path[PATH_MAX];
@@ -110,19 +122,33 @@ static kvspace_t *open_shared_memory_store(const char *path, size_t data_size) {
         snprintf(data_path, sizeof data_path, "%s.sbo.data", path) >=
             (int)sizeof data_path ||
         snprintf(retirement_path, sizeof retirement_path, "%s.retirement", path) >=
-            (int)sizeof retirement_path)
+            (int)sizeof retirement_path) {
+        errno = ENAMETOOLONG;
         return NULL;
+    }
     kvspace_t *store = calloc(1, sizeof(*store));
     if (!store)
         return NULL;
+    if (pthread_mutex_init(&store->local_write_lock, NULL) != 0) {
+        free(store);
+        return NULL;
+    }
+    if (pthread_mutex_init(&store->map_lock, NULL) != 0) {
+        pthread_mutex_destroy(&store->local_write_lock);
+        free(store);
+        return NULL;
+    }
+    store->locks_initialized = 1;
     store->recovery_slot = -1;
     store->region_adaptive_radix_tree.file_descriptor = store->region_header.file_descriptor = store->region_data.file_descriptor =
         store->region_retirement.file_descriptor = -1;
     bool created = false;
     store->region_adaptive_radix_tree.file_descriptor = open(path, O_RDWR);
     if (store->region_adaptive_radix_tree.file_descriptor < 0) {
-        if (!slots_box_data_size_ok(data_size))
+        if (!slots_box_data_size_ok(data_size)) {
+            errno = EINVAL;
             goto fail;
+        }
         store->region_adaptive_radix_tree.file_descriptor = open(path, O_RDWR | O_CREAT | O_EXCL, 0644);
         if (store->region_adaptive_radix_tree.file_descriptor < 0)
             goto fail;
@@ -135,8 +161,10 @@ static kvspace_t *open_shared_memory_store(const char *path, size_t data_size) {
     } else {
         kvspace_header_t temporary;
         if (pread(store->region_adaptive_radix_tree.file_descriptor, &temporary, sizeof temporary, 0) != (ssize_t)sizeof temporary ||
-            memcmp(temporary.magic, KVSPACE_MAGIC, sizeof(KVSPACE_MAGIC) - 1) != 0)
+            memcmp(temporary.magic, KVSPACE_MAGIC, sizeof(KVSPACE_MAGIC) - 1) != 0) {
+            errno = EINVAL;
             goto fail;
+        }
         adaptive_radix_tree_slab = (size_t)temporary.adaptive_radix_tree_slab_size;
         slots_box_head = (size_t)temporary.slots_box_head_size;
         data_size = (size_t)temporary.slots_box_data_size;
@@ -166,59 +194,76 @@ static kvspace_t *open_shared_memory_store(const char *path, size_t data_size) {
         store->header->slots_box_data_size = data_size;
         store->header->adaptive_radix_tree_root = -1;
         if (blocks_init(store->adaptive_radix_tree_meta, adaptive_radix_tree_slab, ADAPTIVE_RADIX_TREE_BLOCK_SIZE) != 0 ||
-            sbo_init(store->slots_box_meta, slots_box_head, data_size) != 0)
+            sbo_init(store->slots_box_meta, slots_box_head, data_size) != 0) {
+            errno = EIO;
             goto fail;
+        }
         store->adaptive_radix_tree_meta->sizeof_block_head = 8;
         memcpy(store->header->magic, KVSPACE_MAGIC, sizeof(KVSPACE_MAGIC) - 1);
     }
     store->recovery_slot = recovery_register_claim(store);
     if (store->recovery_slot == -2) {
         fprintf(stderr, "kvspace: too many processes, N=%d\n", RECOVERY_SLOT_COUNT);
+        errno = EMFILE;
         goto fail;
     }
     if (store->recovery_slot == -3) {
         fprintf(stderr, "kvspace: claim_id exhausted (2^30 opens): "
                         "rebuild the store\n");
+        errno = EOVERFLOW;
         goto fail;
     }
-    if (store->recovery_slot < 0)
+    if (store->recovery_slot < 0) {
+        errno = EIO;
         goto fail;
+    }
     store->process_id = (uint32_t)getpid();
     store->fork_generation = recovery_fork_generation();
-    store->quiesced = 1;
-    if (store->header->committed_bytes -
-            __atomic_load_n(&store->header->freed_bytes, __ATOMIC_ACQUIRE) >=
-            retirement_threshold() &&
-        recovery_maintenance_start(store) != 0)
+    uint64_t committed = __atomic_load_n(&store->header->committed_bytes, __ATOMIC_ACQUIRE);
+    uint64_t freed = __atomic_load_n(&store->header->freed_bytes, __ATOMIC_ACQUIRE);
+    if (committed > freed && committed - freed >= retirement_threshold() &&
+        recovery_maintenance_start(store) != 0) {
+        errno = EAGAIN;
         goto fail;
+    }
     return store;
 fail:
-    recovery_maintenance_stop(store);
-    if (store->recovery_slot >= 0 && store->header)
-        recovery_register_release(store);
-    region_close(&store->region_adaptive_radix_tree);
-    region_close(&store->region_header);
-    region_close(&store->region_data);
-    region_close(&store->region_retirement);
-    free(store);
-    if (created) {
-        unlink(path);
-        unlink(head_path);
-        unlink(data_path);
-        unlink(retirement_path);
+    {
+        int saved_errno = errno;
+        recovery_maintenance_stop(store);
+        if (store->recovery_slot >= 0 && store->header)
+            recovery_register_release(store);
+        region_close(&store->region_adaptive_radix_tree);
+        region_close(&store->region_header);
+        region_close(&store->region_data);
+        region_close(&store->region_retirement);
+        if (store->locks_initialized) {
+            pthread_mutex_destroy(&store->map_lock);
+            pthread_mutex_destroy(&store->local_write_lock);
+        }
+        free(store);
+        if (created) {
+            unlink(path);
+            unlink(head_path);
+            unlink(data_path);
+            unlink(retirement_path);
+        }
+        errno = saved_errno ? saved_errno : EIO;
     }
     return NULL;
 }
 static void close_shared_memory_store(kvspace_t *store) {
-    if (store->process_id == (uint32_t)getpid() && store->recovery_slot >= 0 &&
-        !recovery_other_alive(store)) {
-#if defined(__linux__)
+    if (store->process_id == (uint32_t)getpid() && store->recovery_slot >= 0) {
         __atomic_store_n(&store->header->slots[store->recovery_slot].quiesced, 1u,
                          __ATOMIC_RELEASE);
-        (void)recovery_round(store);
+        recovery_ack_progress(store);
+        if (!recovery_other_alive(store)) {
+#if defined(__linux__)
+            (void)recovery_round(store);
 #else
-        retirement_release_all(store);
+            retirement_release_all(store);
 #endif
+        }
     }
     recovery_maintenance_stop(store);
     recovery_register_release(store);
@@ -226,11 +271,15 @@ static void close_shared_memory_store(kvspace_t *store) {
     region_close(&store->region_header);
     region_close(&store->region_data);
     region_close(&store->region_retirement);
+    if (store->locks_initialized) {
+        pthread_mutex_destroy(&store->map_lock);
+        pthread_mutex_destroy(&store->local_write_lock);
+    }
     free(store);
 }
-static int shared_memory_delete_key(kvspace_t *store, const char *key) {
+static int shared_memory_delete_key_locked(kvspace_t *store, const char *key) {
     uint64_t existing_offset = 0;
-    int locate = resolve_root(store, key, &existing_offset);
+    int locate = resolve_root_locked(store, key, &existing_offset);
     if (locate != KVSPACE_OK)
         return locate == KVSPACE_MISSING ? 0 : -1;
     uint64_t retirement_index = 0;
@@ -238,13 +287,13 @@ static int shared_memory_delete_key(kvspace_t *store, const char *key) {
         return -1;
     bool deleted = false;
     uint64_t retired_offset = 0;
-    int32_t root = adaptive_radix_tree_delete(store, store->header->adaptive_radix_tree_root, (const uint8_t *)key,
+    int32_t current_root = __atomic_load_n(&store->header->adaptive_radix_tree_root, __ATOMIC_ACQUIRE);
+    int32_t root = adaptive_radix_tree_delete(store, current_root, (const uint8_t *)key,
                            (int)strlen(key), 0, &deleted, &retired_offset);
     if (root < 0) {
         retirement_cancel(store, retirement_index);
         return -1;
     }
-    store->header->adaptive_radix_tree_root = root;
     if (!deleted) {
         retirement_cancel(store, retirement_index);
         return 0;
@@ -253,44 +302,33 @@ static int shared_memory_delete_key(kvspace_t *store, const char *key) {
                       sbo_allocated_size(store->slots_box_meta, retired_offset));
     return 1;
 }
-static int delete_tree(kvspace_t *store, const char *prefix) {
-    if (reserved_meta_path(prefix))
-        return -1;
+static int delete_tree_locked(kvspace_t *store, const char *prefix) {
+    if (!key_text_valid(prefix))
+        return KVSPACE_INVALID;
     if (store_sync(store) != 0)
-        return -1;
+        return KVSPACE_BACKEND;
     size_t prefix_length = strlen(prefix);
-    if (prefix_length >= 1024)
-        return -1;
+    size_t base_length = subtree_base_length(prefix, prefix_length);
     char base[1024];
-    memcpy(base, prefix, prefix_length + 1);
-    size_t base_length = prefix_length;
-    if (base_length == (size_t)separator_length(SEPARATOR_SLASH) &&
-        separator_at(base, 0, base_length) == SEPARATOR_SLASH) {
-        base_length = 0;
-    } else {
-        enum separator_kind kind = ending_separator(base, base_length);
-        if (kind != SEPARATOR_NONE)
-            base_length -= (size_t)separator_length(kind);
-    }
+    if (base_length)
+        memcpy(base, prefix, base_length);
     base[base_length] = 0;
-    if (base_length && reserved_meta_path(base))
-        return -1;
     keyscan_t keys = {0};
     if (adaptive_radix_tree_scan_keys(store, base_length ? base : separator_table[SEPARATOR_SLASH].bytes,
                       base_length ? (int)base_length : separator_length(SEPARATOR_SLASH),
                       &keys) != 0) {
         keyscan_free(&keys);
-        return -1;
+        return KVSPACE_BACKEND;
     }
-    int return_code = 0, any = 0;
+    int return_code = KVSPACE_OK, any = 0;
     for (int32_t i = 0; i < keys.count; i++) {
         const char *key = keys.keys[i];
         if (!subtree_key(base, base_length, key) || reserved_meta_path(key) ||
             strlen(key) >= 1024)
             continue;
-        int deleted = shared_memory_delete_key(store, key);
+        int deleted = shared_memory_delete_key_locked(store, key);
         if (deleted < 0)
-            return_code = -1;
+            return_code = KVSPACE_BACKEND;
         else if (deleted)
             any = 1;
     }
@@ -299,149 +337,139 @@ static int delete_tree(kvspace_t *store, const char *prefix) {
         list_generation_bump(store);
     return return_code;
 }
-static int read_wire(kvspace_t *store, const char *key, const uint8_t **out,
-                     uint64_t *out_length) {
+static int read_wire_locked(kvspace_t *store, const char *key, const uint8_t **out,
+                            uint64_t *out_length) {
     uint64_t offset = 0;
-    if (resolve_root(store, key, &offset) != KVSPACE_OK)
-        return -1;
+    int status = resolve_root_locked(store, key, &offset);
+    if (status != KVSPACE_OK)
+        return status;
+    if (offset >= __atomic_load_n(&store->region_data.mapped, __ATOMIC_ACQUIRE) &&
+        store_sync(store) != 0)
+        return KVSPACE_BACKEND;
     uint8_t *base = storage_data_base(store);
     if (!base)
-        return -1;
+        return KVSPACE_BACKEND;
     const uint8_t *wire = base + offset;
     const kvspaceXvalueHead *head = (const kvspaceXvalueHead *)(const void *)wire;
     uint64_t total = kvspaceXvalueHeadTotalLen(head);
     if (total < KVSPACE_XVALUE_HEAD_LEN)
-        return -1;
+        return KVSPACE_BACKEND;
     *out = wire;
     *out_length = total;
-    return 0;
+    return KVSPACE_OK;
 }
-static int write_wire(kvspace_t *store, const char *key, const uint8_t *wire,
-                      uint64_t length) {
+static int write_wire_locked(kvspace_t *store, const char *key, const uint8_t *wire,
+                             uint64_t length) {
     if (length < KVSPACE_XVALUE_HEAD_LEN)
-        return -1;
+        return KVSPACE_INVALID;
     const kvspaceXvalueHead *head = (const kvspaceXvalueHead *)(const void *)wire;
     uint64_t body = kvspaceXvalueHeadLen(head);
     uint64_t attributes = kvspaceXvalueHeadAttrsLen(head);
     if (KVSPACE_XVALUE_HEAD_LEN + body + attributes != length)
-        return -1;
+        return KVSPACE_INVALID;
     uint64_t offset = 0;
-    if (realloc_key(store, key, body, attributes, &offset) != KVSPACE_OK)
-        return -1;
+    int status = realloc_key_locked(store, key, body, attributes, &offset);
+    if (status != KVSPACE_OK)
+        return status;
     uint8_t *base = storage_data_base(store);
     if (!base)
-        return -1;
+        return KVSPACE_BACKEND;
     uint8_t *destination = base + offset;
-    memcpy(destination + KVSPACE_XVALUE_HEAD_LEN, wire + KVSPACE_XVALUE_HEAD_LEN, body);
+    memcpy(destination + KVSPACE_XVALUE_HEAD_LEN, wire + KVSPACE_XVALUE_HEAD_LEN, (size_t)body);
     if (attributes)
         memcpy(destination + KVSPACE_XVALUE_HEAD_LEN + body,
-               wire + KVSPACE_XVALUE_HEAD_LEN + body, attributes);
-    return 0;
+               wire + KVSPACE_XVALUE_HEAD_LEN + body, (size_t)attributes);
+    return KVSPACE_OK;
 }
-static int copy_key(kvspace_t *store, const char *source, const char *destination) {
+static int copy_key_locked(kvspace_t *store, const char *source, const char *destination) {
+    if (!key_text_valid(source) || !key_text_valid(destination))
+        return KVSPACE_INVALID;
     const uint8_t *raw = NULL;
     uint64_t raw_length = 0;
-    if (read_wire(store, source, &raw, &raw_length) != 0)
-        return -1;
+    int status = read_wire_locked(store, source, &raw, &raw_length);
+    if (status != KVSPACE_OK)
+        return status;
     uint8_t *temporary = malloc((size_t)raw_length);
     if (!temporary)
-        return -1;
+        return KVSPACE_BACKEND;
     memcpy(temporary, raw, (size_t)raw_length);
-    int return_code = write_wire(store, destination, temporary, raw_length);
+    status = write_wire_locked(store, destination, temporary, raw_length);
     free(temporary);
-    return return_code;
+    return status;
 }
-static int copy_tree_recursive(kvspace_t *store, const char *source, const char *destination) {
-    {
-        const uint8_t *raw = NULL;
-        uint64_t raw_length = 0;
-        if (read_wire(store, source, &raw, &raw_length) == 0) {
-            if (copy_key(store, source, destination) != 0)
-                return -1;
-        }
-    }
+static int copy_tree_locked(kvspace_t *store, const char *source, const char *destination) {
+    if (!key_text_valid(source) || !key_text_valid(destination))
+        return KVSPACE_INVALID;
     if (store_sync(store) != 0)
-        return -1;
-    char *source_directory = ending_directory(source), *destination_directory = ending_directory(destination);
-    char *member_source_directory = member_directory(source), *member_destination_directory = member_directory(destination);
-    if (!source_directory || !destination_directory || !member_source_directory || !member_destination_directory) {
-        free(source_directory);
-        free(destination_directory);
-        free(member_source_directory);
-        free(member_destination_directory);
-        return -1;
-    }
-    keyscan_t children = {0};
-    keyscan_t members = {0};
-    int return_code = 0;
-    if (storage_children(store, source_directory, &children) == KVSPACE_BACKEND ||
-        storage_children(store, member_source_directory, &members) == KVSPACE_BACKEND)
-        return_code = -1;
-    for (int32_t i = 0; return_code == 0 && i < children.count; i++) {
-        char *child_source = path_join(source_directory, children.keys[i]), *child_destination = path_join(destination_directory, children.keys[i]);
-        if (!child_source || !child_destination || copy_tree_recursive(store, child_source, child_destination) != 0)
-            return_code = -1;
-        free(child_source);
-        free(child_destination);
-    }
-    for (int32_t i = 0; return_code == 0 && i < members.count; i++) {
-        size_t member_source_length = strlen(member_source_directory), member_destination_length = strlen(member_destination_directory), name_length = strlen(members.keys[i]);
-        char *child_source = malloc(member_source_length + name_length + 1);
-        char *child_destination = malloc(member_destination_length + name_length + 1);
-        if (!child_source || !child_destination) {
-            return_code = -1;
-        } else {
-            memcpy(child_source, member_source_directory, member_source_length);
-            memcpy(child_source + member_source_length, members.keys[i], name_length + 1);
-            memcpy(child_destination, member_destination_directory, member_destination_length);
-            memcpy(child_destination + member_destination_length, members.keys[i], name_length + 1);
-            if (copy_tree_recursive(store, child_source, child_destination) != 0)
-                return_code = -1;
-        }
-        free(child_source);
-        free(child_destination);
-    }
-    keyscan_free(&children);
-    keyscan_free(&members);
-    free(source_directory);
-    free(destination_directory);
-    free(member_source_directory);
-    free(member_destination_directory);
-    return return_code;
-}
-static int copy_tree(kvspace_t *store, const char *source, const char *destination) {
-    if (reserved_meta_path(source) || reserved_meta_path(destination))
-        return -1;
+        return KVSPACE_BACKEND;
     size_t source_length = strlen(source);
-    for (;;) {
-        enum separator_kind kind = ending_separator(source, source_length);
-        if (kind == SEPARATOR_NONE || source_length <= (size_t)separator_length(kind))
-            break;
-        source_length -= (size_t)separator_length(kind);
+    size_t destination_length = strlen(destination);
+    size_t source_base_length = subtree_base_length(source, source_length);
+    size_t destination_base_length = subtree_base_length(destination, destination_length);
+    char source_base[1024], destination_base[1024];
+    if (source_base_length)
+        memcpy(source_base, source, source_base_length);
+    source_base[source_base_length] = 0;
+    if (destination_base_length)
+        memcpy(destination_base, destination, destination_base_length);
+    destination_base[destination_base_length] = 0;
+    if (source_base_length == destination_base_length &&
+        memcmp(source_base, destination_base, source_base_length) == 0)
+        return KVSPACE_OK;
+    if (subtree_key(source_base, source_base_length, destination_base) ||
+        subtree_key(destination_base, destination_base_length, source_base))
+        return KVSPACE_INVALID;
+    keyscan_t keys = {0};
+    if (adaptive_radix_tree_scan_keys(store, source_base, (int)source_base_length, &keys) != 0) {
+        keyscan_free(&keys);
+        return KVSPACE_BACKEND;
     }
-    if (source_length == 1 && separator_at(source, 0, source_length) == SEPARATOR_SLASH &&
-        separator_at(destination, 0, strlen(destination)) == SEPARATOR_SLASH)
-        return strlen(destination) == 1 ? 0 : -1;
-    if (strncmp(source, destination, source_length) == 0) {
-        const char *rest = destination + source_length;
-        size_t rest_length = strlen(rest);
-        enum separator_kind kind = separator_at(rest, 0, rest_length);
-        if (rest_length == 0 ||
-            (kind != SEPARATOR_NONE &&
-             rest_length == (size_t)separator_length(kind)))
-            return 0;
-        if (kind != SEPARATOR_NONE)
-            return -1;
+    char target[1024];
+    for (int32_t i = 0; i < keys.count; i++) {
+        const char *key = keys.keys[i];
+        if (!subtree_key(source_base, source_base_length, key) || reserved_meta_path(key))
+            continue;
+        const char *suffix = key + source_base_length;
+        size_t suffix_length = strlen(suffix);
+        if (destination_base_length + suffix_length >= sizeof target) {
+            keyscan_free(&keys);
+            return KVSPACE_INVALID;
+        }
+        memcpy(target, destination_base, destination_base_length);
+        memcpy(target + destination_base_length, suffix, suffix_length + 1);
+        if (!key_text_valid(target)) {
+            keyscan_free(&keys);
+            return KVSPACE_INVALID;
+        }
     }
-    delete_tree(store, destination);
-    return copy_tree_recursive(store, source, destination);
+    int status = delete_tree_locked(store, destination);
+    if (status != KVSPACE_OK) {
+        keyscan_free(&keys);
+        return status;
+    }
+    for (int32_t i = 0; i < keys.count; i++) {
+        const char *key = keys.keys[i];
+        if (!subtree_key(source_base, source_base_length, key) || reserved_meta_path(key))
+            continue;
+        const char *suffix = key + source_base_length;
+        size_t suffix_length = strlen(suffix);
+        memcpy(target, destination_base, destination_base_length);
+        memcpy(target + destination_base_length, suffix, suffix_length + 1);
+        status = copy_key_locked(store, key, target);
+        if (status != KVSPACE_OK) {
+            keyscan_free(&keys);
+            return status;
+        }
+    }
+    keyscan_free(&keys);
+    return KVSPACE_OK;
 }
 static uint8_t *storage_data_base(kvspace_t *store) {
     return store->slots_box_data;
 }
-static int realloc_key(kvspace_t *store, const char *key,
-                             uint64_t body_length, uint64_t attribute_length,
-                             uint64_t *out_offset) {
+static int realloc_key_locked(kvspace_t *store, const char *key,
+                              uint64_t body_length, uint64_t attribute_length,
+                              uint64_t *out_offset) {
     *out_offset = 0;
     if (!key_text_valid(key))
         return KVSPACE_INVALID;
@@ -455,7 +483,8 @@ static int realloc_key(kvspace_t *store, const char *key,
         return KVSPACE_INVALID;
     if (store_sync(store) != 0)
         return KVSPACE_BACKEND;
-    adaptive_radix_tree_header_t *node = adaptive_radix_tree_search(store, store->header->adaptive_radix_tree_root, (const uint8_t *)key,
+    int32_t current_root = __atomic_load_n(&store->header->adaptive_radix_tree_root, __ATOMIC_ACQUIRE);
+    adaptive_radix_tree_header_t *node = adaptive_radix_tree_search(store, current_root, (const uint8_t *)key,
                                  (int)strlen(key));
     uint64_t old_header_value = node ? adaptive_radix_tree_value_load(node) : 0;
     bool retiring = node && ADAPTIVE_RADIX_TREE_VALUE_HAS(old_header_value);
@@ -463,6 +492,9 @@ static int realloc_key(kvspace_t *store, const char *key,
     uint64_t old_capacity = 0;
     if (retiring) {
         uint64_t offset = ADAPTIVE_RADIX_TREE_VALUE_OFFSET(old_header_value);
+        if (offset >= __atomic_load_n(&store->region_data.mapped, __ATOMIC_ACQUIRE) &&
+            store_sync(store) != 0)
+            return KVSPACE_BACKEND;
         old_capacity = sbo_allocated_size(store->slots_box_meta, offset);
         if (need <= old_capacity) {
             storage_write_head(store->slots_box_data + offset, body_length, attribute_length);
@@ -480,15 +512,19 @@ static int realloc_key(kvspace_t *store, const char *key,
     }
     memset(store->slots_box_data + offset, 0, (size_t)need);
     storage_write_head(store->slots_box_data + offset, body_length, attribute_length);
-    int32_t root = adaptive_radix_tree_insert(store, store->header->adaptive_radix_tree_root, (const uint8_t *)key,
+    structure_seq_begin(store);
+    current_root = __atomic_load_n(&store->header->adaptive_radix_tree_root, __ATOMIC_ACQUIRE);
+    int32_t root = adaptive_radix_tree_insert(store, current_root, (const uint8_t *)key,
                            (int)strlen(key), 0, offset);
     if (root < 0) {
+        structure_seq_end(store);
         if (retiring)
             retirement_cancel(store, retirement_index);
         store_slots_box_free(store, offset);
         return KVSPACE_BACKEND;
     }
-    store->header->adaptive_radix_tree_root = root;
+    __atomic_store_n(&store->header->adaptive_radix_tree_root, root, __ATOMIC_RELEASE);
+    structure_seq_end(store);
     if (retiring)
         retirement_commit(store, retirement_index, ADAPTIVE_RADIX_TREE_VALUE_OFFSET(old_header_value), old_capacity);
     else
@@ -496,19 +532,17 @@ static int realloc_key(kvspace_t *store, const char *key,
     *out_offset = offset;
     return KVSPACE_OK;
 }
-static int free_key(kvspace_t *store, const char *key) {
+static int free_key_locked(kvspace_t *store, const char *key) {
     if (!key_text_valid(key))
         return KVSPACE_INVALID;
     if (store_sync(store) != 0)
         return KVSPACE_BACKEND;
     if (storage_is_index_key(key)) {
-        char *directory = ending_directory(key);
-        int child_return_code = storage_has_children(store, directory);
-        free(directory);
+        int child_return_code = storage_has_children(store, key);
         if (child_return_code != KVSPACE_OK)
             return child_return_code;
     }
-    int return_code = shared_memory_delete_key(store, key);
+    int return_code = shared_memory_delete_key_locked(store, key);
     if (return_code < 0)
         return KVSPACE_BACKEND;
     if (return_code == 0)
@@ -516,19 +550,18 @@ static int free_key(kvspace_t *store, const char *key) {
     list_generation_bump(store);
     return KVSPACE_OK;
 }
-static int makeindex_key(kvspace_t *store, const char *key) {
+static int makeindex_key_locked(kvspace_t *store, const char *key) {
     if (!key_text_valid(key))
         return KVSPACE_INVALID;
     if (!storage_is_index_key(key))
         return KVSPACE_INVALID;
     uint64_t offset = 0;
-    int return_code = resolve_root(store, key, &offset);
+    int return_code = resolve_root_locked(store, key, &offset);
     if (return_code == KVSPACE_OK)
         return KVSPACE_OK;
     if (return_code != KVSPACE_MISSING)
         return return_code;
-    return_code = realloc_key(store, key, 0, 0, &offset);
-    return return_code;
+    return realloc_key_locked(store, key, 0, 0, &offset);
 }
 static int kvspace_data_source_name_path(const char *data_source_name, char *out, size_t out_size) {
     if (!data_source_name)
@@ -546,6 +579,7 @@ KVSPACE_PUBLIC void *kvspaceConnect(const char *data_source_name) {
         errno = EINVAL;
         return NULL;
     }
+    errno = 0;
     void *handle = (void *)open_shared_memory_store(path, kvspace_data_size);
     if (handle != NULL) {
         errno = entry_errno;
@@ -564,75 +598,102 @@ KVSPACE_PUBLIC uint8_t *kvspaceXvalueInProcessAddress(void *handle) {
 KVSPACE_PUBLIC int kvspaceResolveOffset(void *handle, const char *key,
                                  const kvspace_anchor_t *anchor,
                                  uint64_t *out_value_offset) {
+    kvspace_t *store = (kvspace_t *)handle;
     *out_value_offset = 0;
-    return resolve_anchor((kvspace_t *)handle, key, anchor, out_value_offset);
+    recovery_mark_active(store);
+    return resolve_anchor(store, key, anchor, out_value_offset);
 }
 KVSPACE_PUBLIC int kvspaceAnchorOf(void *handle, const char *directory_key,
                                    kvspace_anchor_t *out_anchor) {
-    size_t key_len = strlen(directory_key);
-    if (!key_text_valid(directory_key))
-        return KVSPACE_INVALID;
-    if (!storage_is_index_key(directory_key))
-        return KVSPACE_NOT_INDEX;
     kvspace_t *store = (kvspace_t *)handle;
-    if (store_sync(store) != 0)
-        return KVSPACE_BACKEND;
-    adaptive_radix_tree_header_t *node = adaptive_radix_tree_search(store, store->header->adaptive_radix_tree_root,
-                                 (const uint8_t *)directory_key,
-                                 (int)key_len);
-    if (!node || !ADAPTIVE_RADIX_TREE_VALUE_HAS(adaptive_radix_tree_value_load(node)))
-        return KVSPACE_MISSING;
-    int32_t id = adaptive_radix_tree_id_of(store, node);
-    if (id < 0)
-        return KVSPACE_BACKEND;
-    uint64_t offset = (uint64_t)blockdata_offset(store->adaptive_radix_tree_meta, (uint64_t)id);
-    if (offset == 0)
-        return KVSPACE_BACKEND;
-    out_anchor->node_offset = offset;
-    out_anchor->epoch = __atomic_load_n(&store->header->structure_epoch, __ATOMIC_ACQUIRE);
-    out_anchor->depth = (uint32_t)key_len;
-    out_anchor->flags = KVSPACE_ANCHOR_FLAG_INDEX;
-    return KVSPACE_OK;
+    recovery_ack_progress(store);
+    return anchor_of_key(store, directory_key, out_anchor);
 }
 KVSPACE_PUBLIC int kvspaceRealloc(void *handle, const char *key,
                                  uint64_t body_length, uint64_t attribute_length,
                                  uint64_t *out_value_offset) {
+    kvspace_t *store = (kvspace_t *)handle;
     *out_value_offset = 0;
-    return realloc_key((kvspace_t *)handle, key, body_length,
-                       attribute_length, out_value_offset);
+    if (!key_text_valid(key) || attribute_length > UINT16_MAX)
+        return KVSPACE_INVALID;
+    recovery_ack_progress(store);
+    if (store_write_lock(store) != 0)
+        return KVSPACE_BACKEND;
+    int status = realloc_key_locked(store, key, body_length, attribute_length, out_value_offset);
+    store_write_unlock(store);
+    return status;
 }
 KVSPACE_PUBLIC int kvspaceFree(void *handle, const char *key) {
-    return free_key((kvspace_t *)handle, key);
+    kvspace_t *store = (kvspace_t *)handle;
+    if (!key_text_valid(key))
+        return KVSPACE_INVALID;
+    recovery_ack_progress(store);
+    if (store_write_lock(store) != 0)
+        return KVSPACE_BACKEND;
+    int status = free_key_locked(store, key);
+    store_write_unlock(store);
+    return status;
 }
 KVSPACE_PUBLIC int kvspaceCp(void *handle, const char *old_key,
                              const char *new_key) {
-    return copy_key((kvspace_t *)handle, old_key, new_key) == 0 ? KVSPACE_OK
-                                                                : KVSPACE_BACKEND;
+    kvspace_t *store = (kvspace_t *)handle;
+    if (!key_text_valid(old_key) || !key_text_valid(new_key))
+        return KVSPACE_INVALID;
+    recovery_ack_progress(store);
+    if (store_write_lock(store) != 0)
+        return KVSPACE_BACKEND;
+    int status = copy_key_locked(store, old_key, new_key);
+    store_write_unlock(store);
+    return status;
 }
 KVSPACE_PUBLIC int kvspaceMkindex(void *handle, const char *key) {
-    return makeindex_key((kvspace_t *)handle, key);
+    kvspace_t *store = (kvspace_t *)handle;
+    if (!key_text_valid(key) || !storage_is_index_key(key))
+        return KVSPACE_INVALID;
+    recovery_ack_progress(store);
+    if (store_write_lock(store) != 0)
+        return KVSPACE_BACKEND;
+    int status = makeindex_key_locked(store, key);
+    store_write_unlock(store);
+    return status;
 }
 KVSPACE_PUBLIC int kvspaceDeltree(void *handle, const char *key) {
-    return delete_tree((kvspace_t *)handle, key) == 0 ? KVSPACE_OK
-                                                      : KVSPACE_BACKEND;
+    kvspace_t *store = (kvspace_t *)handle;
+    if (!key_text_valid(key))
+        return KVSPACE_INVALID;
+    recovery_ack_progress(store);
+    if (store_write_lock(store) != 0)
+        return KVSPACE_BACKEND;
+    int status = delete_tree_locked(store, key);
+    store_write_unlock(store);
+    return status;
 }
 KVSPACE_PUBLIC int kvspaceCpdir(void *handle, const char *source_key,
                                 const char *destination_key) {
-    return copy_tree((kvspace_t *)handle, source_key, destination_key) == 0
-               ? KVSPACE_OK
-               : KVSPACE_BACKEND;
+    kvspace_t *store = (kvspace_t *)handle;
+    if (!key_text_valid(source_key) || !key_text_valid(destination_key))
+        return KVSPACE_INVALID;
+    recovery_ack_progress(store);
+    if (store_write_lock(store) != 0)
+        return KVSPACE_BACKEND;
+    int status = copy_tree_locked(store, source_key, destination_key);
+    store_write_unlock(store);
+    return status;
 }
 KVSPACE_PUBLIC int kvspaceListlen(void *handle, const char *key,
                                   int64_t *out_count,
                                   uint32_t *out_max_name_length) {
+    kvspace_t *store = (kvspace_t *)handle;
     *out_count = 0;
     *out_max_name_length = 0;
-    return listlen_key((kvspace_t *)handle, key, out_count,
-                       out_max_name_length);
+    recovery_ack_progress(store);
+    return listlen_key(store, key, out_count, out_max_name_length);
 }
 KVSPACE_PUBLIC int kvspaceList(void *handle, const char *key, char *out_names,
                                uint32_t out_capacity, uint32_t *out_length,
                                uint32_t *out_count, uint64_t *out_generation) {
-    return list_names_raw((kvspace_t *)handle, key, out_names, out_capacity,
+    kvspace_t *store = (kvspace_t *)handle;
+    recovery_ack_progress(store);
+    return list_names_raw(store, key, out_names, out_capacity,
                           out_length, out_count, out_generation);
 }

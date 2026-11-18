@@ -6,6 +6,7 @@
 #include <errno.h>
 #include <limits.h>
 #include <pthread.h>
+#include <signal.h>
 #if defined(__linux__)
 #include <linux/futex.h>
 #include <sys/syscall.h>
@@ -15,6 +16,21 @@
 #include <string.h>
 #include <time.h>
 #include <unistd.h>
+static uint32_t g_fork_generation;
+static pthread_once_t g_atfork_once = PTHREAD_ONCE_INIT;
+static void recovery_atfork_child(void) {
+    __atomic_add_fetch(&g_fork_generation, 1u, __ATOMIC_ACQ_REL);
+}
+static void recovery_atfork_install(void) {
+    (void)pthread_atfork(NULL, NULL, recovery_atfork_child);
+}
+uint32_t recovery_fork_generation(void) {
+    (void)pthread_once(&g_atfork_once, recovery_atfork_install);
+    return __atomic_load_n(&g_fork_generation, __ATOMIC_ACQUIRE);
+}
+static inline bool recovery_fork_mismatch(const kvspace_t *store) {
+    return store->fork_generation != __atomic_load_n(&g_fork_generation, __ATOMIC_ACQUIRE);
+}
 static int recovery_process_start_time(uint32_t process_id, uint64_t *out) {
 #if defined(__linux__)
     char path[64];
@@ -51,8 +67,11 @@ static int recovery_process_start_time(uint32_t process_id, uint64_t *out) {
     }
     return 2;
 #else
-    (void)process_id;
     (void)out;
+    if (process_id == 0)
+        return 1;
+    if (kill((pid_t)process_id, 0) != 0 && errno == ESRCH)
+        return 1;
     return 2;
 #endif
 }
@@ -87,6 +106,7 @@ int recovery_register_claim(kvspace_t *store) {
             __atomic_compare_exchange_n(&slot->state, &state, RECOVERY_SLOT_FREE, false,
                                         __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE);
     }
+    recovery_repair_dead_writer(store);
     for (int i = 0; i < RECOVERY_SLOT_COUNT; i++) {
         recovery_slot_t *slot = &store->header->slots[i];
         uint32_t expect = RECOVERY_SLOT_FREE;
@@ -101,8 +121,8 @@ int recovery_register_claim(kvspace_t *store) {
         }
         slot->process_id = current_process_id;
         slot->start_time = process_start_time;
-        slot->quiesced = 1;
-        slot->claim_id = claim_id;
+        __atomic_store_n(&slot->quiesced, 1u, __ATOMIC_RELEASE);
+        __atomic_store_n(&slot->claim_id, claim_id, __ATOMIC_RELEASE);
         __atomic_store_n(&slot->recovery_ack,
                          __atomic_load_n(&store->header->recovery_epoch, __ATOMIC_ACQUIRE),
                          __ATOMIC_RELEASE);
@@ -123,18 +143,6 @@ void recovery_register_release(kvspace_t *store) {
     __atomic_compare_exchange_n(&slot->state, &expect, RECOVERY_SLOT_FREE, false,
                                 __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE);
     store->recovery_slot = -1;
-}
-static uint32_t g_fork_generation;
-static pthread_once_t g_atfork_once = PTHREAD_ONCE_INIT;
-static void recovery_atfork_child(void) {
-    __atomic_add_fetch(&g_fork_generation, 1u, __ATOMIC_ACQ_REL);
-}
-static void recovery_atfork_install(void) {
-    (void)pthread_atfork(NULL, NULL, recovery_atfork_child);
-}
-uint32_t recovery_fork_generation(void) {
-    (void)pthread_once(&g_atfork_once, recovery_atfork_install);
-    return __atomic_load_n(&g_fork_generation, __ATOMIC_ACQUIRE);
 }
 static long long recovery_now_milliseconds(void) {
     struct timespec time_specification;
@@ -165,9 +173,41 @@ static void recovery_futex_wake(uint32_t *address) { (void)address; }
 static void recovery_futex_wait_private(uint32_t *address, uint32_t value, int milliseconds) { (void)address; (void)value; usleep((useconds_t)milliseconds * 1000); }
 static void recovery_futex_wake_private(uint32_t *address) { (void)address; }
 #endif
+static void recovery_publish_ack(kvspace_t *store, recovery_slot_t *slot, uint32_t epoch) {
+    __atomic_store_n(&slot->recovery_ack, (uint64_t)epoch, __ATOMIC_RELEASE);
+    __atomic_add_fetch(&store->header->ack_sequence, 1u, __ATOMIC_RELEASE);
+    if (__atomic_load_n(&store->header->barrier_state, __ATOMIC_ACQUIRE))
+        recovery_futex_wake(&store->header->ack_sequence);
+}
+void recovery_mark_active(kvspace_t *store) {
+    if (store->recovery_slot < 0 || recovery_fork_mismatch(store))
+        return;
+    recovery_slot_t *slot = &store->header->slots[store->recovery_slot];
+    uint32_t epoch = __atomic_load_n(&store->header->recovery_epoch, __ATOMIC_ACQUIRE);
+    if (__atomic_load_n(&slot->quiesced, __ATOMIC_RELAXED)) {
+        __atomic_store_n(&slot->recovery_ack, (uint64_t)epoch, __ATOMIC_RELEASE);
+        __atomic_store_n(&slot->quiesced, 0u, __ATOMIC_SEQ_CST);
+        epoch = __atomic_load_n(&store->header->recovery_epoch, __ATOMIC_SEQ_CST);
+    }
+    if ((uint32_t)__atomic_load_n(&slot->recovery_ack, __ATOMIC_RELAXED) != epoch)
+        recovery_publish_ack(store, slot, epoch);
+}
+void recovery_ack_progress(kvspace_t *store) {
+    if (store->recovery_slot < 0 || recovery_fork_mismatch(store))
+        return;
+    recovery_slot_t *slot = &store->header->slots[store->recovery_slot];
+    if (__atomic_load_n(&slot->quiesced, __ATOMIC_RELAXED))
+        return;
+    uint32_t epoch = __atomic_load_n(&store->header->recovery_epoch, __ATOMIC_ACQUIRE);
+    if ((uint32_t)__atomic_load_n(&slot->recovery_ack, __ATOMIC_RELAXED) != epoch)
+        recovery_publish_ack(store, slot, epoch);
+}
 enum { RECOVERY_BARRIER_FREE = 0, RECOVERY_BARRIER_OWNED = 1 };
+enum { WRITE_LOCK_FREE = 0, WRITE_LOCK_HELD = 1, WRITE_LOCK_CONTENDED = 2 };
 static uint32_t recovery_my_claim(kvspace_t *store) {
-    return store->recovery_slot >= 0 ? store->header->slots[store->recovery_slot].claim_id : 0;
+    if (store->recovery_slot < 0 || recovery_fork_mismatch(store))
+        return 0;
+    return store->header->slots[store->recovery_slot].claim_id;
 }
 bool recovery_claim_alive(kvspace_t *store, uint32_t claim) {
     if (!claim)
@@ -181,6 +221,88 @@ bool recovery_claim_alive(kvspace_t *store, uint32_t claim) {
         return recovery_slot_alive(slot);
     }
     return false;
+}
+static void repair_odd_structure_epoch(kvspace_t *store) {
+    uint64_t epoch = __atomic_load_n(&store->header->structure_epoch, __ATOMIC_ACQUIRE);
+    if (epoch & 1ull)
+        (void)__atomic_compare_exchange_n(&store->header->structure_epoch, &epoch, epoch + 1ull,
+                                          false, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE);
+}
+void recovery_repair_dead_writer(kvspace_t *store) {
+    uint32_t current = __atomic_load_n(&store->header->write_lock, __ATOMIC_ACQUIRE);
+    if (current == WRITE_LOCK_FREE) {
+        repair_odd_structure_epoch(store);
+        return;
+    }
+    uint32_t holder = RING_ENTRY_CLAIM(current);
+    if (recovery_claim_alive(store, holder))
+        return;
+    repair_odd_structure_epoch(store);
+    if (__atomic_compare_exchange_n(&store->header->write_lock, &current, WRITE_LOCK_FREE,
+                                    false, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
+        if (RING_ENTRY_STATE(current) == WRITE_LOCK_CONTENDED)
+            recovery_futex_wake(&store->header->write_lock);
+    }
+}
+int store_write_lock(kvspace_t *store) {
+    uint32_t mine = recovery_my_claim(store);
+    if (!mine)
+        return -1;
+    pthread_mutex_lock(&store->local_write_lock);
+    uint32_t expected = WRITE_LOCK_FREE;
+    uint32_t held = RING_ENTRY_MAKE(WRITE_LOCK_HELD, mine);
+    if (__atomic_compare_exchange_n(&store->header->write_lock, &expected, held, false,
+                                    __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE))
+        return 0;
+    uint32_t desired = held;
+    for (;;) {
+        for (int spin = 0; spin < 128; spin++) {
+            uint32_t current = __atomic_load_n(&store->header->write_lock, __ATOMIC_RELAXED);
+            if (current == WRITE_LOCK_FREE) {
+                expected = WRITE_LOCK_FREE;
+                if (__atomic_compare_exchange_n(&store->header->write_lock, &expected, desired,
+                                                false, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE))
+                    return 0;
+            }
+            kvspace_cpu_relax();
+        }
+        desired = RING_ENTRY_MAKE(WRITE_LOCK_CONTENDED, mine);
+        uint32_t current = __atomic_load_n(&store->header->write_lock, __ATOMIC_ACQUIRE);
+        if (current == WRITE_LOCK_FREE) {
+            if (__atomic_compare_exchange_n(&store->header->write_lock, &current, desired,
+                                            false, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE))
+                return 0;
+            continue;
+        }
+        uint32_t holder = RING_ENTRY_CLAIM(current);
+        if (holder == mine) {
+            pthread_mutex_unlock(&store->local_write_lock);
+            return -1;
+        }
+        if (!recovery_claim_alive(store, holder)) {
+            if (__atomic_compare_exchange_n(&store->header->write_lock, &current, desired,
+                                            false, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
+                repair_odd_structure_epoch(store);
+                return 0;
+            }
+            continue;
+        }
+        if (RING_ENTRY_STATE(current) == WRITE_LOCK_HELD) {
+            uint32_t marked = RING_ENTRY_MAKE(WRITE_LOCK_CONTENDED, holder);
+            if (!__atomic_compare_exchange_n(&store->header->write_lock, &current, marked,
+                                             false, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE))
+                continue;
+            current = marked;
+        }
+        recovery_futex_wait(&store->header->write_lock, current, 2);
+    }
+}
+void store_write_unlock(kvspace_t *store) {
+    uint32_t previous = __atomic_exchange_n(&store->header->write_lock, WRITE_LOCK_FREE,
+                                            __ATOMIC_RELEASE);
+    if (RING_ENTRY_STATE(previous) == WRITE_LOCK_CONTENDED)
+        recovery_futex_wake(&store->header->write_lock);
+    pthread_mutex_unlock(&store->local_write_lock);
 }
 static bool recovery_elect(kvspace_t *store) {
     uint32_t mine = recovery_my_claim(store);
@@ -224,7 +346,8 @@ static bool recovery_wait_acknowledgements(kvspace_t *store, uint32_t epoch, int
             recovery_slot_t *slot = &store->header->slots[i];
             if (__atomic_load_n(&slot->state, __ATOMIC_ACQUIRE) != RECOVERY_SLOT_MINE)
                 continue;
-            if (__atomic_load_n(&slot->recovery_ack, __ATOMIC_ACQUIRE) == epoch)
+            uint32_t acked = (uint32_t)__atomic_load_n(&slot->recovery_ack, __ATOMIC_ACQUIRE);
+            if ((int32_t)(acked - epoch) >= 0)
                 continue;
             if (__atomic_load_n(&slot->quiesced, __ATOMIC_ACQUIRE))
                 continue;
@@ -244,7 +367,8 @@ static bool recovery_wait_acknowledgements(kvspace_t *store, uint32_t epoch, int
             return true;
         long long left = (long long)deadline_milliseconds - (recovery_now_milliseconds() - start_milliseconds);
         if (left <= 0 || __atomic_load_n(&store->maintenance_stop, __ATOMIC_ACQUIRE)) {
-            if (first >= 0) {
+            static bool once;
+            if (first >= 0 && !__atomic_exchange_n(&once, true, __ATOMIC_RELAXED)) {
                 recovery_slot_t *slot = &store->header->slots[first];
                 fprintf(stderr,
                         "kvspace: barrier round %u abandoned (waited %dms): "
@@ -282,7 +406,11 @@ int recovery_round(kvspace_t *store) {
                         "leaked\n", (unsigned long long)pending);
     }
     uint32_t epoch = __atomic_add_fetch(&store->header->recovery_epoch, 1u,
-                                    __ATOMIC_ACQ_REL);
+                                    __ATOMIC_SEQ_CST);
+    if (store->recovery_slot >= 0) {
+        __atomic_store_n(&store->header->slots[store->recovery_slot].recovery_ack,
+                         (uint64_t)epoch, __ATOMIC_RELEASE);
+    }
     if (!recovery_wait_acknowledgements(store, epoch, recovery_barrier_milliseconds())) {
         recovery_release_busy(store);
         return -2;
@@ -311,9 +439,9 @@ static void *recovery_maintenance(void *arg) {
         recovery_futex_wait_private(&store->maintenance_sequence, sequence, 50);
         if (__atomic_load_n(&store->maintenance_stop, __ATOMIC_ACQUIRE))
             break;
-        if (store->header->committed_bytes -
-                __atomic_load_n(&store->header->freed_bytes, __ATOMIC_ACQUIRE) <
-            retirement_threshold())
+        uint64_t committed = __atomic_load_n(&store->header->committed_bytes, __ATOMIC_ACQUIRE);
+        uint64_t freed = __atomic_load_n(&store->header->freed_bytes, __ATOMIC_ACQUIRE);
+        if (committed <= freed || committed - freed < retirement_threshold())
             continue;
         recovery_round(store);
     }

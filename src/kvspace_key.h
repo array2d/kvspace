@@ -56,14 +56,17 @@ typedef struct {
     int32_t capacity;
 } keyscan_t;
 
+void structure_seq_begin(kvspace_t *store);
+void structure_seq_end(kvspace_t *store);
+uint64_t structure_seq_read_begin(kvspace_t *store);
+bool structure_seq_read_retry(const kvspace_t *store, uint64_t before);
+
 enum separator_kind separator_at(const char *text, size_t index, size_t length);
 enum separator_kind ending_separator(const char *text, size_t length);
 int separator_length(enum separator_kind kind);
 int reserved_meta_path(const char *key);
 int key_text_valid(const char *key);
-char *path_join(const char *left, const char *right);
-char *ending_directory(const char *path);
-char *member_directory(const char *path);
+size_t subtree_base_length(const char *path, size_t length);
 int subtree_key(const char *base, size_t base_length, const char *key);
 void keyscan_free(keyscan_t *scan);
 int storage_has_children(kvspace_t *store, const char *key);
@@ -75,7 +78,9 @@ int32_t adaptive_radix_tree_insert(kvspace_t *store, int32_t node_id, const uint
 int32_t adaptive_radix_tree_delete(kvspace_t *store, int32_t node_id, const uint8_t *key, int key_length, int depth, bool *deleted, uint64_t *out_retired_offset);
 int adaptive_radix_tree_scan_keys(kvspace_t *store, const char *prefix, int prefix_length, keyscan_t *scan);
 int resolve_root(kvspace_t *store, const char *key, uint64_t *out_offset);
+int resolve_root_locked(kvspace_t *store, const char *key, uint64_t *out_offset);
 int resolve_anchor(kvspace_t *store, const char *key, const kvspace_anchor_t *anchor, uint64_t *out_offset);
+int anchor_of_key(kvspace_t *store, const char *directory_key, kvspace_anchor_t *out_anchor);
 int listlen_key(kvspace_t *store, const char *key, int64_t *out_count, uint32_t *out_max_name_length);
 int list_names_raw(kvspace_t *store, const char *key, char *out_names, uint32_t out_capacity, uint32_t *out_length, uint32_t *out_count, uint64_t *out_generation);
 #endif

@@ -32,8 +32,8 @@ reallen）：**任何读写路径见到它都必须拒**——那是「写读双
 
 ## 常量
 
-`include/kvspace/const.h` 是**存储**常量的唯一定义处：目录索引后缀 `/`、成员分隔符
-`·`、两条错误串。`kvspaceConstStorage("KVSPACE_MEMBER_SEP")` → `"·"`，供
+`include/kvspace/const.h` 是**存储**常量的唯一定义处：目录索引后缀 `/` 与成员分隔符
+`·`。`kvspaceConstStorage("KVSPACE_MEMBER_SEP")` → `"·"`，供
 Go/Python/Rust 扩展运行期取，免去硬编码裸字面量。运行期成员分隔符 `‥` 属于语言层，
 已移到 `kvlangConstLanguage("KVLANG_RUNTIME_MEMBER_SEP")`。
 
@@ -59,18 +59,19 @@ Go/Python/Rust 扩展运行期取，免去硬编码裸字面量。运行期成�
 - **key 语法**：绝对 key 以 `/` 开头；分隔符只有 `/` 与 `·`；末字节是分隔符的
   key 是目录（索引），否则是值；相邻分隔符、长度 ≥1024 一律 `INVALID`。
 - **anchor**：`NULL` 表示按绝对 key 从根解析；非空表示从 `node_offset` 指向的
-  目录节点按**相对后缀**解析，key 不得再以 `/` 开头。`epoch` 用于判断是否需要
-  跟随迁移，`flags` 必须含 `KVSPACE_ANCHOR_FLAG_INDEX`。偏移不属于当前 ART
-  已分配区、标志不符、或目标不是节点返回 `ANCHOR_INVALID`；目录或成员不存在
-  返回 `MISSING`（删除目录不会让锚点失效）。并发结构变化下解析最多重试 3 轮，
-  仍不稳定返回 `ANCHOR_INVALID`——此时锚点本身仍然有效，重试或重新
-  `kvspaceAnchorOf` 即可。
-- **输出有效条件**：`ResolveOffset`/`Realloc` 只在返回 `OK` 时写 `out_value_offset`；
-  `Listlen` 先清零再写；`List` 的 `out_length` 是 NUL 分隔名字的总字节数，
-  `out_names == NULL` 时只查询不写，容量不足返回 `CAPACITY` 且 `out_length`
-  给出所需字节数。`out_count`/`out_generation` 可为 `NULL`。
-- **并发**：偏移与值字节都在同一张共享映射里，跨进程直接寻址；删除是延迟回收
-  （退役环），已拿到的偏移在返回值有效期内可读。同一 key 的并发写由调用方串行化。
+  目录节点按**相对后缀**解析，key 不得再以 `/` 开头。`epoch` 用于观测结构世代，
+  `flags` 必须含 `KVSPACE_ANCHOR_FLAG_INDEX`。偏移不属于当前 ART 已分配区、
+  标志不符、或目标不是节点返回 `ANCHOR_INVALID`；目录或成员不存在返回 `MISSING`
+  （删除目录不会让锚点失效）。并发结构变化下解析自动等待并重试，仍不稳定返回
+  `ANCHOR_INVALID`——此时锚点本身仍然有效，重试或重新 `kvspaceAnchorOf` 即可。
+- **输出有效条件**：`ResolveOffset`/`Realloc`/`Listlen` 入口先将必填输出清零，
+  返回 `OK` 时写出有效结果；`AnchorOf` 只在 `OK` 时写 `out_anchor`；`List` 的
+  `out_length` 是 NUL 分隔名字的总字节数，`out_names == NULL` 时只查询不写，
+  容量不足返回 `CAPACITY` 且 `out_length` 给出所需字节数。`out_count`/`out_generation`
+  可为 `NULL`。
+- **并发**：偏移与值字节都在同一张共享映射里，跨进程直接寻址；引擎内部通过共享写锁与
+  `structure_epoch` 顺序锁保护树结构读写，删除走退役环按屏障代延迟回收，读方在当次操作
+  返回后至下次进入存储接口前可安全读取已拿到的偏移。同一 key 值区字节的并发原地写由调用方串行化。
 
 ## 兼容性
 
@@ -124,7 +125,10 @@ cmake --install build                   # libkvspace.so.1 + include/ + kvspace.p
 include/kvspace/kvspace.h          # 权威存储 ABI 头（13 符号）
 include/kvspace/kvspace_xvalue.h   # 字节层：head 布局 + attr 读写（3 符号）
 include/kvspace/const.h            # 存储常量 + kvspaceConstStorage()
-src/kvspace.c                      # SHM 引擎（file-backed mmap + ART）
+src/kvspace.c                      # 公共存储入口、映射与树级拷贝删除
+src/kvspace_key.c                  # key 语法、双分隔符与 ART 寻址/扫描
+src/kvspace_xvalue_internal.c      # 值区分配回收（slotsbox）与退役环
+src/kvspace_recovery.c             # 跨进程槽位、写互斥与回收屏障
 src/xvalue_head.c                  # 字节层实现
 src/const.c                        # 存储常量查找表
 cli/                               # kvspace CLI（Cargo）——只做存储子命令

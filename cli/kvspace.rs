@@ -125,7 +125,9 @@ fn raw_head(wire: &[u8]) -> Option<RawHead> {
     let body_len = u64::from_le_bytes(wire[0..8].try_into().ok()?);
     let attrs_len = u16::from_le_bytes(wire[8..10].try_into().ok()?);
     let padding_zero = wire[10..16].iter().all(|b| *b == 0);
-    let total = KVSPACE_XVALUE_HEAD_LEN as u64 + body_len + attrs_len as u64;
+    let total = (KVSPACE_XVALUE_HEAD_LEN as u64)
+        .checked_add(body_len)?
+        .checked_add(attrs_len as u64)?;
     Some(RawHead { body_len, attrs_len, total, padding_zero })
 }
 
@@ -438,7 +440,7 @@ fn fprint_tree(kv: *mut c_void, prefix: &str, indent: &str) {
         let last = i == n - 1;
         let branch = if last { "└── " } else { "├── " };
         let next_indent = format!("{}{}", indent, if last { "    " } else { "│   " });
-        if c.ends_with('/') {
+        if c.ends_with('/') || c.ends_with('·') {
             println!("{}{}{}", indent, branch, c);
             fprint_tree(kv, &full, &next_indent);
         } else {

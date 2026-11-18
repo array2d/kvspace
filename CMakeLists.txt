@@ -7,14 +7,10 @@ set(CMAKE_C_EXTENSIONS ON)
 
 include(GNUInstallDirs)
 
-                                                                  
 if(CMAKE_INSTALL_PREFIX_INITIALIZED_TO_DEFAULT)
     set(CMAKE_INSTALL_PREFIX "/usr" CACHE PATH "" FORCE)
 endif()
 
-                                                        
-                                       
-                                                 
 add_library(kvspace SHARED
     src/kvspace.c
     src/kvspace_recovery.c
@@ -22,34 +18,15 @@ add_library(kvspace SHARED
     src/kvspace_xvalue_internal.c
     src/xvalue_head.c
     src/const.c)
-target_include_directories(kvspace PRIVATE src)
 
-                                                                    
-                                                                     
-                                                             
-                                                                             
-                      
- 
-                                                        
-                 
- 
-                                     
- 
-                                                        
-                                                   
- 
-                          
-                                        
-                                            
-                   
-                                                     
-                                  
- 
-                                                                
-                          
- 
-                                                         
-                                    
+target_include_directories(kvspace
+    PUBLIC
+        $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+        $<INSTALL_INTERFACE:include>
+    PRIVATE
+        src
+)
+
 foreach(header IN ITEMS blockmalloc/blockmalloc.h slotsboxmalloc/slotsboxobj.h)
     string(REGEX REPLACE "/[^/]+$" "" header_directory "${header}")
     set(pin_candidates
@@ -60,8 +37,6 @@ foreach(header IN ITEMS blockmalloc/blockmalloc.h slotsboxmalloc/slotsboxobj.h)
         PATHS ${pin_candidates}
         NO_DEFAULT_PATH)
     if(NOT KVSPACE_${header_directory}_INCLUDE_DIRECTORY)
-                                                           
-                                                         
         set(candidate_lines "")
         set(candidate_index 1)
         foreach(candidate IN LISTS pin_candidates)
@@ -77,35 +52,17 @@ foreach(header IN ITEMS blockmalloc/blockmalloc.h slotsboxmalloc/slotsboxobj.h)
             "    2. 用 -DKVSPACE_${header_directory}_INCLUDE_DIRECTORY=<包含 ${header_directory}/ 的目录> 显式指定。")
     endif()
     message(STATUS "kvspace: <${header}> → ${KVSPACE_${header_directory}_INCLUDE_DIRECTORY}")
-    target_include_directories(kvspace PRIVATE
+    target_include_directories(kvspace SYSTEM PRIVATE
         "${KVSPACE_${header_directory}_INCLUDE_DIRECTORY}")
 endforeach()
 
-                                                 
-                                                     
-                                                  
-                                    
-
 include(CTest)
 if(BUILD_TESTING)
-                                                                
-                              
-
-                                              
-                                
     add_executable(test_storage_shm tests/test_storage_shm.c)
     target_include_directories(test_storage_shm PRIVATE include)
     target_link_libraries(test_storage_shm PRIVATE kvspace)
     add_test(NAME storage_shm_contract COMMAND test_storage_shm)
-endif()
 
-                                             
-                                                          
-                                   
-if(BUILD_TESTING)
-                                                 
-                                                     
-                                                  
     set(KVSPACE_SHM_TEST_PAIRS
         "art_scan|test_art_scan"
         "art_alignment|test_art_alignment"
@@ -115,33 +72,19 @@ if(BUILD_TESTING)
         "storage_abi|test_storage_abi"
         "xvalue_layout|test_xvalue_layout"
         "storage_boundary|test_storage_boundary"
-                                                                      
-                                                  
-        )
+    )
     foreach(pair IN LISTS KVSPACE_SHM_TEST_PAIRS)
         string(FIND "${pair}" "|" pair_sep)
         string(SUBSTRING "${pair}" 0 ${pair_sep} shm_name)
         math(EXPR pair_tail "${pair_sep} + 1")
         string(SUBSTRING "${pair}" ${pair_tail} -1 shm_source)
         add_executable(shm_${shm_name} tests/shm/${shm_source}.c)
-        target_include_directories(shm_${shm_name} PRIVATE
-            src include)
-                                                                  
-                                     
-                                                                
-                  
+        target_include_directories(shm_${shm_name} PRIVATE src include)
         target_compile_definitions(shm_${shm_name} PRIVATE RECOVERY_TEST_HOOKS)
         target_link_libraries(shm_${shm_name} PRIVATE kvspace)
         add_test(NAME shm_${shm_name} COMMAND shm_${shm_name})
     endforeach()
 
-                                       
-     
-                                                 
-                                                                   
-                                                  
-                                            
-                 
     add_executable(test_export_surface tests/test_export_surface.c)
     target_include_directories(test_export_surface PRIVATE include)
     target_link_libraries(test_export_surface PRIVATE kvspace)
@@ -157,29 +100,14 @@ if(BUILD_TESTING)
                      ${CMAKE_CURRENT_SOURCE_DIR}/src)
 endif()
 
-                           
 set_target_properties(kvspace PROPERTIES
     VERSION 1.0.0
     SOVERSION 1
 )
 
-target_include_directories(kvspace
-    PUBLIC
-        $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
-        $<INSTALL_INTERFACE:include>
-)
-
-                                                         
 find_package(Threads REQUIRED)
 target_link_libraries(kvspace PRIVATE Threads::Threads)
 
-                                              
-                         
-                                                  
-                                        
-                                                    
-                                                       
-                                         
 if(NOT BUILD_TESTING)
     set_target_properties(kvspace PROPERTIES C_VISIBILITY_PRESET hidden)
     target_compile_options(kvspace PRIVATE -fvisibility=hidden)
@@ -187,17 +115,10 @@ endif()
 
 target_compile_definitions(kvspace PRIVATE _GNU_SOURCE)
 
-                                                
-                            
 if(BUILD_TESTING)
     target_compile_definitions(kvspace PRIVATE RECOVERY_TEST_HOOKS)
 endif()
 
-                 
- 
-                                         
-                                                 
-                             
 target_compile_options(kvspace PRIVATE -Werror=implicit-function-declaration)
 
 install(TARGETS kvspace
@@ -208,18 +129,6 @@ install(DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/include/ DESTINATION ${CMAKE_INSTA
 configure_file(kvspace.pc.in ${CMAKE_CURRENT_BINARY_DIR}/kvspace.pc @ONLY)
 install(FILES ${CMAKE_CURRENT_BINARY_DIR}/kvspace.pc DESTINATION ${CMAKE_INSTALL_LIBDIR}/pkgconfig)
 
-                                                                
-                                            
-                                                                
-                                 
-                                                                        
-                                                                                      
-                                                      
-                                                               
- 
-                                                                          
-                                                                       
-                                                                
 find_program(CARGO_EXECUTABLE cargo)
 if(CARGO_EXECUTABLE)
   set(KVSPACE_CLI_BIN "${CMAKE_CURRENT_SOURCE_DIR}/cli/target/release/kvspace")
