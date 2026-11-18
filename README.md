@@ -60,9 +60,11 @@ Go/Python/Rust 扩展运行期取，免去硬编码裸字面量。运行期成�
   key 是目录（索引），否则是值；相邻分隔符、长度 ≥1024 一律 `INVALID`。
 - **anchor**：`NULL` 表示按绝对 key 从根解析；非空表示从 `node_offset` 指向的
   目录节点按**相对后缀**解析，key 不得再以 `/` 开头。`epoch` 用于判断是否需要
-  跟随迁移，`flags` 必须含 `KVSPACE_ANCHOR_FLAG_INDEX`；节点已删除或标志不符
-  返回 `ANCHOR_INVALID`。并发结构变化下解析最多重试 3 轮；仍不稳定同样返回
-  `ANCHOR_INVALID`，调用方重新 `kvspaceAnchorOf` 获取即可。
+  跟随迁移，`flags` 必须含 `KVSPACE_ANCHOR_FLAG_INDEX`。偏移不属于当前 ART
+  已分配区、标志不符、或目标不是节点返回 `ANCHOR_INVALID`；目录或成员不存在
+  返回 `MISSING`（删除目录不会让锚点失效）。并发结构变化下解析最多重试 3 轮，
+  仍不稳定返回 `ANCHOR_INVALID`——此时锚点本身仍然有效，重试或重新
+  `kvspaceAnchorOf` 即可。
 - **输出有效条件**：`ResolveOffset`/`Realloc` 只在返回 `OK` 时写 `out_value_offset`；
   `Listlen` 先清零再写；`List` 的 `out_length` 是 NUL 分隔名字的总字节数，
   `out_names == NULL` 时只查询不写，容量不足返回 `CAPACITY` 且 `out_length`
