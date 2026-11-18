@@ -221,6 +221,43 @@ int main(void) {
               "final total %llu != 41",
               (unsigned long long)kvspaceXvalueHeadTotalLen(head));
     }
+    {
+        uint8_t retired_wire[64] = {0};
+        kvspaceXvalueHead *retired_head = (kvspaceXvalueHead *)(void *)retired_wire;
+        kvspaceXvalueHeadSetLen(retired_head, 0);
+        kvspaceXvalueHeadSetAttrsLen(retired_head, 8);
+        retired_wire[16] = 1u;
+        retired_wire[17] = 1u;
+        retired_wire[18] = 0u;
+        retired_wire[19] = 'a';
+        retired_wire[20] = KVSPACE_XVALUE_ATTR_TAG_RETIRED_REALLEN;
+        retired_wire[21] = 1u;
+        retired_wire[22] = 0u;
+        retired_wire[23] = 'x';
+        uint64_t new_length = 0;
+        uint64_t effective = 0;
+        const uint8_t *attr_ptr = NULL;
+        uint16_t attr_len = 0;
+        CHECK(kvspaceXvalueGetAttr(retired_wire, sizeof retired_wire, 1u,
+                                   &attr_ptr, &attr_len) == -1,
+              "GetAttr must reject wire containing retired tag 2");
+        CHECK(kvspaceXvalueSetAttr(retired_wire, sizeof retired_wire, 1u,
+                                   (const uint8_t *)"b", 1u, &new_length) == -1,
+              "SetAttr must reject wire containing retired tag 2");
+        CHECK(kvspaceXvalueHeadEffectiveLen(retired_wire, sizeof retired_wire,
+                                            &effective) == -1,
+              "EffectiveLen must reject wire containing retired tag 2");
+        kvspaceXvalueHeadSetAttrsLen(retired_head, 5);
+        CHECK(kvspaceXvalueGetAttr(retired_wire, sizeof retired_wire, 1u,
+                                   &attr_ptr, &attr_len) == -1,
+              "GetAttr must reject trailing truncated TLV bytes");
+        CHECK(kvspaceXvalueSetAttr(retired_wire, sizeof retired_wire, 3u,
+                                   (const uint8_t *)"c", 1u, &new_length) == -1,
+              "SetAttr must reject trailing truncated TLV bytes");
+        CHECK(kvspaceXvalueHeadEffectiveLen(retired_wire, sizeof retired_wire,
+                                            &effective) == -1,
+              "EffectiveLen must reject trailing truncated TLV bytes");
+    }
     t_close(kv);
     char command[256];
     snprintf(command, sizeof command, "rm -rf '%s'", dir);

@@ -390,6 +390,125 @@ int main(void) {
                                            pbody, sizeof pbody) == 0,
               "anchor after parent close failed across process");
     }
+    {
+        void * writer = kvspaceConnect(dsn);
+        CHECK(writer != NULL, "reconnect after close failed");
+        if (writer) {
+            const int dirs = 64;
+            kvspace_anchor_t anchors[64];
+            uint64_t keep_offsets[64];
+            uint64_t cur_offset = 0;
+            CHECK(kvspaceRealloc(writer, "/swmr_cur", 8, 0, &cur_offset) == KVSPACE_OK,
+                  "realloc /swmr_cur");
+            uint8_t *wbase = kvspaceXvalueInProcessAddress(writer);
+            volatile int32_t *cur_dir =
+                (volatile int32_t *)(void *)(wbase + cur_offset + KVSPACE_XVALUE_HEAD_LEN);
+            *cur_dir = 0;
+            for (int d = 0; d < dirs; d++) {
+                char dir_key[32], keep_key[48];
+                snprintf(dir_key, sizeof dir_key, "/swmr%02d/", d);
+                snprintf(keep_key, sizeof keep_key, "/swmr%02d/keep", d);
+                CHECK(kvspaceMkindex(writer, dir_key) == KVSPACE_OK, "mkindex %s", dir_key);
+                CHECK(kvspaceRealloc(writer, keep_key, 8, 0, &keep_offsets[d]) == KVSPACE_OK,
+                      "realloc %s", keep_key);
+                CHECK(kvspaceAnchorOf(writer, dir_key, &anchors[d]) == KVSPACE_OK,
+                      "anchor_of %s", dir_key);
+            }
+            int ready_pipe[2];
+            CHECK(pipe(ready_pipe) == 0, "swmr pipe");
+            pid_t reader = fork();
+            if (reader == 0) {
+                close(ready_pipe[0]);
+                kvspaceClose(writer);
+                void *rh = kvspaceConnect(dsn);
+                if (!rh)
+                    _exit(2);
+                uint8_t *rbase = kvspaceXvalueInProcessAddress(rh);
+                volatile int32_t *rcur =
+                    (volatile int32_t *)(void *)(rbase + cur_offset + KVSPACE_XVALUE_HEAD_LEN);
+                if (gate_write(ready_pipe[1], 'r') != 0)
+                    _exit(3);
+                close(ready_pipe[1]);
+                int bad = 0;
+                for (;;) {
+                    int d = __atomic_load_n(rcur, __ATOMIC_ACQUIRE);
+                    if (d < 0)
+                        break;
+                    char keep_key[48];
+                    snprintf(keep_key, sizeof keep_key, "/swmr%02d/keep", d);
+                    uint64_t ro = 0, ao = 0;
+                    if (kvspaceResolveOffset(rh, keep_key, NULL, &ro) != KVSPACE_OK ||
+                        ro != keep_offsets[d])
+                        bad = 1;
+                    if (kvspaceResolveOffset(rh, "keep", &anchors[d], &ao) != KVSPACE_OK ||
+                        ao != keep_offsets[d])
+                        bad = 1;
+                }
+                kvspaceClose(rh);
+                _exit(bad);
+            }
+            close(ready_pipe[1]);
+            char ready_ch = 0;
+            CHECK(gate_read(ready_pipe[0], &ready_ch) == 0 && ready_ch == 'r',
+                  "swmr reader ready");
+            close(ready_pipe[0]);
+            static const char extra_bytes[] =
+                "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijlmnpqrstuvwxyz";
+            for (int d = 0; d < dirs; d++) {
+                __atomic_store_n(cur_dir, d, __ATOMIC_RELEASE);
+                for (size_t s = 0; extra_bytes[s] != '\0'; s++) {
+                    char sibling_key[48];
+                    uint64_t sibling_off = 0;
+                    snprintf(sibling_key, sizeof sibling_key, "/swmr%02d/%c", d, extra_bytes[s]);
+                    if (kvspaceRealloc(writer, sibling_key, 8, 0, &sibling_off) != KVSPACE_OK)
+                        ++failures;
+                }
+            }
+            __atomic_store_n(cur_dir, -1, __ATOMIC_RELEASE);
+            int reader_status = 0;
+            CHECK(waitpid(reader, &reader_status, 0) == reader &&
+                      WIFEXITED(reader_status) && WEXITSTATUS(reader_status) == 0,
+                  "SWMR concurrent dir growth reader failed (status=%d)", reader_status);
+
+            CHECK(kvspaceMkindex(writer, "/mw/") == KVSPACE_OK, "mkindex /mw/");
+            const int workers = 4, per_worker = 200;
+            pid_t mw_pids[4];
+            for (int w = 0; w < workers; w++) {
+                mw_pids[w] = fork();
+                if (mw_pids[w] == 0) {
+                    kvspaceClose(writer);
+                    void *wh = kvspaceConnect(dsn);
+                    if (!wh)
+                        _exit(2);
+                    for (int i = 0; i < per_worker; i++) {
+                        char mkey[48];
+                        uint64_t moff = 0;
+                        snprintf(mkey, sizeof mkey, "/mw/k_%03d_p%d", i, w);
+                        if (kvspaceRealloc(wh, mkey, 8, 0, &moff) != KVSPACE_OK)
+                            _exit(3);
+                    }
+                    kvspaceClose(wh);
+                    _exit(0);
+                }
+            }
+            for (int w = 0; w < workers; w++) {
+                int mw_status = 0;
+                CHECK(waitpid(mw_pids[w], &mw_status, 0) == mw_pids[w] &&
+                          WIFEXITED(mw_status) && WEXITSTATUS(mw_status) == 0,
+                      "multi-writer %d failed (status=%d)", w, mw_status);
+            }
+            for (int w = 0; w < workers; w++) {
+                for (int i = 0; i < per_worker; i++) {
+                    char mkey[48];
+                    uint64_t moff = 0;
+                    snprintf(mkey, sizeof mkey, "/mw/k_%03d_p%d", i, w);
+                    if (kvspaceResolveOffset(writer, mkey, NULL, &moff) != KVSPACE_OK)
+                        ++failures;
+                }
+            }
+            kvspaceClose(writer);
+        }
+    }
     char cmd[600];
     snprintf(cmd, sizeof cmd, "rm -rf '%s'", dir);
     if (system(cmd) != 0)

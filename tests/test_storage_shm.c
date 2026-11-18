@@ -1,4 +1,5 @@
 #include <kvspace/kvspace.h>
+#include <kvspace/kvspace_xvalue.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -21,9 +22,9 @@ static void test_resolve_realloc(void *kv) {
     CHECK(kvspaceRealloc(kv, "/ct/a", 8, 0, &first) == KVSPACE_OK,"realloc 创建失败");
     if (base) {
         uint64_t probe = 0x0123456789ABCDEFULL;
-        memcpy(base + first, &probe, sizeof probe);
+        memcpy(base + first + KVSPACE_XVALUE_HEAD_LEN, &probe, sizeof probe);
         uint64_t back = 0;
-        memcpy(&back, base + first, sizeof back);
+        memcpy(&back, base + first + KVSPACE_XVALUE_HEAD_LEN, sizeof back);
         CHECK(back == probe, "base+offset 写读回的字节不对");
     }
     CHECK(kvspaceResolveOffset(kv, "/ct/a", NULL, &again) == KVSPACE_OK,"resolve 已存在的 key 失败");
@@ -203,10 +204,13 @@ int main(void) {
     test_existence_three_states(kv);
     test_copy_and_delete(kv);
     kvspaceClose(kv);
-    char path[256];
-    snprintf(path, sizeof path, "/tmp/kvspace_storage_shm_%ld.shm",
-             (long)getpid());
-    unlink(path);
+    static const char *const suffixes[] = {"", ".sbo.head", ".sbo.data", ".retirement"};
+    for (size_t i = 0; i < sizeof suffixes / sizeof suffixes[0]; i++) {
+        char path[256];
+        snprintf(path, sizeof path, "/tmp/kvspace_storage_shm_%ld.shm%s",
+                 (long)getpid(), suffixes[i]);
+        unlink(path);
+    }
     if (failures) {
         fprintf(stderr, "%d failure(s)\n", failures);
         return 1;
