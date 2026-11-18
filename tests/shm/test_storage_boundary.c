@@ -170,8 +170,9 @@ int main(void) {
           "cp changed /target body");
     {
         static const char *invalid_keys[] = {
-            "abc",       "/a//b",       "/a··b",       "/a·/b",
-            "/a/·b",     "/.kvspace-meta", "/.kvspace-meta/x",
+            "abc",       "abc/def",    "abc/",        "/a//b",
+            "/a··b",     "/a·/b",      "/a/·b",       "/.kvspace-meta",
+            "/.kvspace-meta/x",
         };
         for (size_t i = 0;
              i < sizeof invalid_keys / sizeof invalid_keys[0]; i++) {
@@ -186,6 +187,23 @@ int main(void) {
         CHECK(kvspaceRealloc(kv, "/.kvspace-meta·x", 1, 0, &meta_offset) == KVSPACE_OK,"/.kvspace-meta·x must be writable");
         CHECK(resolve(kv, "/.kvspace-meta·x", &ignored) == KVSPACE_OK,
               "/.kvspace-meta·x must resolve after write");
+        CHECK(kvspaceDeltree(kv, "") == KVSPACE_INVALID,
+              "deltree empty key must be INVALID");
+        CHECK(kvspaceDeltree(kv, "·") == KVSPACE_INVALID,
+              "deltree bare dot separator must be INVALID");
+        CHECK(kvspaceDeltree(kv, "abc/def") == KVSPACE_INVALID,
+              "deltree relative key must be INVALID");
+        CHECK(kvspaceDeltree(kv, "/a//b") == KVSPACE_INVALID,
+              "deltree adjacent separators must be INVALID");
+        CHECK(resolve(kv, "/target", &ignored) == KVSPACE_OK &&
+                  ignored == target_offset,
+              "/target must survive rejected deltree calls");
+        CHECK(kvspaceCp(kv, "/missing-source", "/cp-dst") == KVSPACE_MISSING,
+              "cp missing source must return MISSING");
+        CHECK(kvspaceCp(kv, "bad/src", "/cp-dst") == KVSPACE_INVALID,
+              "cp invalid source must return INVALID");
+        CHECK(kvspaceCp(kv, "/target", "bad/dst") == KVSPACE_INVALID,
+              "cp invalid destination must return INVALID");
     }
     {
         uint64_t offset = 0;
@@ -245,6 +263,26 @@ int main(void) {
                   "list /k/a· missing \"f\"");
             free(buffer);
         }
+        CHECK(kvspaceMkindex(kv, "/k/a·") == KVSPACE_OK, "mkindex /k/a·");
+        CHECK(kvspaceFree(kv, "/k/a·") == KVSPACE_HAS_CHILDREN,
+              "free non-empty · index must return HAS_CHILDREN");
+        CHECK(kvspaceCpdir(kv, "/k/", "/k_copy/") == KVSPACE_OK,
+              "cpdir /k/ -> /k_copy/");
+        CHECK(resolve(kv, "/k_copy/a·f", &ignored) == KVSPACE_OK,
+              "cpdir must copy · member subtree /k_copy/a·f");
+        CHECK(resolve(kv, "/k_copy/z/q", &ignored) == KVSPACE_OK,
+              "cpdir must copy / subtree /k_copy/z/q");
+        CHECK(kvspaceCpdir(kv, "/k/a·", "/k_dot·") == KVSPACE_OK,
+              "cpdir · index /k/a· -> /k_dot·");
+        CHECK(resolve(kv, "/k_dot·f", &ignored) == KVSPACE_OK,
+              "cpdir · index must produce /k_dot·f");
+        CHECK(kvspaceCpdir(kv, "/k/z/", "/k/") == KVSPACE_INVALID,
+              "cpdir child -> ancestor must be INVALID");
+        CHECK(kvspaceCpdir(kv, "/k/", "/k/z/") == KVSPACE_INVALID,
+              "cpdir ancestor -> child must be INVALID");
+        CHECK(resolve(kv, "/k/z/q", &ignored) == KVSPACE_OK &&
+                  resolve(kv, "/k/a·f", &ignored) == KVSPACE_OK,
+              "/k/ subtree must survive rejected overlapping cpdir");
     }
     t_close(kv);
     char command[256];

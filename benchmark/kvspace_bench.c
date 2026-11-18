@@ -1,5 +1,6 @@
 #define _POSIX_C_SOURCE 200809L
 #include <kvspace/kvspace.h>
+#include <kvspace/kvspace_xvalue.h>
 #include <pthread.h>
 #include <signal.h>
 #include <stdint.h>
@@ -51,7 +52,7 @@ static uint64_t pct(const double *sorted, size_t n, double q) {
 }
 static void store_clear(const char *dsn) {
     static const char *const suffixes[] = {
-        "", ".sbo.data", ".sbo.head", ".garb", ".gen",
+        "", ".sbo.data", ".sbo.head", ".retirement",
     };
     if (strncmp(dsn, "shm://", 6) != 0)
         return;
@@ -90,14 +91,14 @@ static void suite_q1(void) {
     uint8_t *base = kvspaceXvalueInProcessAddress(h);
     for (int i = 0; i < Q1_WARMUP; i++) {
         uint64_t o = 0;
-        kvspaceResolveOffset(h, "/bench/k", 0, &o);
+        kvspaceResolveOffset(h, "/bench/k", NULL, &o);
     }
     for (int i = 0; i < Q1_ITERS; i++) {
         double t0 = now_ns();
         uint64_t o = 0;
-        if (kvspaceResolveOffset(h, "/bench/k", 0, &o) == 0 &&
+        if (kvspaceResolveOffset(h, "/bench/k", NULL, &o) == 0 &&
             base) {
-            memcpy(base + o, payload, 8);
+            memcpy(base + o + KVSPACE_XVALUE_HEAD_LEN, payload, 8);
         }
         samples[i] = now_ns() - t0;
     }
@@ -129,22 +130,22 @@ static void suite_q2(void) {
     }
     uint8_t *base0 = kvspaceXvalueInProcessAddress(h);
     if (base0)
-        memcpy(base0 + off_before, "PROBE!!", 8);
+        memcpy(base0 + off_before + KVSPACE_XVALUE_HEAD_LEN, "PROBE!!", 8);
     for (int i = 0; i < Q2_FILL_KEYS; i++) {
         uint64_t o = 0;
         snprintf(key, sizeof key, "/bench/fill%06d", i);
-            if (kvspaceRealloc(h, key, Q2_FILL_BYTES, 0, &o) != 0)
+        if (kvspaceRealloc(h, key, Q2_FILL_BYTES, 0, &o) != 0)
             break;
         uint8_t *b = kvspaceXvalueInProcessAddress(h);
         if (b)
-            memset(b + o, (uint8_t)(i & 0xFF), Q2_FILL_BYTES);
+            memset(b + o + KVSPACE_XVALUE_HEAD_LEN, (uint8_t)(i & 0xFF), Q2_FILL_BYTES);
     }
     uint64_t off_after = 0;
-    int resolved = kvspaceResolveOffset(h, "/bench/probe", 0, &off_after);
+    int resolved = kvspaceResolveOffset(h, "/bench/probe", NULL, &off_after);
     uint8_t *base1 = kvspaceXvalueInProcessAddress(h);
     int same = 0;
     if (resolved == 0 && base1) {
-        same = memcmp(base1 + off_after, "PROBE!!", 8) == 0;
+        same = memcmp(base1 + off_after + KVSPACE_XVALUE_HEAD_LEN, "PROBE!!", 8) == 0;
     }
     emit_u64("kvspace", "address-stable-after-grow", "correct",
              (uint64_t)same, "bool", "", "", "", "-");
@@ -223,12 +224,12 @@ static void suite_q4(void) {
         for (int i = 0; i < Q4_KEYS; i++) {
             uint64_t off = 0;
             snprintf(key, sizeof key, "/bench/recover%04d", i);
-                    if (kvspaceRealloc(h, key, 8, 0, &off) != 0)
+            if (kvspaceRealloc(h, key, 8, 0, &off) != 0)
                 _exit(3);
             uint8_t *b = kvspaceXvalueInProcessAddress(h);
             int64_t marker = i;
             if (b)
-                memcpy(b + off, &marker, sizeof marker);
+                memcpy(b + off + KVSPACE_XVALUE_HEAD_LEN, &marker, sizeof marker);
         }
         raise(SIGKILL);
         _exit(0);
@@ -250,7 +251,7 @@ static void suite_q4(void) {
     for (int i = 0; i < Q4_KEYS; i++) {
         uint64_t off = 0;
         snprintf(key, sizeof key, "/bench/recover%04d", i);
-            if (kvspaceResolveOffset(h, key, 0, &off) != 0) {
+        if (kvspaceResolveOffset(h, key, NULL, &off) != 0) {
             missing++;
             continue;
         }
@@ -260,7 +261,7 @@ static void suite_q4(void) {
             unreadable++;
             continue;
         }
-        memcpy(&v, b + off, sizeof v);
+        memcpy(&v, b + off + KVSPACE_XVALUE_HEAD_LEN, sizeof v);
         if (v == (int64_t)i)
             correct++;
         else

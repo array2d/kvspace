@@ -131,7 +131,7 @@ else
                                    
     mapfile -t actual_syms < <(
         nm -D --defined-only "$SONAME_FILE" 2>/dev/null |
-        awk '$2=="T"{print $3}' | grep '^kvspace' | sort -u
+        awk '$2=="T" && $3 !~ /^_/{print $3}' | sort -u
     )
 
     if [ ${#expected_syms[@]} -eq 0 ]; then
@@ -163,13 +163,13 @@ else
     say ""
     say "── 3. 内部符号泄漏 ──"
     leak_count=$(nm -D --defined-only "$SONAME_FILE" 2>/dev/null |
-                 awk '$2=="T"{print $3}' | grep -c '^kvspaceShm')
+                 awk '$2 ~ /^[TDBR]$/ && $3 !~ /^_/ && $3 !~ /^kvspace/{print $3}' | wc -l)
     if [ "$leak_count" -eq 0 ]; then
-        ok "kvspaceShm* 泄漏 0"
+        ok "非 kvspace* 内部符号泄漏 0"
     else
-        bad "kvspaceShm* 泄漏 $leak_count 个（内部符号不得导出）"
+        bad "内部符号泄漏 $leak_count 个（内部符号不得导出）"
         nm -D --defined-only "$SONAME_FILE" 2>/dev/null |
-            awk '$2=="T"{print $3}' | grep '^kvspaceShm' | sed 's/^/      /'
+            awk '$2 ~ /^[TDBR]$/ && $3 !~ /^_/ && $3 !~ /^kvspace/{print $3}' | sed 's/^/      /'
         failures=$((failures + 1))
     fi
 fi

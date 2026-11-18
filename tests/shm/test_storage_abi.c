@@ -313,6 +313,21 @@ int main(void) {
         CHECK(kvspaceListlen(h, "/only", &oc, &om) ==
                   KVSPACE_NOT_INDEX,
               "同名的值形态 /only 在同名目录有根值后应 NOT_INDEX");
+        CHECK(kvspaceMkindex(h, "/onlydot·") == KVSPACE_OK,
+              "seed /onlydot·");
+        CHECK(kvspaceListlen(h, "/onlydot", &oc, &om) ==
+                  KVSPACE_NOT_INDEX,
+              "同名的值形态 /onlydot 在同名 · 索引有根值后应 NOT_INDEX");
+        CHECK(kvspaceMkindex(h, "/") == KVSPACE_OK, "seed /");
+        kvspace_anchor_t root_anchor = {0};
+        CHECK(kvspaceAnchorOf(h, "/", &root_anchor) == KVSPACE_OK,
+              "anchor_of /");
+        CHECK(kvspaceResolveOffset(h, ".kvspace-meta", &root_anchor, &y) ==
+                  KVSPACE_INVALID,
+              "根 anchor 查保留路径 .kvspace-meta 应 INVALID");
+        CHECK(kvspaceResolveOffset(h, ".kvspace-meta/x", &root_anchor, &y) ==
+                  KVSPACE_INVALID,
+              "根 anchor 查保留子树 .kvspace-meta/x 应 INVALID");
     }
     kvspace_anchor_t dead_anchor = {
         .node_offset = UINT64_C(1) << 40,
